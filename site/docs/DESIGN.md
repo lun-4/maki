@@ -24,7 +24,7 @@
 
 | | Light | Dark |
 |---|---|---|
-| Surface | warm paper `#f5eded` | lunared `#120c0c` |
+| Surface | warm paper `#f5eded` | makima `#120c0c` |
 | Ink | warm brown `#2a1818` | `#e9dede` |
 | Accent | crimson `#e03030` | red `#ff4545` |
 
@@ -34,7 +34,7 @@
 
 ## Code blocks
 
-Dark panes (#1E1E2E) in both themes. Custom `maki` syntax theme (`extra/maki.json`, VSCode format, `extra_themes`, zola >= 0.22); single `theme` key so giallo emits plain hex. Tokens, all roman, no italics:
+Dark panes (#1E1E2E) in both themes. Custom `maki` syntax theme (`extra/makima.json`, VSCode format, `extra_themes`, zola >= 0.22); single `theme` key so giallo emits plain hex. Tokens, all roman, no italics:
 
 | ink | comment | keyword | operator | function/command | type | string | const |
 |---|---|---|---|---|---|---|---|

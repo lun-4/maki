@@ -6,5 +6,5 @@ build_search_index = false
 [markdown.highlighting]
 enabled = true
 style = "inline"
-theme = "lunared"
-extra_themes = ["extra/lunared.json"]
+theme = "makima"
+extra_themes = ["extra/makima.json"]
