@@ -59,7 +59,7 @@ use crate::image;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpSnapshotReader, SharedBuf,
@@ -119,6 +119,7 @@ fn provider_thinking(config: maki_commands::ThinkingConfig) -> ThinkingConfig {
 pub(crate) use mode::{Mode, PlanState, PlanTrigger};
 #[cfg(test)]
 use mouse::EDGE_SCROLL_LINES;
+use mouse::{MIDDLE_SCROLL_INTERVAL, MiddleScroll};
 pub(crate) use queue::{MessageQueue, SubmitOutcome};
 use session::Sent;
 pub(crate) use session::session_has_content;
@@ -378,6 +379,7 @@ pub struct App {
     pub(super) retry_info: Option<RetryInfo>,
     pub(super) zones: ZoneRegistry,
     pub(super) selection_state: Option<SelectionState>,
+    middle_scroll: Option<MiddleScroll>,
     pub(super) clipboard: ClipboardState,
     pub(super) last_esc: Option<Instant>,
     /// Last user keystroke/paste; `None` until the first. Drives input deferral.
@@ -495,6 +497,7 @@ impl App {
             retry_info: None,
             zones: ZoneRegistry::new(),
             selection_state: None,
+            middle_scroll: None,
             clipboard: ClipboardState::new(),
             last_esc: None,
             last_input: None,
@@ -682,6 +685,20 @@ impl App {
     }
 
     pub fn update(&mut self, msg: Msg) -> Vec<Action> {
+        match &msg {
+            Msg::Key(key) if key.kind == KeyEventKind::Release => return vec![],
+            Msg::Key(key) => {
+                let active = self.middle_scroll.is_some();
+                let _ = self.cancel_middle_scroll();
+                if active && key.code == KeyCode::Esc {
+                    return vec![];
+                }
+            }
+            Msg::Paste(_) | Msg::Scroll { .. } => {
+                let _ = self.cancel_middle_scroll();
+            }
+            _ => {}
+        }
         let actions = match msg {
             Msg::Key(key) => {
                 self.last_input = Some(Instant::now());
@@ -723,6 +740,7 @@ impl App {
         // A modal-closing key or an answered permission yields the next demand
         // immediately, rather than waiting for the next 100ms tick.
         let _ = self.promote_deferred_if_ready();
+        let _ = self.validate_middle_scroll();
         actions
     }
 
@@ -2631,6 +2649,10 @@ impl App {
     }
 
     pub fn tick(&mut self) -> Dirty {
+        self.tick_at(Instant::now())
+    }
+
+    pub(crate) fn tick_at(&mut self, now: Instant) -> Dirty {
         // `|` never short-circuits: every poller must run on every tick.
         let mut dirty = self.float_mgr.tick()
             | self.lua_picker.tick()
@@ -2661,6 +2683,7 @@ impl App {
         // `float_mgr.tick` above may have closed the active question float; the
         // promote call reconciles that, then pops the queue head when idle.
         dirty |= self.promote_deferred_if_ready();
+        dirty |= self.tick_middle_scroll_at(now);
         dirty
     }
 
@@ -2689,6 +2712,10 @@ impl App {
     /// adding one to [`Self::overlays`] is enough.
     pub fn cadence(&self) -> Cadence {
         Cadence::any([
+            Cadence::when(
+                self.middle_scroll.is_some(),
+                Cadence::after(MIDDLE_SCROLL_INTERVAL),
+            ),
             Cadence::any(self.overlays().into_iter().map(Overlay::cadence)),
             StatusBar::cadence(
                 self.status_for_chat(self.active_chat),

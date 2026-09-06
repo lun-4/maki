@@ -2998,6 +2998,374 @@ fn status_hints_published_by_a_plugin_reach_the_screen() {
     assert!(!rendered(&mut app).contains(HINT_TEXT));
 }
 
+const MIDDLE_ORIGIN: u16 = 10;
+const MIDDLE_COLUMN: u16 = 4;
+const MIDDLE_TEST_AREA: Rect = Rect::new(0, 0, 80, 24);
+
+fn activate_middle_scroll(app: &mut App) {
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Middle),
+        MIDDLE_COLUMN,
+        MIDDLE_ORIGIN,
+    ));
+}
+
+fn middle_scroll_transcript() -> App {
+    let mut app = app_without_splash();
+    for i in 0..100 {
+        app.active_chat().push(DisplayMessage::new(
+            DisplayRole::User,
+            format!("transcript row {i}"),
+        ));
+    }
+    rendered(&mut app);
+    app
+}
+
+#[test_case(SelectionZone::Messages, true; "messages")]
+#[test_case(SelectionZone::Input, false; "input")]
+#[test_case(SelectionZone::Overlay, false; "overlay")]
+fn middle_scroll_activation_targets(zone: SelectionZone, expected: bool) {
+    let mut app = app_without_splash();
+    set_zone(&mut app, zone, MIDDLE_TEST_AREA);
+    activate_middle_scroll(&mut app);
+    assert_eq!(app.middle_scroll.is_some(), expected);
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Middle),
+        MIDDLE_COLUMN,
+        MIDDLE_ORIGIN,
+    ));
+    assert_eq!(app.middle_scroll.is_some(), expected);
+    activate_middle_scroll(&mut app);
+    assert!(app.middle_scroll.is_none());
+}
+
+#[test_case(-10, 100, 3; "up")]
+#[test_case(10, 100, -3; "down")]
+#[test_case(-1, 100, 0; "upper_dead_zone")]
+#[test_case(1, 100, 0; "lower_dead_zone")]
+#[test_case(0, 100, 0; "anchor")]
+#[test_case(31, 100, -12; "speed_cap")]
+#[test_case(100, 10000, -12; "stall_clamp")]
+#[test_case(6, 25, 0; "fractional_step")]
+fn middle_scroll_motion_rates(displacement: i32, millis: u64, expected: i32) {
+    let mut app = app_without_splash();
+    set_zone(&mut app, SelectionZone::Messages, MIDDLE_TEST_AREA);
+    activate_middle_scroll(&mut app);
+    let now = Instant::now();
+    let state = app.middle_scroll.as_mut().unwrap();
+    state.move_to((i32::from(MIDDLE_ORIGIN) + displacement) as u16, now);
+    assert_eq!(state.delta(now + Duration::from_millis(millis)), expected);
+}
+
+#[test]
+fn middle_scroll_fractional_direction_and_horizontal_motion() {
+    let mut app = middle_scroll_transcript();
+    activate_middle_scroll(&mut app);
+    let now = Instant::now();
+    let state = app.middle_scroll.as_mut().unwrap();
+    state.move_to(MIDDLE_ORIGIN + 6, now);
+    assert_eq!(state.delta(now + Duration::from_millis(25)), 0);
+    assert_eq!(state.delta(now + Duration::from_millis(50)), -1);
+    state.move_to(MIDDLE_ORIGIN - 6, now + Duration::from_millis(50));
+    assert_eq!(state.delta(now + Duration::from_millis(75)), 0);
+    state.move_to(MIDDLE_ORIGIN, now + Duration::from_millis(75));
+    state.move_to(MIDDLE_ORIGIN - 6, now + Duration::from_millis(100));
+    assert_eq!(state.delta(now + Duration::from_millis(125)), 0);
+    app.update(mouse_event(MouseEventKind::Moved, u16::MAX, MIDDLE_ORIGIN));
+    let state = app.middle_scroll.as_mut().unwrap();
+    assert_eq!(state.origin.x, MIDDLE_COLUMN);
+    assert_eq!(state.delta(now + Duration::from_secs(1)), 0);
+}
+
+#[test_case(0; "outside")]
+#[test_case(1; "modal")]
+#[test_case(2; "dragging")]
+#[test_case(3; "pending_copy")]
+fn middle_scroll_activation_rejected(cause: u8) {
+    let mut app = middle_scroll_transcript();
+    match cause {
+        0 => app.zones = ZoneRegistry::new(),
+        1 => open_help(&mut app),
+        2 => {
+            app.update(mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                MIDDLE_COLUMN,
+                MIDDLE_ORIGIN,
+            ));
+        }
+        _ => make_pending_copy(&mut app),
+    }
+    activate_middle_scroll(&mut app);
+    assert!(app.middle_scroll.is_none());
+}
+
+#[test]
+fn middle_scroll_stationary_ticks_render() {
+    let mut app = middle_scroll_transcript();
+    activate_middle_scroll(&mut app);
+    let now = Instant::now();
+    app.middle_scroll.as_mut().unwrap().move_to(0, now);
+    let before = rendered(&mut app);
+    for step in 1..=4 {
+        assert_eq!(
+            app.tick_middle_scroll_at(now + Duration::from_millis(step * 100)),
+            Dirty::YES
+        );
+    }
+    assert_ne!(rendered(&mut app), before);
+}
+
+#[test]
+fn middle_scroll_anchor_render() {
+    let mut app = middle_scroll_transcript();
+    activate_middle_scroll(&mut app);
+    let rows = rendered_rows(&mut app, 80, 24);
+    assert_eq!(
+        rows[usize::from(MIDDLE_ORIGIN)]
+            .chars()
+            .nth(usize::from(MIDDLE_COLUMN)),
+        Some('+')
+    );
+    activate_middle_scroll(&mut app);
+    let rows = rendered_rows(&mut app, 80, 24);
+    assert_ne!(
+        rows[usize::from(MIDDLE_ORIGIN)]
+            .chars()
+            .nth(usize::from(MIDDLE_COLUMN)),
+        Some('+')
+    );
+}
+
+#[test_case(0; "escape")]
+#[test_case(1; "ordinary_key")]
+#[test_case(2; "release")]
+#[test_case(3; "paste")]
+#[test_case(4; "wheel")]
+#[test_case(5; "left_button")]
+#[test_case(6; "right_button")]
+fn middle_scroll_input_cancellation(input: u8) {
+    let mut app = middle_scroll_transcript();
+    activate_middle_scroll(&mut app);
+    let msg = match input {
+        0 => Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        1 => Msg::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+        2 => Msg::Key(KeyEvent::new_with_kind(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        )),
+        3 => Msg::Paste("paste".into()),
+        4 => Msg::Scroll {
+            column: MIDDLE_COLUMN,
+            row: MIDDLE_ORIGIN,
+            delta: 1,
+        },
+        5 => mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            MIDDLE_COLUMN,
+            MIDDLE_ORIGIN,
+        ),
+        _ => mouse_event(
+            MouseEventKind::Down(MouseButton::Right),
+            MIDDLE_COLUMN,
+            MIDDLE_ORIGIN,
+        ),
+    };
+    let actions = app.update(msg);
+    assert_eq!(app.middle_scroll.is_some(), input == 2);
+    if input == 0 {
+        assert!(actions.is_empty());
+        assert!(app.last_esc.is_none());
+    }
+    if input == 1 {
+        assert_eq!(app.input_box.buffer.value(), "x");
+    }
+    if input == 3 {
+        assert_eq!(app.input_box.buffer.value(), "paste");
+    }
+    if input == 5 {
+        assert!(app.selection_state.is_some());
+    }
+}
+
+#[test_case(0; "overlay")]
+#[test_case(1; "geometry")]
+#[test_case(2; "chat_identity")]
+#[test_case(3; "reset")]
+#[test_case(4; "preview")]
+fn middle_scroll_target_invalidation(cause: u8) {
+    let mut app = middle_scroll_transcript();
+    activate_middle_scroll(&mut app);
+    match cause {
+        0 => open_help(&mut app),
+        1 => {
+            app.zones = ZoneRegistry::new();
+            set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 40, 10));
+        }
+        2 => app.chats[0].subagent_id = Some(TASK_ID.into()),
+        3 => app.reset_ui_chrome(),
+        _ => app.task_picker.open(vec![], TASK_ID),
+    }
+    let _ = app.tick_middle_scroll_at(Instant::now());
+    assert!(app.middle_scroll.is_none());
+    app.close_all_overlays();
+    assert_eq!(
+        app.tick_middle_scroll_at(Instant::now() + Duration::from_secs(1)),
+        Dirty::NO
+    );
+}
+
+#[test]
+fn middle_scroll_boundaries_and_reversal() {
+    let mut app = middle_scroll_transcript();
+    let bottom = app.chats[0].scroll_top();
+    activate_middle_scroll(&mut app);
+    let now = Instant::now();
+    app.middle_scroll.as_mut().unwrap().move_to(100, now);
+    assert_eq!(
+        app.tick_middle_scroll_at(now + Duration::from_millis(100)),
+        Dirty::NO
+    );
+    app.middle_scroll
+        .as_mut()
+        .unwrap()
+        .move_to(0, now + Duration::from_millis(100));
+    assert_eq!(
+        app.tick_middle_scroll_at(now + Duration::from_millis(200)),
+        Dirty::YES
+    );
+    assert_eq!(app.chats[0].scroll_top(), bottom - 3);
+    app.chats[0].scroll_to_top();
+    assert_eq!(
+        app.tick_middle_scroll_at(now + Duration::from_millis(300)),
+        Dirty::NO
+    );
+    app.middle_scroll
+        .as_mut()
+        .unwrap()
+        .move_to(20, now + Duration::from_millis(300));
+    assert_eq!(
+        app.tick_middle_scroll_at(now + Duration::from_millis(400)),
+        Dirty::YES
+    );
+    assert_eq!(app.chats[0].scroll_top(), 3);
+}
+
+#[test_case(false; "above_bottom")]
+#[test_case(true; "at_bottom")]
+fn middle_scroll_streaming_follow_render(at_bottom: bool) {
+    let mut app = middle_scroll_transcript();
+    if !at_bottom {
+        app.chats[0].scroll(10);
+    }
+    activate_middle_scroll(&mut app);
+    let before = app.chats[0].scroll_top();
+    app.chats[0].push(DisplayMessage::new(DisplayRole::User, "new output".into()));
+    rendered(&mut app);
+    assert_eq!(app.chats[0].scroll_top(), before);
+    let _ = app.cancel_middle_scroll();
+    rendered(&mut app);
+    assert_eq!(app.chats[0].scroll_top(), before);
+    app.chats[0].scroll(-i32::from(u16::MAX));
+    rendered(&mut app);
+    assert!(app.chats[0].auto_scroll());
+    let bottom = app.chats[0].scroll_top();
+    app.chats[0].push(DisplayMessage::new(
+        DisplayRole::User,
+        "later output".into(),
+    ));
+    rendered(&mut app);
+    assert!(app.chats[0].scroll_top() > bottom);
+}
+
+#[test]
+fn middle_scroll_async_overlay_prevents_final_motion() {
+    let mut app = middle_scroll_transcript();
+    activate_middle_scroll(&mut app);
+    let now = Instant::now();
+    app.middle_scroll.as_mut().unwrap().move_to(0, now);
+    let before = app.chats[0].scroll_top();
+    app.last_input = Some(now);
+    assert!(app.begin_input_demand(bash_perm_demand(PERM_SCOPE)));
+    app.last_input = Some(now - IDLE_AGE);
+    let _ = app.tick_at(now + Duration::from_millis(100));
+    assert!(app.permission_active());
+    assert!(app.middle_scroll.is_none());
+    assert_eq!(app.chats[0].scroll_top(), before);
+}
+
+#[test]
+fn middle_scroll_chat_switch_and_render_resize() {
+    let mut app = middle_scroll_transcript();
+    activate_middle_scroll(&mut app);
+    app.update(subagent_msg(
+        AgentEvent::TextDelta {
+            text: TASK_ID.into(),
+        },
+        TASK_ID,
+        Some(TASK_ID),
+    ));
+    app.active_chat = 1;
+    let _ = app.tick_middle_scroll_at(Instant::now());
+    assert!(app.middle_scroll.is_none());
+    app.active_chat = 0;
+    assert_eq!(app.tick_middle_scroll_at(Instant::now()), Dirty::NO);
+    activate_middle_scroll(&mut app);
+    rendered_rows(&mut app, 60, 20);
+    assert!(app.middle_scroll.is_none());
+}
+
+#[test]
+fn middle_scroll_selection_copy_render() {
+    let mut app = middle_scroll_transcript();
+    activate_middle_scroll(&mut app);
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        MIDDLE_COLUMN,
+        MIDDLE_ORIGIN,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Drag(MouseButton::Left),
+        MIDDLE_COLUMN + 8,
+        MIDDLE_ORIGIN,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        MIDDLE_COLUMN + 8,
+        MIDDLE_ORIGIN,
+    ));
+    assert!(
+        app.selection_state
+            .as_ref()
+            .is_some_and(SelectionState::is_pending_copy)
+    );
+    activate_middle_scroll(&mut app);
+    assert!(app.middle_scroll.is_none());
+    let rows = rendered_rows(&mut app, 80, 24);
+    assert_ne!(
+        rows[usize::from(MIDDLE_ORIGIN)]
+            .chars()
+            .nth(usize::from(MIDDLE_COLUMN)),
+        Some('+')
+    );
+}
+
+#[test]
+fn middle_scroll_cadence_restores_baseline() {
+    let mut app = app_without_splash();
+    set_zone(&mut app, SelectionZone::Messages, MIDDLE_TEST_AREA);
+    let baseline = app.cadence();
+    activate_middle_scroll(&mut app);
+    assert_eq!(
+        app.cadence(),
+        Cadence::any([baseline, Cadence::after(mouse::MIDDLE_SCROLL_INTERVAL)])
+    );
+    assert_eq!(app.cancel_middle_scroll(), Dirty::YES);
+    assert_eq!(app.cancel_middle_scroll(), Dirty::NO);
+    assert_eq!(app.cadence(), baseline);
+}
+
 fn rendered(app: &mut App) -> String {
     let backend = ratatui::backend::TestBackend::new(80, 24);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
