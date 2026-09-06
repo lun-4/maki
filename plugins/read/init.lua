@@ -34,9 +34,8 @@ local function read_view_opts(ctx)
   return { max_lines = (tol and tol.read) or 10, keep = "head" }
 end
 
-local function apply_highlights(view, lines, ext, prefix)
-  local opts = prefix and { prefix = prefix } or nil
-  local highlighted = maki.ui.highlight(table.concat(lines, "\n"), ext, opts)
+local function apply_highlights(view, lines, ext)
+  local highlighted = maki.ui.highlight(table.concat(lines, "\n"), ext)
   if not highlighted then
     return
   end
@@ -50,7 +49,7 @@ local function apply_highlights(view, lines, ext, prefix)
   view:flush()
 end
 
-local function build_file_view(lines, start_line, total_lines, path, ctx, prefix)
+local function build_file_view(lines, start_line, total_lines, path, ctx)
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, read_view_opts(ctx))
   local nr_fmt = ToolView.line_nr_fmt(start_line + #lines - 1) .. " "
@@ -77,7 +76,7 @@ local function build_file_view(lines, start_line, total_lines, path, ctx, prefix
 
   local ext = path:match("%.([^%.]+)$") or ""
   maki.async.run(function()
-    apply_highlights(view, lines, ext, prefix)
+    apply_highlights(view, lines, ext)
   end)
 
   buf:on("click", function()
@@ -138,8 +137,10 @@ local function read_file(path, offset, limit, ctx)
 
   return {
     llm_output = llm_output,
-    body = build_file_view(lines, start, total_lines, path, ctx, prefix),
+    body = build_file_view(lines, start, total_lines, path, ctx),
     annotation = annotation,
+    -- What the view was built from, kept so restore can build it again.
+    state = { lines = lines, start_line = start, total_lines = total_lines },
   }
 end
 
@@ -190,8 +191,14 @@ maki.api.register_tool({
     return buf
   end,
 
+  -- Same view as the live handler, so an expand that goes through restore
+  -- keeps its highlighting. Sessions saved without state get the plain view.
   restore = function(input, output, _is_error, ctx)
-    return ToolView.restore(output, read_view_opts(ctx))
+    local st = ctx:state()
+    if not (st and type(st.lines) == "table" and st.start_line and st.total_lines) then
+      return ToolView.restore(output, read_view_opts(ctx))
+    end
+    return build_file_view(st.lines, st.start_line, st.total_lines, input.path or "", ctx)
   end,
 
   handler = function(input, ctx)
