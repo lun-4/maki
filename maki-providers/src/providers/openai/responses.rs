@@ -39,7 +39,8 @@ pub(crate) fn build_body<'a, 'b>(args: ResponsesRequestArgs<'a, 'b>) -> Value {
     };
     #[derive(Serialize)]
     struct ReasoningRequest {
-        effort: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        effort: Option<&'static str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         summary: Option<&'static str>,
     }
@@ -57,12 +58,11 @@ pub(crate) fn build_body<'a, 'b>(args: ResponsesRequestArgs<'a, 'b>) -> Value {
         reasoning: Option<ReasoningRequest>,
     }
 
-    let reasoning = thinking
-        .and_then(|(thinking, effort_dialect)| thinking.effort_str(effort_dialect, model))
-        .map(|effort| ReasoningRequest {
-            summary: (effort != "none").then_some("auto"),
-            effort: effort.into(),
-        });
+    let reasoning = thinking.and_then(|(thinking, effort_dialect)| {
+        let effort = thinking.effort_str(effort_dialect, model);
+        let summary = thinking.is_enabled().then_some("auto");
+        (effort.is_some() || summary.is_some()).then_some(ReasoningRequest { effort, summary })
+    });
     serde_json::to_value(ResponsesRequest {
         model: model.id.clone(),
         instructions: system.into(),
@@ -579,10 +579,34 @@ fn parse_usage(u: &Value) -> TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Effort, dialect, model::Model};
     use futures_lite::io::Cursor;
     use serde_json::json;
+    use test_case::test_case;
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+
+    #[test_case(None, &dialect::STANDARD, None; "no_thinking_config")]
+    #[test_case(Some(ThinkingConfig::Off), &dialect::STANDARD, None; "off_omitted")]
+    #[test_case(Some(ThinkingConfig::Off), &dialect::TENSORX, Some(json!({"effort": "none"})); "off_explicit")]
+    #[test_case(Some(ThinkingConfig::Adaptive), &dialect::ANTHROPIC_ADAPTIVE, Some(json!({"summary": "auto"})); "native_adaptive")]
+    #[test_case(Some(ThinkingConfig::Adaptive), &dialect::STANDARD, Some(json!({"effort": "medium", "summary": "auto"})); "adaptive_effort")]
+    #[test_case(Some(ThinkingConfig::Effort(Effort::High)), &dialect::STANDARD, Some(json!({"effort": "high", "summary": "auto"})); "explicit_effort")]
+    fn build_body_reasoning(
+        thinking: Option<ThinkingConfig>,
+        dialect: &EffortDialect<'_>,
+        expected: Option<Value>,
+    ) {
+        let model = Model::from_spec("copilot/gpt-5.4").unwrap();
+        let body = build_body(ResponsesRequestArgs {
+            model: &model,
+            messages: &[],
+            system: "",
+            tools: &json!([]),
+            thinking: thinking.map(|thinking| (thinking, dialect)),
+        });
+        assert_eq!(body.get("reasoning"), expected.as_ref());
+    }
 
     async fn run_sse(sse: &str) -> (Result<StreamResponse, AgentError>, Vec<ProviderEvent>) {
         let (tx, rx) = flume::unbounded();
