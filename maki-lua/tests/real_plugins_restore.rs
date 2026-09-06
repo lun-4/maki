@@ -446,6 +446,81 @@ fn grep_renders_identically_live_and_restored() {
     );
 }
 
+/// A batch rebuilds each child through the child's own restore, both when
+/// the child settles live and on batch restore. The child's tool state has
+/// to travel with it, or a read child comes back plain and its expand click
+/// finds no truncated view to open.
+#[test]
+fn batch_read_child_restores_highlighted_and_click_expands_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("long.rs");
+    let src: String = (0..READ_VIEW_CAP + 3)
+        .map(|i| format!("fn f{i}() {{}}\n"))
+        .collect();
+    std::fs::write(&path, &src).unwrap();
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let read_input = json!({ "path": path.to_str().unwrap(), "offset": 1, "limit": 0 });
+
+    let read = exec_live(&host, &reg, READ_TOOL, read_input.clone());
+    assert!(read.state.is_some(), "read reply carries state for restore");
+    let batch_input = json!({ "tool_calls": [
+        { "tool": READ_TOOL, "parameters": read_input },
+    ]});
+    let state = json!({ "children": [
+        { "tool": READ_TOOL, "status": "success", "output": read.output, "state": read.state },
+    ]});
+
+    let collapsed = restore(
+        &host,
+        "batch",
+        batch_input.clone(),
+        "whatever",
+        Some(state.clone()),
+        Vec::new(),
+    );
+    assert!(
+        has_syntax_colors(&collapsed.spans),
+        "read child keeps its highlighting inside a batch: {}",
+        collapsed.body
+    );
+    assert!(
+        collapsed.body.contains(EXPAND_HINT),
+        "read child collapsed past its cap: {}",
+        collapsed.body
+    );
+    let last_fn = format!("f{}()", READ_VIEW_CAP + 2);
+    assert!(
+        !collapsed.body.contains(&last_fn),
+        "tail hidden while collapsed: {}",
+        collapsed.body
+    );
+
+    let notice_row = 1 + collapsed
+        .body
+        .lines()
+        .position(|l| l.contains(EXPAND_HINT))
+        .expect("read truncation notice in collapsed render");
+    let clicked = restore(
+        &host,
+        "batch",
+        batch_input,
+        "whatever",
+        Some(state),
+        vec![notice_row],
+    );
+    assert!(
+        clicked.body.contains(&last_fn),
+        "click on the read child expands it: {}",
+        clicked.body
+    );
+    assert!(
+        has_syntax_colors(&clicked.spans),
+        "expanded read child is still highlighted: {}",
+        clicked.body
+    );
+}
+
 // Phase 4: bash auto-mode gate integration. We drive the real bash handler
 // with `classify_verdict` stubbed on the shared `bash_helpers` module (require
 // caches the singleton, so `init.lua` sees the override). The deny and error
