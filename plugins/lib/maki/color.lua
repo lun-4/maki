@@ -15,8 +15,11 @@ function M.lerp(from, to, t)
 end
 
 function M.dim(color, factor)
-  local bg = maki.ui.theme_color("background") or "#000000"
-  return M.lerp(color, bg, factor)
+  local background = maki.ui.theme_color("background")
+  if not background then
+    return color
+  end
+  return M.lerp(color, background, factor)
 end
 
 return M

@@ -4893,6 +4893,32 @@ fn test_splash_slot_default() {
 }
 
 #[test]
+fn test_splash_default_degrades_without_theme_colors() {
+    const LOGO: &str = "makima";
+    let (handle, _guard) = maki_lua::test_support::spawn_host_for_tests(&["splashes_default"]);
+    let frame = wait_for_splash_text(&handle, LOGO);
+    // The test host never seeds theme colors, so every semantic name is nil
+    // and the frame degrades to the host foreground instead of baking a
+    // fallback palette.
+    let rgba_rows: Vec<_> = frame
+        .rows
+        .iter()
+        .filter(|r| matches!(r.style, maki_lua::SplashStyle::Rgba { .. }))
+        .collect();
+    assert!(!rgba_rows.is_empty(), "frame has explicit-style rows");
+    assert!(
+        rgba_rows
+            .iter()
+            .all(|r| { matches!(r.style, maki_lua::SplashStyle::Rgba { fg: None, .. }) }),
+        "every explicit-style row degrades to the host foreground: {frame:?}"
+    );
+    assert!(
+        rgba_rows.iter().any(|r| r.glyphs.contains(LOGO)),
+        "logo row carries an explicit style"
+    );
+}
+
+#[test]
 fn test_splash_slot_override() {
     let (handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["splashes_default"]);
     guard
@@ -4978,6 +5004,36 @@ maki.api.register_tool({
     handle.set_version("1.2.3", Some("9.9.9"));
     let out = exec_tool(&reg, "vprobe", json!({})).unwrap();
     assert_eq!(out, "1.2.3|9.9.9|true", "set store: {out}");
+}
+
+#[test]
+fn test_color_dim_is_identity_without_theme_colors() {
+    const PROBE_COLOR: &str = "#8899aa";
+    const DIM_FACTOR: &str = "0.5";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let source = format!(
+        r#"
+maki.api.register_tool({{
+  name = "dimprobe",
+  description = "probe maki.color.dim",
+  schema = {{ type = "object", properties = {{}}, additionalProperties = false }},
+  handler = function()
+    return require("maki.color").dim("{color}", {factor})
+  end,
+}})
+"#,
+        color = PROBE_COLOR,
+        factor = DIM_FACTOR,
+    );
+    host.load_source("dimprobe", &source).unwrap();
+    let out = exec_tool(&reg, "dimprobe", json!({})).unwrap();
+    // Unseeded host: the background name is nil, so dim degrades to identity
+    // instead of lerping toward a baked-in black.
+    assert_eq!(
+        out, PROBE_COLOR,
+        "dim without theme colors must be identity, got {out}"
+    );
 }
 
 const HOST_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
