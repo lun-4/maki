@@ -14,7 +14,8 @@ pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
 
 pub(super) const MIDDLE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
 const MIDDLE_SCROLL_DEAD_ZONE: i32 = 1;
-const MIDDLE_SCROLL_RATE: f64 = 4.0;
+const MIDDLE_SCROLL_RATE: f64 = 2.0;
+const MIDDLE_SCROLL_EXPONENT: f64 = 1.5;
 const MIDDLE_SCROLL_MAX_RATE: f64 = 120.0;
 const MIDDLE_SCROLL_MAX_ELAPSED: Duration = Duration::from_millis(100);
 pub(super) const MIDDLE_SCROLL_ANCHOR: &str = "+";
@@ -33,7 +34,8 @@ impl MiddleScroll {
     fn rate(&self) -> f64 {
         let distance = (self.displacement.abs() - MIDDLE_SCROLL_DEAD_ZONE).max(0);
         -(self.displacement.signum() as f64)
-            * (distance as f64 * MIDDLE_SCROLL_RATE).min(MIDDLE_SCROLL_MAX_RATE)
+            * ((distance as f64).powf(MIDDLE_SCROLL_EXPONENT) * MIDDLE_SCROLL_RATE)
+                .min(MIDDLE_SCROLL_MAX_RATE)
     }
 
     pub(super) fn move_to(&mut self, row: u16, now: Instant) {

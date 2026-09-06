@@ -3040,8 +3040,10 @@ fn middle_scroll_activation_targets(zone: SelectionZone, expected: bool) {
     assert!(app.middle_scroll.is_none());
 }
 
-#[test_case(-10, 100, 3; "up")]
-#[test_case(10, 100, -3; "down")]
+#[test_case(-10, 100, 5; "up")]
+#[test_case(10, 100, -5; "down")]
+#[test_case(5, 100, -1; "moderate_speed")]
+#[test_case(17, 100, -12; "cap_threshold")]
 #[test_case(-1, 100, 0; "upper_dead_zone")]
 #[test_case(1, 100, 0; "lower_dead_zone")]
 #[test_case(0, 100, 0; "anchor")]
@@ -3056,6 +3058,24 @@ fn middle_scroll_motion_rates(displacement: i32, millis: u64, expected: i32) {
     let state = app.middle_scroll.as_mut().unwrap();
     state.move_to((i32::from(MIDDLE_ORIGIN) + displacement) as u16, now);
     assert_eq!(state.delta(now + Duration::from_millis(millis)), expected);
+}
+
+#[test_case(2, -2; "fine_control")]
+#[test_case(5, -16; "moderate_speed")]
+#[test_case(10, -54; "fast_travel")]
+#[test_case(17, -120; "capped_speed")]
+fn middle_scroll_power_curve(displacement: u16, expected: i32) {
+    const TICK_COUNT: u32 = 10;
+    const TICK_INTERVAL: Duration = Duration::from_millis(100);
+    let mut app = middle_scroll_transcript();
+    activate_middle_scroll(&mut app);
+    let now = Instant::now();
+    let state = app.middle_scroll.as_mut().unwrap();
+    state.move_to(MIDDLE_ORIGIN + displacement, now);
+    let delta: i32 = (1..=TICK_COUNT)
+        .map(|step| state.delta(now + TICK_INTERVAL * step))
+        .sum();
+    assert_eq!(delta, expected);
 }
 
 #[test]
@@ -3235,7 +3255,7 @@ fn middle_scroll_boundaries_and_reversal() {
         app.tick_middle_scroll_at(now + Duration::from_millis(200)),
         Dirty::YES
     );
-    assert_eq!(app.chats[0].scroll_top(), bottom - 3);
+    assert_eq!(app.chats[0].scroll_top(), bottom - 5);
     app.chats[0].scroll_to_top();
     assert_eq!(
         app.tick_middle_scroll_at(now + Duration::from_millis(300)),
@@ -3249,7 +3269,7 @@ fn middle_scroll_boundaries_and_reversal() {
         app.tick_middle_scroll_at(now + Duration::from_millis(400)),
         Dirty::YES
     );
-    assert_eq!(app.chats[0].scroll_top(), 3);
+    assert_eq!(app.chats[0].scroll_top(), 5);
 }
 
 #[test_case(false; "above_bottom")]
