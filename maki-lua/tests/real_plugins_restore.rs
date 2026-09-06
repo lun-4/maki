@@ -155,7 +155,7 @@ fn batch_restore_renders_real_children_and_click_expands_grep() {
     assert!(text.contains("grep> "), "grep child header: {text}");
     assert!(text.contains("bash> "), "bash child header: {text}");
     // grep's real view reformats `nr:` into gutter lines.
-    assert!(text.contains("    1: fn main() {}"), "grep gutter: {text}");
+    assert!(text.contains(" 1 fn main() {}"), "grep gutter: {text}");
     assert!(
         !text.contains("\n1: fn main"),
         "raw llm text means the child restore degraded to fallback: {text}"
@@ -189,7 +189,7 @@ fn batch_restore_renders_real_children_and_click_expands_grep() {
     );
     let text = &clicked.body;
     assert!(
-        text.contains("    10: fn other() {}"),
+        text.contains("10 fn other() {}"),
         "expanded grep tail visible: {text}"
     );
     assert!(
@@ -415,6 +415,34 @@ fn read_renders_identically_live_and_restored(limit: usize) {
     assert_eq!(
         restored.spans, live.spans,
         "restored read view must match the live one, colors included"
+    );
+}
+
+const GREP_TOOL: &str = "grep";
+
+/// Same contract as read: grep's restore used to rebuild a plain view from
+/// the LLM output while the live handler highlighted, so an expand that went
+/// through restore dropped the colors.
+#[test]
+fn grep_renders_identically_live_and_restored() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "fn one() {}\nfn two() {}\n").unwrap();
+    std::fs::write(dir.path().join("b.rs"), "fn three() {}\n").unwrap();
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let input = json!({ "pattern": "fn", "path": dir.path().to_str().unwrap() });
+
+    let live = exec_live(&host, &reg, GREP_TOOL, input.clone());
+    let restored = restore(&host, GREP_TOOL, input, &live.output, None, Vec::new());
+
+    assert!(
+        has_syntax_colors(&live.spans),
+        "live grep view is syntax highlighted: {}",
+        live.body
+    );
+    assert_eq!(
+        restored.spans, live.spans,
+        "restored grep view must match the live one, colors included"
     );
 }
 

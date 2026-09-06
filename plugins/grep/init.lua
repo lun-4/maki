@@ -238,7 +238,7 @@ maki.api.register_tool({
     if #entries == 0 then
       return nil
     end
-    return ToolView.restore(output, grep_view_opts(ctx))
+    return build_grep_view(entries, ctx)
   end,
 
   handler = function(input, ctx)
@@ -278,9 +278,11 @@ maki.api.register_tool({
     local llm_output = format_llm_output(entries)
     llm_output = maki.text.truncate_file(llm_output, max_lines, max_bytes, nil)
 
+    -- Built from the truncated output rather than `entries`, so the view
+    -- shows exactly what the model got and restore renders the same way.
     return {
       llm_output = llm_output,
-      body = ToolView.restore(llm_output, grep_view_opts(ctx)),
+      body = build_grep_view(parse_llm_output(llm_output), ctx),
       annotation = count_matches(entries),
     }
   end,
