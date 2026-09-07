@@ -75,7 +75,6 @@ pub enum BuiltinId {
     Cd,
     Btw,
     Yolo,
-    Thinking,
     Fast,
     Workflow,
     Exit,
@@ -113,26 +112,10 @@ pub enum BuiltinOperation {
         attachments: Arc<[CommandAttachment]>,
     },
     ToggleYolo,
-    SetThinking {
-        config: ThinkingConfig,
-    },
     ToggleFast,
     ToggleWorkflow,
     Exit,
     Reload,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThinkingConfig {
-    Off,
-    Adaptive,
-    Minimal,
-    Low,
-    Medium,
-    High,
-    XHigh,
-    Max,
-    Budget(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,7 +123,6 @@ pub enum HostContextRequest {
     ModelSpecs,
     ThemeNames,
     WorkingDirectory,
-    ThinkingConfig,
     FastModeSupported,
 }
 
@@ -148,7 +130,6 @@ pub enum HostContextRequest {
 pub enum HostContextResponse {
     Values(Arc<[Arc<str>]>),
     WorkingDirectory(PathBuf),
-    ThinkingConfig(ThinkingConfig),
     FastModeSupported(bool),
     Unavailable,
 }
@@ -185,7 +166,7 @@ const LIFECYCLE: TargetCapabilities =
 const RELOAD: TargetCapabilities = TargetCapabilities::from_capability(TargetCapability::Reload);
 
 macro_rules! builtin {
-    ($id:ident, $name:expr, $aliases:expr, $description:literal, $arguments:expr, $hint:expr, $caps:expr, $completion:expr $(,)?) => {
+    ($id:ident, $name:expr, $aliases:expr, $description:expr, $arguments:expr, $hint:expr, $caps:expr, $completion:expr $(,)?) => {
         BuiltinDefinition {
             id: BuiltinId::$id,
             name: $name,
@@ -318,16 +299,6 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         ArgumentArity::NONE,
         None,
         PERMISSIONS,
-        None,
-    ),
-    builtin!(
-        Thinking,
-        "/thinking",
-        &[],
-        "Toggle extended thinking (off, adaptive, effort level, or budget)",
-        ArgumentArity::OPTIONAL,
-        Some("<mode>"),
-        INTERACTIVE,
         None,
     ),
     builtin!(
