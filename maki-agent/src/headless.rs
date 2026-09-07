@@ -17,6 +17,10 @@ use crate::agent::{self, History};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
+use crate::session_coordinator::SessionOptionCatalog;
+use crate::session_coordinator::{
+    SessionCoordinatorHandle, SessionCoordinatorParams, builtin_option_definitions,
+};
 use crate::template;
 use crate::tools::{
     DescriptionContext, FileReadTracker, LocalTools, ToolAudience, ToolFilter, ToolRegistry,
@@ -42,6 +46,10 @@ pub struct HeadlessParams {
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
     pub modes: Arc<crate::ModeRegistry>,
+    /// Plugin-registered session options. A print-mode run still needs a
+    /// coordinator: tools read their options through one, and
+    /// `SessionMailbox::notify` resolves through one.
+    pub session_options: SessionOptionCatalog,
 }
 
 pub struct HeadlessHandle {
@@ -150,6 +158,58 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
     let session_ref = SessionRef::from(session_id);
     let session_ref_clone = session_ref.clone();
     let mailbox = SessionMailbox::new(session_id);
+    // A print-mode session is one turn and is never restored, so the
+    // checkpoint is a no-op and no options are persisted -- but the
+    // coordinator must exist, or every option read and every mailbox
+    // notification in this run fails with `session not live`.
+    let coordinator = SessionCoordinatorHandle::register(SessionCoordinatorParams {
+        session_id,
+        catalog: params.session_options.clone(),
+        definitions: builtin_option_definitions(
+            Arc::from(params.model.spec().as_str()),
+            [Arc::from(params.model.spec().as_str())],
+            params.permissions_config.yolo,
+            false,
+            workflow,
+        ),
+        persisted_options: Default::default(),
+        history: Vec::new(),
+        model: Arc::from(params.model.spec().as_str()),
+        cwd: params.initial_wd.clone(),
+        model_policy: Arc::clone(&params.model_policy),
+        // A print run resolves its provider once, up front: there is no
+        // mechanism to swap either mid-run, so both adoptions are refused
+        // rather than silently accepted and ignored.
+        model_adopter: Arc::new(|_: Model| {
+            Box::pin(async { Err(Arc::from("model cannot be changed in print mode")) })
+                as crate::session_coordinator::ModelAdoptionFuture
+        }),
+        directory_adopter: Arc::new(|_: PathBuf| {
+            Box::pin(async { Err(Arc::from("directory cannot be changed in print mode")) })
+                as crate::session_coordinator::DirectoryAdoptionFuture
+        }),
+        checkpoint: Arc::new(
+            |request: maki_storage::checkpoint::CheckpointRequest<
+                crate::session_coordinator::SessionCheckpoint,
+            >| {
+                Box::pin(async move {
+                    Ok(maki_storage::checkpoint::CheckpointAck {
+                        session_id: request.session_id,
+                        version: request.version,
+                    })
+                }) as maki_storage::checkpoint::CheckpointFuture
+            },
+        ),
+        mailbox: mailbox.clone(),
+    })
+    .map_err(|error| error.to_string());
+    let coordinator = match coordinator {
+        Ok(coordinator) => Some(coordinator),
+        Err(error) => {
+            error!(%error, "session coordinator registration failed");
+            None
+        }
+    };
     let file_write_locks = Arc::new(crate::tools::FileWriteLocks::new());
     let task = smol::spawn({
         let file_write_locks = Arc::clone(&file_write_locks);
@@ -166,6 +226,9 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                         let _ = event_tx.send(AgentEvent::ControlError {
                             message: e.user_message(),
                         });
+                        if let Some(coordinator) = coordinator {
+                            let _ = coordinator.close().await;
+                        }
                         return;
                     }
                 };
@@ -210,6 +273,9 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
 
             if let Some(handle) = mcp_shutdown {
                 handle.shutdown().await;
+            }
+            if let Some(coordinator) = coordinator {
+                let _ = coordinator.close().await;
             }
         }
     });
@@ -804,6 +870,54 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A print-mode run needs a coordinator like any other session: tools read
+    /// their options through one, and `SessionMailbox::notify` resolves through
+    /// one. Without it every option read fails with `session not live` and
+    /// `bash` cannot run at all.
+    #[test]
+    fn spawn_registers_a_resolvable_coordinator() {
+        let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let handle = spawn(HeadlessParams {
+            model: model.clone(),
+            config: AgentConfig::default(),
+            permissions_config: PermissionsConfig::default(),
+            timeouts: Timeouts::default(),
+            input: AgentInput {
+                message: "hello".into(),
+                mode: AgentMode::Build,
+                images: Vec::new(),
+                preamble: Vec::new(),
+                thinking: Default::default(),
+                fast: false,
+                workflow: false,
+                prompt: None,
+                lease_committer: None,
+            },
+            prompt_slots: ResolvedSlots::default(),
+            excluded_tools: Vec::new(),
+            mcp_handle: None,
+            initial_wd: PathBuf::from("/tmp"),
+            system_prompt_override: None,
+            append_system_prompt: None,
+            model_policy: Arc::default(),
+            plugin_rules: Arc::default(),
+            modes: Arc::default(),
+            session_options: Default::default(),
+        });
+
+        let session_id = handle.session_id.id();
+        let coordinator = SessionCoordinatorHandle::resolve(session_id)
+            .expect("print mode must register a coordinator for its session");
+        assert_eq!(coordinator.read().session_id(), session_id);
+        // The mailbox the coordinator hands out must be the one the run polls,
+        // or notifications land nowhere.
+        SessionMailbox::notify(session_id, "ping".into(), true)
+            .expect("notify resolves through the registered coordinator");
+
+        drop(handle.task);
+        let _ = futures_lite::future::block_on(coordinator.close());
+    }
 
     #[test]
     fn extract_tool_names_filters_valid_entries() {

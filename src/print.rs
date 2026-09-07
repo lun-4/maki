@@ -287,6 +287,7 @@ pub fn run(
     let command_turn_marker = CommandTurnMarker;
 
     let prompt_slots = lua_handle.collect_prompt_slots();
+    let session_options = lua_handle.session_option_catalog();
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let (mcp_handle, mcp_config_errors) = smol::block_on(async {
         let (handle, errors) =
@@ -317,6 +318,7 @@ pub fn run(
             append_system_prompt,
             plugin_rules: Arc::clone(&plugin_rules),
             modes: Arc::clone(&modes),
+            session_options: session_options.clone(),
         });
 
         let HeadlessHandle {

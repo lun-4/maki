@@ -506,6 +506,9 @@ pub struct SdkParams {
     pub plugin_rules: Arc<PluginRuleStore>,
     pub commands: Vec<CustomCommand>,
     pub command_registry: CommandRegistry,
+    /// Plugin-registered session options, so a tool's options resolve here the
+    /// same way they do in the TUI.
+    pub session_options: maki_agent::session_coordinator::SessionOptionCatalog,
 }
 
 struct Shared {
@@ -669,6 +672,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         plugin_rules,
         commands,
         command_registry,
+        session_options,
     } = params;
     cli.warn_ignored_flags();
     if let Some(max) = cli.max_turns {
@@ -764,7 +768,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let coordinator = maki_agent::session_coordinator::SessionCoordinatorHandle::register(
         maki_agent::session_coordinator::SessionCoordinatorParams {
             session_id: handle.session_id.id(),
-            catalog: Default::default(),
+            catalog: session_options.clone(),
             definitions,
             persisted_options,
             history: coordinator_history,

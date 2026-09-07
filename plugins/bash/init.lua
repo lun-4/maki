@@ -288,11 +288,17 @@ local auto_mode = maki.api.register_session_option({
   persistent = true,
 })
 
+-- Sessionless contexts (`maki index`, an embedding host with no coordinator)
+-- have no per-session value to read. They still run bash, so fall back to the
+-- configured default rather than refusing to execute.
 local function auto_mode_enabled(session_id)
   local target = session_id and { session = session_id } or nil
   local value, err = auto_mode:get(target)
   if not value then
-    return nil, err
+    if session_id then
+      return nil, err
+    end
+    return opts.auto_mode and true or false, nil
   end
   return value == "enabled", nil
 end
@@ -412,8 +418,8 @@ maki.api.register_tool({
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
     local session_id, session_err = ctx:session_id()
-    if not session_id then
-      return { llm_output = session_err or "bash requires a live session", is_error = true }
+    if session_err then
+      return { llm_output = session_err, is_error = true }
     end
     local enabled, option_err = auto_mode_enabled(session_id)
     if enabled == nil then
