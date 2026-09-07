@@ -235,7 +235,8 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
             let mut history = History::new(Vec::new());
             let mut agent = Agent::new(
                 AgentParams {
-                    model_source: None,
+                    settings_source: None,
+                    tool_builder: None,
                     agent_id: AgentId::generate(),
                     provider,
                     model,
@@ -793,7 +794,14 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 };
                 let mut agent = Agent::new(
                     AgentParams {
-                        model_source: Some(Arc::new(shared_model.clone())),
+                        // Session options travel through the coordinator, so
+                        // fast and workflow reach a run in flight the same way
+                        // the model does.
+                        settings_source: Some(Arc::new(crate::SessionRunSettings {
+                            model: Arc::new(shared_model.clone()),
+                            session_id,
+                        })),
+                        tool_builder: None,
                         agent_id,
                         provider: turn_provider,
                         model: turn_model,

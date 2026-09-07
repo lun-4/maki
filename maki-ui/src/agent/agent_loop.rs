@@ -327,9 +327,35 @@ impl TuiActorBackend {
                 agent_id: self.agent_id,
                 provider: Arc::clone(&slot.provider) as Arc<dyn maki_providers::provider::Provider>,
                 model: slot.model.clone(),
-                // The session's slot, so a model changed while this run is in
-                // flight is picked up at the next request.
-                model_source: Some(Arc::clone(&self.model_slot) as Arc<dyn ModelSource>),
+                // The session's slot for the model, the coordinator for the
+                // options, so a change while this run is in flight is picked
+                // up at its next request.
+                settings_source: self.session_id.as_ref().map(|session| {
+                    Arc::new(maki_agent::SessionRunSettings {
+                        model: Arc::clone(&self.model_slot) as Arc<dyn ModelSource>,
+                        session_id: session.id(),
+                    }) as Arc<dyn maki_agent::RunSettingsSource>
+                }),
+                // The schema is built here, so a run that can be reconfigured
+                // needs the means to rebuild it. `vars` is snapshotted: a cwd
+                // change defers behind the lease, so it cannot move mid-run.
+                tool_builder: Some({
+                    let vars = self.vars.clone();
+                    let config = self.config.clone();
+                    Arc::new(move |model: &Model, workflow: bool| {
+                        let filter = ToolFilter::from_config(&config, model, &[]);
+                        let ctx = DescriptionContext {
+                            filter: &filter,
+                            audience: ToolAudience::MAIN,
+                            workflow,
+                        };
+                        ToolRegistry::global().definitions(
+                            &vars,
+                            &ctx,
+                            model.supports_tool_examples(),
+                        )
+                    })
+                }),
                 config: self.config.clone(),
                 tool_output_lines: self.tool_output_lines,
                 permissions: Arc::clone(&self.permissions),

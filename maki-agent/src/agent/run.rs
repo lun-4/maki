@@ -81,6 +81,63 @@ fn filter_tools(all: &Value, allowed: &[String]) -> Value {
     )
 }
 
+/// Rebuilds a run's base tool schema for a model and workflow flag. The
+/// schema belongs to the frontend, so a run that can be reconfigured has to be
+/// handed the means to rebuild it.
+pub type ToolBuilder = Arc<dyn Fn(&Model, bool) -> Value + Send + Sync>;
+
+/// What a run should use from its next request onward.
+pub struct RunSettings {
+    pub provider: Arc<dyn Provider>,
+    pub model: Model,
+    pub fast: bool,
+    pub workflow: bool,
+}
+
+/// Supplies [`RunSettings`] between requests. A frontend that lets a session
+/// be reconfigured while a run is in flight provides one, so a change lands on
+/// the next inference rather than the next turn.
+pub trait RunSettingsSource: Send + Sync {
+    /// `None` while the source cannot answer yet, which reads as "no change".
+    fn current(&self) -> Option<RunSettings>;
+}
+
+/// Layers a session's option values over a [`ModelSource`]. The coordinator
+/// owns `fast` and `workflow`, so reading them here keeps one authority rather
+/// than mirroring them into a second place.
+pub struct SessionRunSettings {
+    pub model: Arc<dyn ModelSource>,
+    pub session_id: maki_storage::id::MakiId,
+}
+
+impl RunSettingsSource for SessionRunSettings {
+    fn current(&self) -> Option<RunSettings> {
+        use crate::session_options::{ENABLED_VALUE, FAST_OPTION_ID, WORKFLOW_OPTION_ID};
+
+        let (provider, model) = self.model.current()?;
+        let options =
+            crate::session_coordinator::SessionCoordinatorHandle::resolve(self.session_id)
+                .ok()?
+                .read()
+                .options();
+        let enabled = |id: &str| {
+            options
+                .options
+                .iter()
+                .find(|option| option.definition.id.as_ref() == id)
+                .is_some_and(|option| option.current_value.as_ref() == ENABLED_VALUE)
+        };
+        Some(RunSettings {
+            provider,
+            model,
+            // Thinking is deliberately absent: it has no session-level owner
+            // to read, so it stays whatever the turn was admitted with.
+            fast: enabled(FAST_OPTION_ID),
+            workflow: enabled(WORKFLOW_OPTION_ID),
+        })
+    }
+}
+
 /// The provider and model a run should use from its next request onward.
 /// A frontend that can change the model while a run is in flight supplies one
 /// of these; the agent polls it between requests so a change lands on the next
@@ -118,9 +175,11 @@ pub struct AgentParams {
     pub agent_id: AgentId,
     pub provider: Arc<dyn Provider>,
     pub model: Model,
-    /// `None` for a run whose model cannot change once it starts, such as a
+    /// `None` for a run whose settings cannot change once it starts, such as a
     /// single print-mode invocation.
-    pub model_source: Option<Arc<dyn ModelSource>>,
+    pub settings_source: Option<Arc<dyn RunSettingsSource>>,
+    /// Rebuilds the base tool schema when the model or workflow changes.
+    pub tool_builder: Option<ToolBuilder>,
     pub config: AgentConfig,
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
@@ -151,7 +210,8 @@ pub struct Agent<'h> {
     agent_id: AgentId,
     provider: Arc<dyn Provider>,
     model: Arc<Model>,
-    model_source: Option<Arc<dyn ModelSource>>,
+    settings_source: Option<Arc<dyn RunSettingsSource>>,
+    tool_builder: Option<ToolBuilder>,
     history: &'h mut History,
     system: String,
     event_tx: EventSender,
@@ -196,7 +256,8 @@ impl<'h> Agent<'h> {
             agent_id: params.agent_id,
             provider: params.provider,
             model: Arc::new(params.model),
-            model_source: params.model_source,
+            settings_source: params.settings_source,
+            tool_builder: params.tool_builder,
             config: params.config,
             tool_output_lines: params.tool_output_lines,
             permissions: params.permissions,
@@ -386,27 +447,44 @@ impl<'h> Agent<'h> {
     /// is still outstanding. Everything derived from the model -- the tool
     /// schema, thinking clamps, cost attribution -- is recomputed per request,
     /// so swapping the two fields is the whole change.
-    fn adopt_pending_model(&mut self) {
-        let Some(source) = &self.model_source else {
+    fn adopt_pending_settings(&mut self) {
+        let Some(source) = &self.settings_source else {
             return;
         };
-        let Some((provider, model)) = source.current() else {
+        let Some(settings) = source.current() else {
             return;
         };
-        if model.spec() == self.model.spec() {
+        let model_changed = settings.model.spec() != self.model.spec();
+        let workflow_changed = settings.workflow != self.workflow;
+        if !model_changed && !workflow_changed && settings.fast == self.opts.fast {
             return;
         }
-        info!(
-            from = %self.model.spec(),
-            to = %model.spec(),
-            self.num_turns,
-            "adopting a model changed mid-run"
-        );
-        let _ = self
-            .event_tx
-            .send(AgentEvent::ModelSwitched { spec: model.spec() });
-        self.provider = provider;
-        self.model = Arc::new(model);
+        if model_changed {
+            info!(
+                from = %self.model.spec(),
+                to = %settings.model.spec(),
+                self.num_turns,
+                "adopting a model changed mid-run"
+            );
+            let _ = self.event_tx.send(AgentEvent::ModelSwitched {
+                spec: settings.model.spec(),
+            });
+        }
+        self.provider = settings.provider;
+        self.model = Arc::new(settings.model);
+        self.workflow = settings.workflow;
+        // Thinking has no session-level owner, so the turn's value stands.
+        self.opts.fast = settings.fast;
+        // The base schema is built per model and workflow, so it is stale
+        // whenever either moves. Without this the request would reach a new
+        // model carrying the previous one's tool descriptions, and a workflow
+        // toggle would change subagent behaviour while the interpreter kept
+        // its old tool set.
+        if (model_changed || workflow_changed)
+            && let Some(build) = &self.tool_builder
+        {
+            self.tools = build(&self.model, self.workflow);
+        }
     }
 
     fn request_tools(&self) -> Cow<'_, Value> {
@@ -429,7 +507,7 @@ impl<'h> Agent<'h> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        self.adopt_pending_model();
+        self.adopt_pending_settings();
         let tools = self.request_tools();
         let response = match stream_with_retry(
             &*self.provider,
@@ -961,6 +1039,81 @@ mod tests {
         make_agent_with_sender(provider, history, raw_tx, event_rx)
     }
 
+    /// A source that hands back whatever it is told to, so a test can change a
+    /// run's settings between requests the way a user would.
+    struct StubSettings(std::sync::Mutex<RunSettings>);
+
+    impl RunSettingsSource for StubSettings {
+        fn current(&self) -> Option<RunSettings> {
+            let settings = self.0.lock().unwrap();
+            Some(RunSettings {
+                provider: Arc::clone(&settings.provider),
+                model: settings.model.clone(),
+                fast: settings.fast,
+                workflow: settings.workflow,
+            })
+        }
+    }
+
+    /// A workflow toggle has to reach a run in flight, and the tool schema is
+    /// built per model and workflow, so adopting the flag without rebuilding
+    /// the schema would change subagent behaviour while the interpreter kept
+    /// its old tool set.
+    #[test]
+    fn adopting_settings_rebuilds_the_tool_schema() {
+        let mut history = History::new(Vec::new());
+        let (raw_tx, event_rx) = flume::unbounded();
+        let (mut agent, _rx) =
+            make_agent_with_sender(MockProvider::new(vec![]), &mut history, raw_tx, event_rx);
+
+        let source = Arc::new(StubSettings(std::sync::Mutex::new(RunSettings {
+            provider: Arc::clone(&agent.provider),
+            model: default_model(),
+            fast: false,
+            workflow: true,
+        })));
+        agent.settings_source = Some(Arc::clone(&source) as Arc<dyn RunSettingsSource>);
+        agent.tool_builder = Some(Arc::new(
+            |_model: &Model, workflow: bool| serde_json::json!([{ "name": if workflow { "with-workflow" } else { "without" } }]),
+        ));
+        agent.workflow = false;
+        agent.tools = serde_json::json!([{ "name": "without" }]);
+
+        agent.adopt_pending_settings();
+
+        assert!(agent.workflow, "the flag is adopted");
+        assert_eq!(
+            agent.tools,
+            serde_json::json!([{ "name": "with-workflow" }]),
+            "the schema is rebuilt for the new flag"
+        );
+    }
+
+    /// Nothing changed means nothing is rebuilt, so a run does not pay for a
+    /// schema build on every request.
+    #[test]
+    fn adopting_settings_is_a_no_op_when_nothing_moved() {
+        let mut history = History::new(Vec::new());
+        let (raw_tx, event_rx) = flume::unbounded();
+        let (mut agent, _rx) =
+            make_agent_with_sender(MockProvider::new(vec![]), &mut history, raw_tx, event_rx);
+
+        let source = Arc::new(StubSettings(std::sync::Mutex::new(RunSettings {
+            provider: Arc::clone(&agent.provider),
+            model: default_model(),
+            fast: false,
+            workflow: false,
+        })));
+        agent.settings_source = Some(source as Arc<dyn RunSettingsSource>);
+        agent.tool_builder = Some(Arc::new(|_model: &Model, _workflow: bool| {
+            panic!("the schema must not be rebuilt when nothing changed")
+        }));
+        agent.workflow = false;
+        agent.opts.fast = false;
+
+        agent.adopt_pending_settings();
+    }
+
     fn make_agent_with_sender(
         provider: impl Provider + 'static,
         history: &mut History,
@@ -969,7 +1122,8 @@ mod tests {
     ) -> (Agent<'_>, flume::Receiver<Envelope>) {
         let agent = Agent::new(
             AgentParams {
-                model_source: None,
+                settings_source: None,
+                tool_builder: None,
                 agent_id: AgentId::generate(),
                 provider: Arc::new(provider),
                 model: default_model(),

@@ -15,6 +15,7 @@ pub use instructions::{
     is_instruction_file, load_instruction_text, load_instructions,
 };
 pub use run::{
-    Agent, AgentParams, AgentRunParams, ModelSource, SharedModel, estimate_message_tokens,
+    Agent, AgentParams, AgentRunParams, ModelSource, RunSettings, RunSettingsSource,
+    SessionRunSettings, SharedModel, ToolBuilder, estimate_message_tokens,
     resolve_compaction_model,
 };
