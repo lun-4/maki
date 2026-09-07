@@ -15,6 +15,7 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use tracing::info;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::repaint::{Cadence, Dirty};
@@ -78,7 +79,12 @@ impl StatusBar {
         }
     }
 
+    /// The single place a flash is set. Some failures surface nowhere else,
+    /// and a flash is gone within seconds, so mirror it to the log: tracing a
+    /// reported error afterwards should not depend on catching the status bar
+    /// before it clears.
     pub fn flash(&mut self, msg: String) {
+        info!(flash = %msg, "status flash");
         self.flash = Some((msg, Instant::now()));
     }
 
