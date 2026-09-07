@@ -2221,7 +2221,10 @@ impl<'t> EventLoop<'t> {
             // its history instead would checkpoint the previous conversation
             // away, and leaving it in place strands the tab under an id that
             // no longer resolves.
-            Action::NewSession => self.rotate_session(idx),
+            Action::NewSession => {
+                self.note_if_deferred(idx, "the new session");
+                self.rotate_session(idx)
+            }
             Action::LoadSession(loaded) => {
                 let loaded = *loaded;
                 let coordinator = self.sessions[idx].coordinator.clone();
@@ -2261,6 +2264,7 @@ impl<'t> EventLoop<'t> {
                 );
             }
             Action::ChangeDirectory(path) => {
+                self.note_if_deferred(idx, "cd");
                 let coordinator = self.sessions[idx].coordinator.clone();
                 let adopted: Arc<std::sync::Mutex<Option<PathBuf>>> = Arc::default();
                 let slot = Arc::clone(&adopted);
@@ -2377,6 +2381,17 @@ impl<'t> EventLoop<'t> {
             });
         })
         .detach();
+    }
+
+    /// The coordinator serves option changes while a turn holds the lease, but
+    /// still queues anything that changes what the turn is working on. Say so:
+    /// a command that is accepted and deferred should not look ignored.
+    fn note_if_deferred(&mut self, idx: usize, what: &str) {
+        if SessionStatus::of(&self.sessions[idx].app) != SessionStatus::Idle {
+            self.sessions[idx]
+                .app
+                .flash(format!("{what} applies when this turn finishes"));
+        }
     }
 
     fn handle_session_op(

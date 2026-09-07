@@ -1,5 +1,6 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -79,7 +80,11 @@ pub enum SessionCoordinatorError {
 
 #[derive(Debug, Clone)]
 pub struct SessionCheckpoint {
-    pub history: Arc<Vec<Message>>,
+    /// `None` when the operation being checkpointed does not change history,
+    /// which is every operation except a replacement. A lease holder's turn
+    /// has not committed yet, so the coordinator's copy is the pre-turn one:
+    /// writing it would rewind the stored session to before the running turn.
+    pub history: Option<Arc<Vec<Message>>>,
     pub model: Arc<str>,
     pub cwd: PathBuf,
     pub options: SessionOptionsSnapshot,
@@ -678,6 +683,156 @@ impl SessionReadHandle {
     }
 }
 
+/// Everything `run` needs to serve one operation. Bundled so operation
+/// handling can live outside the loop, which lets a held lease keep serving
+/// the operations it does not guard.
+struct CoordinatorCtx {
+    session_id: MakiId,
+    generation: u64,
+    catalog: SessionOptionCatalog,
+    read: SessionReadHandle,
+    model_policy: Arc<ModelPolicy>,
+    model_adopter: Arc<dyn ModelAdopter>,
+    directory_adopter: Arc<dyn DirectoryAdopter>,
+    checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>>,
+}
+
+/// A lease exists so a running turn's history is not replaced underneath it.
+/// That is all it guards: an operation that leaves history alone runs while
+/// the lease is held, so toggling YOLO reaches the turn that is prompting and
+/// a model change is not stalled behind a long run. Anything that changes what
+/// the turn is operating on waits.
+fn defers_behind_lease(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::ReplaceHistory { .. }
+            | Operation::ChangeDirectory { .. }
+            | Operation::PreparePluginOptions { .. }
+            | Operation::Close { .. }
+            | Operation::AcquireLease { .. }
+    )
+}
+
+async fn handle_operation(ctx: &CoordinatorCtx, operation: Operation) -> ControlFlow<()> {
+    match operation {
+        Operation::AcquireLease { .. } => {
+            // Held leases are driven by `run`; a nested one cannot happen.
+            unreachable!("lease acquisition is handled by the coordinator loop")
+        }
+        Operation::SetOption {
+            id,
+            value,
+            version,
+            reply,
+        } => {
+            let result = if version.is_some_and(|version| ctx.read.options().version != version) {
+                Err(SessionOptionError::StaleHandle(Arc::from(
+                    "session option snapshot changed during validation",
+                ))
+                .into())
+            } else if id.as_ref() == MODEL_OPTION_ID {
+                #[allow(clippy::explicit_auto_deref)]
+                set_model(
+                    &ctx.read,
+                    &*ctx.model_policy,
+                    &*ctx.model_adopter,
+                    &*ctx.checkpoint,
+                    &value,
+                )
+                .await
+            } else {
+                set_option(&ctx.read, &*ctx.checkpoint, &id, &value).await
+            };
+            let _ = reply.send(result);
+        }
+        Operation::ReplaceHistory { history, reply } => {
+            let result = replace_history(&ctx.read, &*ctx.checkpoint, history).await;
+            let _ = reply.send(result);
+        }
+        Operation::ChangeDirectory { path, reply } => {
+            let result =
+                change_directory(&ctx.read, &*ctx.directory_adopter, &*ctx.checkpoint, path).await;
+            let _ = reply.send(result);
+        }
+        Operation::UpdateModelValues { specs, reply } => {
+            let result = update_model_values(&ctx.read, &*ctx.checkpoint, specs).await;
+            let _ = reply.send(result);
+        }
+        Operation::PreparePluginOptions {
+            plugin,
+            definitions,
+            prepared,
+            decision,
+        } => {
+            let previous = ctx.read.options.snapshot();
+            let result = ctx
+                .read
+                .options
+                .prepare_replace_plugin(&plugin, definitions)
+                .map(|candidate| {
+                    candidate.unwrap_or_else(|| ctx.read.options.unchanged_candidate())
+                })
+                .map_err(Into::into);
+            let candidate = match result {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    let _ = prepared.send(Err(error));
+                    return ControlFlow::Continue(());
+                }
+            };
+            let candidate_snapshot = SessionOptions::candidate_snapshot(&candidate);
+            let (model, cwd) = {
+                let state = lock(&ctx.read.state);
+                (Arc::clone(&state.model), state.cwd.clone())
+            };
+            if let Err(error) = checkpoint_state(
+                &ctx.read,
+                &*ctx.checkpoint,
+                None,
+                model,
+                cwd,
+                candidate_snapshot,
+            )
+            .await
+            {
+                let _ = prepared.send(Err(error.into()));
+                return ControlFlow::Continue(());
+            }
+            let staged = PreparedPluginOptions {
+                session_id: ctx.session_id,
+                options: Arc::clone(&ctx.read.options),
+                previous: previous.clone(),
+                candidate,
+            };
+            if prepared.send(Ok(staged)).is_err() {
+                let _ = checkpoint_options(&ctx.read, &*ctx.checkpoint, previous).await;
+                return ControlFlow::Continue(());
+            }
+            match decision.recv_async().await {
+                Ok(PluginOptionDecision::Commit(reply)) => {
+                    let _ = reply.send(Ok(()));
+                }
+                Ok(PluginOptionDecision::Abort(reply)) => {
+                    let result = checkpoint_options(&ctx.read, &*ctx.checkpoint, previous)
+                        .await
+                        .map_err(Into::into);
+                    let _ = reply.send(result);
+                }
+                Err(_) => {
+                    let _ = checkpoint_options(&ctx.read, &*ctx.checkpoint, previous).await;
+                }
+            }
+        }
+        Operation::Close { reply } => {
+            unregister(ctx.session_id, ctx.generation);
+            ctx.catalog.unregister(ctx.session_id, ctx.generation);
+            let _ = reply.send(());
+            return ControlFlow::Break(());
+        }
+    }
+    ControlFlow::Continue(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run(
     session_id: MakiId,
@@ -690,128 +845,91 @@ async fn run(
     checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>>,
     rx: flume::Receiver<Operation>,
 ) {
-    while let Ok(operation) = rx.recv_async().await {
+    let ctx = CoordinatorCtx {
+        session_id,
+        generation,
+        catalog,
+        read,
+        model_policy,
+        model_adopter,
+        directory_adopter,
+        checkpoint,
+    };
+    let mut deferred: VecDeque<Operation> = VecDeque::new();
+    loop {
+        let operation = match deferred.pop_front() {
+            Some(operation) => operation,
+            None => match rx.recv_async().await {
+                Ok(operation) => operation,
+                Err(_) => break,
+            },
+        };
         match operation {
             Operation::AcquireLease { reply } => {
                 let (released, wait) = flume::bounded(1);
                 let lease = SessionLease {
-                    session_id,
+                    session_id: ctx.session_id,
                     released: Some(released),
-                    read: read.clone(),
+                    read: ctx.read.clone(),
                 };
                 if reply.send(Ok(lease)).is_err() {
                     continue;
                 }
-                if let Ok(LeaseRelease::CommitHistory { history, reply }) = wait.recv_async().await
-                {
-                    let result = replace_history(&read, &*checkpoint, history).await;
-                    let _ = reply.send(result);
-                    let _ = wait.recv_async().await;
+                hold_lease(&ctx, &rx, &wait, &mut deferred).await;
+            }
+            other => {
+                if handle_operation(&ctx, other).await.is_break() {
+                    return;
                 }
-            }
-            Operation::SetOption {
-                id,
-                value,
-                version,
-                reply,
-            } => {
-                let result = if version.is_some_and(|version| read.options().version != version) {
-                    Err(SessionOptionError::StaleHandle(Arc::from(
-                        "session option snapshot changed during validation",
-                    ))
-                    .into())
-                } else if id.as_ref() == MODEL_OPTION_ID {
-                    #[allow(clippy::explicit_auto_deref)]
-                    set_model(&read, &*model_policy, &*model_adopter, &*checkpoint, &value).await
-                } else {
-                    set_option(&read, &*checkpoint, &id, &value).await
-                };
-                let _ = reply.send(result);
-            }
-            Operation::ReplaceHistory { history, reply } => {
-                let result = replace_history(&read, &*checkpoint, history).await;
-                let _ = reply.send(result);
-            }
-            Operation::ChangeDirectory { path, reply } => {
-                let result = change_directory(&read, &*directory_adopter, &*checkpoint, path).await;
-                let _ = reply.send(result);
-            }
-            Operation::UpdateModelValues { specs, reply } => {
-                let result = update_model_values(&read, &*checkpoint, specs).await;
-                let _ = reply.send(result);
-            }
-            Operation::PreparePluginOptions {
-                plugin,
-                definitions,
-                prepared,
-                decision,
-            } => {
-                let previous = read.options.snapshot();
-                let result = read
-                    .options
-                    .prepare_replace_plugin(&plugin, definitions)
-                    .map(|candidate| {
-                        candidate.unwrap_or_else(|| read.options.unchanged_candidate())
-                    })
-                    .map_err(Into::into);
-                let candidate = match result {
-                    Ok(candidate) => candidate,
-                    Err(error) => {
-                        let _ = prepared.send(Err(error));
-                        continue;
-                    }
-                };
-                let candidate_snapshot = SessionOptions::candidate_snapshot(&candidate);
-                let (history, model, cwd) = {
-                    let state = lock(&read.state);
-                    (
-                        Arc::clone(&state.history),
-                        Arc::clone(&state.model),
-                        state.cwd.clone(),
-                    )
-                };
-                if let Err(error) =
-                    checkpoint_state(&read, &*checkpoint, history, model, cwd, candidate_snapshot)
-                        .await
-                {
-                    let _ = prepared.send(Err(error.into()));
-                    continue;
-                }
-                let staged = PreparedPluginOptions {
-                    session_id,
-                    options: Arc::clone(&read.options),
-                    previous: previous.clone(),
-                    candidate,
-                };
-                if prepared.send(Ok(staged)).is_err() {
-                    let _ = checkpoint_options(&read, &*checkpoint, previous).await;
-                    continue;
-                }
-                match decision.recv_async().await {
-                    Ok(PluginOptionDecision::Commit(reply)) => {
-                        let _ = reply.send(Ok(()));
-                    }
-                    Ok(PluginOptionDecision::Abort(reply)) => {
-                        let result = checkpoint_options(&read, &*checkpoint, previous)
-                            .await
-                            .map_err(Into::into);
-                        let _ = reply.send(result);
-                    }
-                    Err(_) => {
-                        let _ = checkpoint_options(&read, &*checkpoint, previous).await;
-                    }
-                }
-            }
-            Operation::Close { reply } => {
-                unregister(session_id, generation);
-                catalog.unregister(session_id, generation);
-                let _ = reply.send(());
-                break;
             }
         }
     }
-    unregister(session_id, generation);
-    catalog.unregister(session_id, generation);
+    unregister(ctx.session_id, ctx.generation);
+    ctx.catalog.unregister(ctx.session_id, ctx.generation);
+}
+
+/// Serves operations for as long as the lease is held. History replacement and
+/// anything else the lease guards is queued for after the release, so the turn
+/// still owns what it is working on; everything else runs now.
+async fn hold_lease(
+    ctx: &CoordinatorCtx,
+    rx: &flume::Receiver<Operation>,
+    wait: &flume::Receiver<LeaseRelease>,
+    deferred: &mut VecDeque<Operation>,
+) {
+    loop {
+        let release = std::pin::pin!(wait.recv_async());
+        let incoming = std::pin::pin!(rx.recv_async());
+        match futures_lite::future::or(async { Either::Left(release.await) }, async {
+            Either::Right(incoming.await)
+        })
+        .await
+        {
+            Either::Left(Ok(LeaseRelease::CommitHistory { history, reply })) => {
+                let result = replace_history(&ctx.read, &*ctx.checkpoint, history).await;
+                let _ = reply.send(result);
+                let _ = wait.recv_async().await;
+                return;
+            }
+            // Released without a commit, or the holder dropped.
+            Either::Left(_) => return,
+            Either::Right(Ok(operation)) => {
+                if defers_behind_lease(&operation) {
+                    deferred.push_back(operation);
+                } else {
+                    // Only `Close` breaks, and it defers.
+                    let _ = handle_operation(ctx, operation).await;
+                }
+            }
+            // The last handle is gone; nothing more will arrive.
+            Either::Right(Err(_)) => return,
+        }
+    }
+}
+
+enum Either<L, R> {
+    Left(L),
+    Right(R),
 }
 
 async fn abort_plugin_options(
@@ -846,21 +964,17 @@ async fn checkpoint_options(
     checkpoint: &dyn CheckpointWriter<SessionCheckpoint>,
     options: SessionOptionsSnapshot,
 ) -> Result<(), CheckpointError> {
-    let (history, model, cwd) = {
+    let (model, cwd) = {
         let state = lock(&read.state);
-        (
-            Arc::clone(&state.history),
-            Arc::clone(&state.model),
-            state.cwd.clone(),
-        )
+        (Arc::clone(&state.model), state.cwd.clone())
     };
-    checkpoint_state(read, checkpoint, history, model, cwd, options).await
+    checkpoint_state(read, checkpoint, None, model, cwd, options).await
 }
 
 async fn checkpoint_state(
     read: &SessionReadHandle,
     checkpoint: &dyn CheckpointWriter<SessionCheckpoint>,
-    history: Arc<Vec<Message>>,
+    history: Option<Arc<Vec<Message>>>,
     model: Arc<str>,
     cwd: PathBuf,
     options: SessionOptionsSnapshot,
@@ -907,7 +1021,7 @@ async fn replace_history(
     checkpoint_state(
         read,
         checkpoint,
-        Arc::clone(&history),
+        Some(Arc::clone(&history)),
         model,
         cwd,
         read.options.snapshot(),
@@ -953,15 +1067,11 @@ async fn update_model_values(
         return Ok(snapshot);
     };
     let options = SessionOptions::candidate_snapshot(&candidate);
-    let (history, model, cwd) = {
+    let (model, cwd) = {
         let state = lock(&read.state);
-        (
-            Arc::clone(&state.history),
-            Arc::clone(&state.model),
-            state.cwd.clone(),
-        )
+        (Arc::clone(&state.model), state.cwd.clone())
     };
-    checkpoint_state(read, checkpoint, history, model, cwd, options).await?;
+    checkpoint_state(read, checkpoint, None, model, cwd, options).await?;
     read.options.commit(candidate).map_err(Into::into)
 }
 
@@ -971,13 +1081,9 @@ async fn change_directory(
     checkpoint: &dyn CheckpointWriter<SessionCheckpoint>,
     path: PathBuf,
 ) -> Result<PathBuf, SessionCoordinatorError> {
-    let (history, model, previous) = {
+    let (model, previous) = {
         let state = lock(&read.state);
-        (
-            Arc::clone(&state.history),
-            Arc::clone(&state.model),
-            state.cwd.clone(),
-        )
+        (Arc::clone(&state.model), state.cwd.clone())
     };
     let canonical = directory_adopter
         .adopt(path)
@@ -989,7 +1095,7 @@ async fn change_directory(
     let result = checkpoint_state(
         read,
         checkpoint,
-        history,
+        None,
         model,
         canonical.clone(),
         read.options.snapshot(),
@@ -1050,12 +1156,9 @@ async fn set_model(
         .adopt(model)
         .await
         .map_err(SessionCoordinatorError::ModelAdoption)?;
-    let (history, cwd) = {
-        let state = lock(&read.state);
-        (Arc::clone(&state.history), state.cwd.clone())
-    };
+    let cwd = lock(&read.state).cwd.clone();
     let checkpoint_result =
-        checkpoint_state(read, checkpoint, history, Arc::from(spec), cwd, options).await;
+        checkpoint_state(read, checkpoint, None, Arc::from(spec), cwd, options).await;
     if let Err(error) = checkpoint_result {
         let previous_model = Model::from_spec(&previous_spec).map_err(|rollback_error| {
             SessionCoordinatorError::ModelRollback(Arc::from(rollback_error.to_string()))
@@ -1093,15 +1196,11 @@ async fn set_option(
         return Ok(read.options.snapshot());
     };
     let options = SessionOptions::candidate_snapshot(&candidate);
-    let (history, model, cwd) = {
+    let (model, cwd) = {
         let state = lock(&read.state);
-        (
-            Arc::clone(&state.history),
-            Arc::clone(&state.model),
-            state.cwd.clone(),
-        )
+        (Arc::clone(&state.model), state.cwd.clone())
     };
-    checkpoint_state(read, checkpoint, history, model, cwd, options).await?;
+    checkpoint_state(read, checkpoint, None, model, cwd, options).await?;
     read.options.commit(candidate).map_err(Into::into)
 }
 
@@ -1476,7 +1575,79 @@ mod tests {
     }
 
     #[test]
-    fn external_mutation_queues_until_lease_release() {
+    /// The lease guards history, not options. Toggling YOLO has to reach the
+    /// turn that is prompting, and a model change should not wait out a long
+    /// run, so an option change runs while the lease is held.
+    fn an_option_change_runs_while_a_lease_is_held() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let coordinator = register(id);
+            let lease = coordinator.acquire_lease().await.unwrap();
+
+            let snapshot = coordinator
+                .set_option(YOLO_OPTION_ID, ENABLED_VALUE)
+                .await
+                .expect("an option change must not wait for the lease");
+            assert_eq!(snapshot.options[1].current_value.as_ref(), ENABLED_VALUE);
+
+            drop(lease);
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    /// An option change while a turn holds the lease must not carry history.
+    /// The coordinator's copy is the last committed one, so the running turn's
+    /// messages are not in it; writing it would rewind the stored session to
+    /// before the turn. Only a replacement owns history.
+    #[test]
+    fn an_option_change_does_not_checkpoint_history() {
+        smol::block_on(async {
+            let carried: Arc<Mutex<Vec<Option<usize>>>> = Arc::default();
+            let seen = Arc::clone(&carried);
+            let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> =
+                Arc::new(move |request: CheckpointRequest<SessionCheckpoint>| {
+                    lock(&seen).push(request.snapshot.history.as_ref().map(|h| h.len()));
+                    Box::pin(async move {
+                        Ok(CheckpointAck {
+                            session_id: request.session_id,
+                            version: request.version,
+                        })
+                    }) as CheckpointFuture
+                });
+            let id = MakiId::generate();
+            let coordinator = SessionCoordinatorHandle::register(params(id, checkpoint)).unwrap();
+            let lease = coordinator.acquire_lease().await.unwrap();
+
+            coordinator
+                .set_option(YOLO_OPTION_ID, ENABLED_VALUE)
+                .await
+                .unwrap();
+            coordinator
+                .update_model_values(vec![Arc::from("openai/gpt-5")])
+                .await
+                .unwrap();
+
+            assert_eq!(
+                *lock(&carried),
+                vec![None, None],
+                "an option change must leave the stored history alone"
+            );
+
+            // A replacement is the one operation that owns history.
+            drop(lease);
+            coordinator
+                .replace_history(vec![Message::user("committed".into())])
+                .await
+                .unwrap();
+            assert_eq!(lock(&carried).last().copied().flatten(), Some(1));
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    /// The other half: replacing history under a running turn is exactly what
+    /// the lease exists to prevent.
+    #[test]
+    fn replacing_history_waits_for_the_lease() {
         smol::block_on(async {
             let id = MakiId::generate();
             let coordinator = register(id);
@@ -1484,15 +1655,20 @@ mod tests {
             let (done_tx, done_rx) = flume::bounded(1);
             let queued = coordinator.clone();
             smol::spawn(async move {
-                let result = queued.set_option(YOLO_OPTION_ID, ENABLED_VALUE).await;
+                let result = queued
+                    .replace_history(vec![Message::user("late".into())])
+                    .await;
                 let _ = done_tx.send(result);
             })
             .detach();
 
-            assert!(done_rx.try_recv().is_err());
+            assert!(
+                done_rx.try_recv().is_err(),
+                "history replacement must wait for the turn to release the lease"
+            );
             drop(lease);
-            let snapshot = done_rx.recv_async().await.unwrap().unwrap();
-            assert_eq!(snapshot.options[1].current_value.as_ref(), ENABLED_VALUE);
+            done_rx.recv_async().await.unwrap().unwrap();
+            assert_eq!(coordinator.read().history().len(), 1);
             coordinator.close().await.unwrap();
         });
     }
@@ -1508,7 +1684,9 @@ mod tests {
             let (done_tx, done_rx) = flume::bounded(1);
             let queued = coordinator.clone();
             smol::spawn(async move {
-                let result = queued.set_option(YOLO_OPTION_ID, ENABLED_VALUE).await;
+                let result = queued
+                    .replace_history(vec![Message::user("queued".into())])
+                    .await;
                 let _ = done_tx.send(result);
             })
             .detach();
@@ -1521,8 +1699,12 @@ mod tests {
             assert!(done_rx.try_recv().is_err());
 
             drop(lease);
-            let snapshot = done_rx.recv_async().await.unwrap().unwrap();
-            assert_eq!(snapshot.options[1].current_value.as_ref(), ENABLED_VALUE);
+            done_rx.recv_async().await.unwrap().unwrap();
+            assert_eq!(
+                coordinator.read().history().len(),
+                1,
+                "the queued replacement lands after the commit, not before it"
+            );
             coordinator.close().await.unwrap();
         });
     }
@@ -1683,7 +1865,9 @@ mod tests {
             let checkpoint: Arc<dyn CheckpointWriter<SessionCheckpoint>> = Arc::new({
                 let saved = Arc::clone(&saved);
                 move |request: CheckpointRequest<SessionCheckpoint>| {
-                    lock(&saved).push(request.snapshot.history.as_ref().clone());
+                    if let Some(history) = &request.snapshot.history {
+                        lock(&saved).push(history.as_ref().clone());
+                    }
                     Box::pin(async move {
                         Ok(CheckpointAck {
                             session_id: request.session_id,

@@ -91,7 +91,9 @@ impl CheckpointWriter<SessionCheckpoint> for CoordinatorCheckpointWriter {
                 })
             });
         };
-        if !histories_match(base.messages(), &request.snapshot.history) {
+        if let Some(history) = &request.snapshot.history
+            && !histories_match(base.messages(), history)
+        {
             state
                 .coordinator_history_bases
                 .entry(session_id)
@@ -304,8 +306,14 @@ fn merge_tui_snapshot(
 
 fn merge_checkpoint(base: &AppSession, checkpoint: &SessionCheckpoint) -> AppSession {
     let mut session = base.clone();
-    if !histories_match(session.messages(), &checkpoint.history) {
-        session.replace_messages(checkpoint.history.as_ref().clone());
+    // Only a history replacement carries messages. An option or model change
+    // leaves them alone: while a turn holds the lease the coordinator's copy
+    // is the pre-turn one, and writing it would rewind the stored session to
+    // before the running turn.
+    if let Some(history) = &checkpoint.history
+        && !histories_match(session.messages(), history)
+    {
+        session.replace_messages(history.as_ref().clone());
     }
     session.set_model(checkpoint.model.to_string());
     session.set_cwd(checkpoint.cwd.to_string_lossy().into_owned());
@@ -603,7 +611,7 @@ mod tests {
                         epoch: 1,
                     },
                     snapshot: Arc::new(SessionCheckpoint {
-                        history: Arc::new(Vec::new()),
+                        history: Some(Arc::new(Vec::new())),
                         model: Arc::from("next/model"),
                         cwd: std::path::PathBuf::from(CWD),
                         options,
@@ -655,7 +663,7 @@ mod tests {
                         epoch: 1,
                     },
                     snapshot: Arc::new(SessionCheckpoint {
-                        history: Arc::new(Vec::new()),
+                        history: Some(Arc::new(Vec::new())),
                         model: Arc::from("next/model"),
                         cwd: std::path::PathBuf::from(CWD),
                         options,
@@ -701,7 +709,7 @@ mod tests {
                     session_id: id,
                     version,
                     snapshot: Arc::new(SessionCheckpoint {
-                        history: Arc::new(history),
+                        history: Some(Arc::new(history)),
                         model: Arc::from("next/model"),
                         cwd: "/tmp/next".into(),
                         options,

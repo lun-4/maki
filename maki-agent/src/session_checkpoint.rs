@@ -58,7 +58,12 @@ impl SessionLogCheckpoint {
     ) -> Result<CheckpointAck, CheckpointError> {
         let mut session = lock(&self.session);
         let checkpoint = &request.snapshot;
-        session.replace_messages(checkpoint.history.as_ref().clone());
+        // Only a history replacement carries messages; an option or model
+        // change leaves the stored ones alone rather than rewinding them to
+        // the coordinator's pre-turn copy.
+        if let Some(history) = &checkpoint.history {
+            session.replace_messages(history.as_ref().clone());
+        }
         session.set_model(checkpoint.model.to_string());
         session.set_cwd(checkpoint.cwd.to_string_lossy().into_owned());
         session.update_title_if_default();
@@ -143,7 +148,7 @@ mod tests {
                         epoch: 1,
                     },
                     snapshot: Arc::new(SessionCheckpoint {
-                        history: Arc::new(vec![Message::user("hello".into())]),
+                        history: Some(Arc::new(vec![Message::user("hello".into())])),
                         model: Arc::from("test/model"),
                         cwd: PathBuf::from("/project"),
                         options: options.snapshot(),

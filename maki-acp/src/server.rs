@@ -2103,14 +2103,14 @@ mod tests {
             .unwrap();
             assert!(input_rx.try_recv().is_ok());
 
+            // The lease guards history, so history replacement is what it
+            // holds off. An option change is served while the prompt runs and
+            // would not observe the lease at all.
             let (done_tx, done_rx) = flume::bounded(1);
             let queued = coordinator.clone();
             smol::spawn(async move {
                 let result = queued
-                    .set_option(
-                        maki_agent::session_options::YOLO_OPTION_ID,
-                        maki_agent::session_options::ENABLED_VALUE,
-                    )
+                    .replace_history(vec![maki_providers::Message::user("late".into())])
                     .await;
                 let _ = done_tx.send(result);
             })
@@ -2121,11 +2121,8 @@ mod tests {
             let operation = take_active_operation(pending, OperationKind::PrimaryTurn).unwrap();
             assert_eq!(operation.request_id, request_id);
             drop(operation);
-            let snapshot = done_rx.recv_async().await.unwrap().unwrap();
-            assert_eq!(
-                snapshot.options[1].current_value.as_ref(),
-                maki_agent::session_options::ENABLED_VALUE
-            );
+            done_rx.recv_async().await.unwrap().unwrap();
+            assert_eq!(coordinator.read().history().len(), 1);
             coordinator.close().await.unwrap();
         });
     }
