@@ -244,3 +244,234 @@ Update user-facing ACP and command pages for command availability and protocol l
 - **Client limitation:** ACP v1 cannot clear Zed’s transcript, replace the active session ID from a slash prompt, or change Zed’s displayed session cwd. Documentation and progress text must not claim those effects.
 - **Client verification risk:** Zed may rank or hide several `mode` options. Full wire snapshots are the portable guarantee; the manual Zed record must note actual presentation without adding client-specific protocol behavior.
 - **Scope boundary:** no generic Rust TUI selector, no new keybinding, no ACP dependency upgrade solely for this work, no monolithic command-effect protocol, and no attempt to make old transcript messages disappear.
+# Rebase onto the shared agent actor
+
+The branch was implemented against `145541ff`. `mistress` has since replaced the TUI's `AgentLoop` with the shared agent actor in `maki-agent/src/actor/`, replaced `ModelSlot` with `ProviderSlot` plus provider identity generations, moved provider usage into a Lua-driven state machine, and changed Bash auto mode so a classifier error falls back to permission enforcement instead of failing closed. Merging `635a6317` required re-seating this plan's lease and coordinator work onto machinery that no longer exists.
+
+## Merge resolution
+
+| Area | Resolution |
+|---|---|
+| `maki-lua/src/docs.rs`, `api/session.rs` | Both sides added list entries. Kept both. |
+| `maki-lua/src/api/agent.rs` | `mistress` deleted the `SubagentDriver` block this plan had touched. The deletion wins; `lease_committer: None` moved to the five surviving `AgentInput` literals. A sub-session must not commit into its parent's coordinator. |
+| `plugins/bash/init.lua` | Kept the session-option auto-mode gate. Dropped `ctx:set_deadline` from that position: `mistress` moved it to immediately before `jobstart`, so approval time no longer counts against the execution timeout. |
+| `maki-lua/tests/real_plugins_restore.rs` | Took the renamed tests and the inverted classifier-error semantics, threaded `SessionCoordinatorHandle` through them. `exec_verdict` is gone; its last caller uses `exec_verdict_prompt`. |
+| `maki-ui/src/agent/agent_loop.rs` | Lease acquisition moved from the deleted `AgentLoop::process_entry` into `TuiActorBackend::acquire_lease`, called from `execute_agent` and `run_compact`. History commits on `TurnOutcome::Completed` and after a successful idle compaction. |
+| `maki-ui/src/agent/mod.rs` | Kept `mistress`'s `ProviderSlot` rewrite plus this plan's `cwd` slot. `SessionMailbox` is minted once per session and threaded through respawn. |
+| `maki-ui/src/event_loop.rs` | Per-session model slots retyped to `ProviderSlot`. The provider-usage readers follow the focused session. Coordinator calls dispatch off the event-loop thread. |
+
+Provider usage remains one coordinator listening on one channel. Session slots share the event loop's change channel through `ProviderSlot::with_change_tx`, and instance generations come from a process-wide counter so identities stay unique across slots.
+
+## Defects found and corrected
+
+An adversarial review of the merged branch, followed by manual testing through the TUI, found fifteen defects. Three came from the merge resolution; the rest were already present in the plan's implementation and were exposed by the new base or by testing.
+
+### Introduced by the merge
+
+- Respawn minted a fresh `SessionMailbox`. The coordinator hands out the mailbox it was registered with and cannot learn about a replacement, so every notification after a respawn reached an instance nobody polled. The mailbox is now created once in `AgentHandles::spawn` and reused.
+- A lease failure returned `SetupFailed`, which the runner discards for a root turn. TUI prompts are root turns, so the prompt vanished with no feedback. `report_setup_failure` emits `ControlError` before returning.
+- `change_model` installed an already-tracked provider into the event loop's slot, double-wrapping `TrackedProvider` so a session-local re-auth never reached the usage coordinator. The install is gone; session slots report through the shared channel instead.
+
+### Already present in the implementation
+
+- `headless::spawn` registered no coordinator, so every option read and every mailbox notification in print mode failed with `session not live`. Bash could not run under `--print`. SDK mode passed an empty option catalog with the same effect. Both now receive the real catalog, and `auto_mode_enabled` falls back to the configured default when there is no session at all.
+- The per-tick model sync wrote the event loop's global model into every tab's `App` and persisted it, so a session restored on its own model displayed and saved the wrong one while inference used the right one. Each tab now follows its own slot.
+- Coordinator operations ran under `smol::block_on` on the event-loop thread. A turn holds the session lease for its whole duration, so `/model` during a turn froze the UI, and a turn parked on a permission prompt deadlocked the process. Operations dispatch off-thread and apply through `InternalEvent::SessionOp`.
+- The model option's value list was fixed at registration, but providers discover models in the background. A session registered before discovery could only select the model it started on. `sync_model_values` republishes through `update_model_values`, which ACP already did.
+- `/new` rotates the tab onto a new session id but left the coordinator registered under the old one. Restoring the previous session failed with `session already live`, the new session never acquired a lease, and `replace_history(Vec::new())` on the retired coordinator checkpointed the previous conversation away. `rotate_session` retires the old coordinator and registers one for the new id, and the mailbox rotates with it.
+- A coordinator was registered before its session had a snapshot in the storage writer, so its first checkpoint had no base to merge into. Seeding moved into `register_coordinator`, where every registration path gets it.
+- The cleanup that removes an empty session's files also forgot its writer snapshot, which is the base a coordinator checkpoint merges into. After `/new` the fresh session is empty, so the cleanup ran, and the model change on it failed with `session snapshot is unavailable`. The two deletes meant different things through one function: a delete from the picker still forgets everything, while the cleanup keeps the snapshot and lets the files come back if the coordinator later has something worth saving. This one was invisible to reading either subsystem, because each is correct alone: the cleanup predates the plan and the merge-into-snapshot checkpoint comes from it. Logging the storage writer's map found it in one reproduction after three wrong diagnoses from code.
+- Restoring a session no longer reused an idle empty tab, stranding one tab per restore. The path is restored by pushing the new runtime and removing the stale one; a tab owns a coordinator and mailbox keyed to its session id and cannot be repointed in place.
+- `run_compact` returned `ControlDone` where the runner expects `CompactDone`, warning on every idle compaction.
+- The TUI wrote `input.lease_committer` and then committed through a separately acquired lease, leaving the assignment dead.
+
+## Verification
+
+`just ci` passes: `fmt-check`, `lint`, `test`, `gen-docs-check`, `machete`.
+
+Every defect above has a regression test, each confirmed to fail with its fix reverted:
+
+| Test | Defect |
+|---|---|
+| `maki-ui`: `respawn_keeps_the_mailbox_the_coordinator_hands_out` | Mailbox replaced on respawn |
+| `maki-ui`: `session_slot_reports_into_the_shared_change_channel` | Session-local re-auth lost; colliding instance generations |
+| `maki-ui`: `rotate_mailbox_repoints_the_agent_at_the_new_session` | Mailbox left on the retired session after `/new` |
+| `maki-ui`: `rotating_a_session_moves_its_coordinator_and_mailbox` | Coordinator left on the retired session id after `/new` |
+| `maki-ui`: `each_tab_follows_its_own_model_slot` | Per-tab model overwritten from the global slot |
+| `maki-ui`: `a_setup_failure_reaches_the_user` | A turn dying in setup vanished silently |
+| `maki-ui`: `cleaning_up_an_empty_session_keeps_its_coordinator_base` | Empty-session cleanup dropped the checkpoint base |
+| `maki-ui`: `deleting_a_session_forgets_its_coordinator_base` | The other half: a deleted session must not be resurrected |
+| `maki-agent`: `spawn_registers_a_resolvable_coordinator` | No coordinator in print mode |
+| `maki-agent`: `a_model_discovered_after_registration_becomes_selectable` | Model list frozen at registration |
+
+Reaching the three `EventLoop`-bound defects meant moving the logic off a type that owns a terminal. `register_coordinator` took only four things from `SpawnCtx`, now a `CoordinatorDeps`; `sync_session_models` takes only the sessions, which makes reading one shared slot for every tab unrepresentable rather than merely fixed; and `rotate_session_coordinator` holds the rotation invariant. An `EventLoop` still cannot be constructed in a test, so logic that needs one should be moved out rather than left uncovered.
+
+## Flaky tests found while verifying
+
+Three tests failed intermittently under full-suite contention, each asserting an outcome that was only usually true.
+
+| Test | Cause |
+|---|---|
+| `file_refresh_uses_lexical_source_order_for_ties` | Fixed hundred-iteration budget polling an async matcher; uses the deadline helper `91-flaky-tests` added |
+| `failed_subagent_turn_resolves_and_same_session_recovers` | Assumed the first envelope on the parent channel was the history one, then assumed `status` had settled when `prompt` returned |
+| `live_event_handle_does_not_hang_after_begin_shutdown` | Raced the dispatch loop over whether a shutting-down host still serves requests |
+
+The third was corrected in the product rather than the test: `EventHandle` carries the host's shutdown flag and `collect_prompt_slots` returns defaults without sending into a dying host, which is what the test's own comment already claimed. Fifty consecutive full-suite runs pass.
+
+## Lease scope
+
+The lease was first implemented as "nothing else may touch this session while a
+turn runs": `AcquireLease` parked the coordinator's whole operation loop until
+the turn released it, so every operation queued behind it. That is broader than
+what the lease is for, and it changed behaviour the TUI had before this plan.
+On `mistress` `/yolo` flipped a `PermissionManager` flag directly, `/fast` set a
+field, and `/model` installed into the model slot, all synchronously; each took
+effect the moment it was typed. Toggling YOLO mid-turn is how a user escapes a
+permission prompt they are looking at, so deferring it removes the reason to
+reach for it.
+
+The lease now guards history alone. An operation that leaves history untouched
+runs while the lease is held; `ReplaceHistory`, `ChangeDirectory`,
+`PreparePluginOptions`, `Close` and a nested `AcquireLease` queue until the turn
+releases. Operation handling moved out of the loop into `handle_operation` so
+`hold_lease` can serve from the same set.
+
+Two consequences worth stating. A turn's history commit travels through the same
+loop, so a slow operation served during a lease delays that commit; the trade is
+deliberate, because the alternative is the UI waiting on the turn. And `fast` and
+`workflow` are captured into a turn's input when it is admitted, so toggling
+either mid-turn updates the option snapshot while the running turn keeps the old
+value -- the same behaviour `mistress` had, not something the lease change
+introduces.
+
+Commands that still defer say so rather than appearing ignored.
+
+## Model changes mid-run
+
+Narrowing the lease made an option change reach the coordinator during a
+running turn, but a run still captured its provider and model when it started,
+so a model change applied only to the following turn. For an agentic loop of a
+dozen requests that is a long wait, and it reads as the change having been
+ignored -- the status bar showed the new name while every request kept using
+the old model.
+
+A run now polls an optional `ModelSource` at the top of each request. That
+point is safe because every tool call already has its result in history, so a
+changed tool schema cannot orphan an outstanding one; everything else derived
+from the model is recomputed per request already. Cost attribution improves as a
+side effect, each request billing against the model that served it.
+
+Two properties made this smaller than it looks. History is stored
+provider-neutral -- `ContentBlock` is a shared representation each adapter
+renders, and a reasoning block's signature is used by the provider that issued
+it and ignored elsewhere -- so a history built under one provider is not
+malformed for another. And `resolve_compaction_model` already substituted a
+different provider and model for a request inside a live run, so the precedent
+existed.
+
+One claim made when this landed was wrong and is corrected here. Not everything
+derived from the model is recomputed per request: `request_tools` filters and
+extends a base schema the frontend built once for the turn, so a run that
+switched model carried the previous model's tool descriptions. The base is
+rebuilt now, through a builder the frontend supplies.
+
+ACP and SDK adopt through a shared source rather than asking the session loop to
+swap its locals. That loop reads its control channel only between turns, so the
+round-trip could not adopt mid-run at all; worse, once the coordinator served
+option changes during a lease, it deadlocked. The adopter waited for the turn,
+the turn's history commit waited for the coordinator, and the coordinator waited
+for the adopter. Installing into the source is a store, so nothing waits.
+`ChangeDirectory` was never exposed to this because it defers behind the lease.
+
+Between a change and the request that picks it up, the status bar shows the
+model the run is on with a queued marker. Showing the new name would claim a
+switch that has not happened; showing only the old one looks like the change was
+dropped.
+
+`fast` and `workflow` travel the same path. The coordinator owns both as
+session options, so the source reads them from there rather than mirroring them
+into a second place, and a toggle reaches the run at its next request. Workflow
+needed the schema rebuild to be worth anything: the flag admits `task` into the
+interpreter's tool list, which is decided when the schema is built, so adopting
+the flag alone would have changed subagent behaviour while the interpreter kept
+its old tools.
+
+Thinking is the exception. It has no session-level owner to read -- it is not a
+session option, it lives in the TUI's own state -- so it stays whatever the turn
+was admitted with. Making it behave like the others means making it a session
+option first.
+
+## What the lease still had to guard
+
+Narrowing the lease to history replacement was not enough on its own, because
+two operations it kept serving write history on the way past. `set_option` and
+`update_model_values` snapshot `state.history` for their checkpoint, and that
+field is written in exactly one place -- a replacement -- so while a lease is
+held it is the last committed history, from before the running turn. The TUI's
+writer merges a checkpoint by replacing the stored messages with the ones it
+carries, so an option change mid-turn rewound the saved session to before the
+turn, and the history-base guard then preserved the rewind against the next
+correct save.
+
+The unattended path was the worse one: republishing discovered models calls
+`update_model_values` on every session, so a tab with a turn in flight lost its
+persisted history seconds after startup with no user action.
+
+A checkpoint's history is optional now, and only a replacement carries it. An
+option, model or directory change leaves the stored messages alone, which is
+what those operations always meant.
+
+## The interactive loop and the shared model
+
+Pointing the ACP and SDK adopters at the shared source left
+`InteractiveControl::AdoptModel` with no producer, and the interactive session
+loop kept its own `provider` and `model` locals. Those locals were never
+updated again, so after a model change everything the loop builds from them was
+stale: the advertised tool set, which gates tools on model capabilities, the
+system prompt, and -- worst -- manual compaction and isolated turns, which ran
+on the old provider entirely. The SDK's `set_model` control request rebuilt a
+provider into those locals and was then discarded, because the turn reads the
+shared source.
+
+The loop refreshes its locals from the shared source each iteration, so
+controls and turns alike see the current model, and `set_model` installs there.
+The dead control is gone rather than left as an invitation for the two to
+diverge again. Interactive runs also carry a tool builder now; without one they
+adopted a workflow toggle while keeping the schema built for the old flag,
+which is the half-applied state the change set out to avoid.
+
+## Smaller corrections from the same review
+
+A session cleaned up as empty keeps its writer snapshot so its coordinator can
+still checkpoint, but nothing forgot it afterwards, so `/new` on an untouched
+session left one behind every time. Retiring a coordinator forgets it.
+
+Rotating a tab onto a new session mutated the mailbox before registration could
+fail, and a failure left the tab on a session id nothing could resolve while
+every later operation checkpointed into the retired session's file. Registration
+happens first now, and the mailbox moves only once it succeeds.
+
+The guard against awaiting a coordinator operation on the event-loop thread
+listed the wrong operations after the lease was narrowed: it still named the two
+the lease now serves, and omitted `close`, which the lease defers. Correcting it
+caught a real one at shutdown. That await is gone -- dropping the handle ends the
+coordinator's loop and unregisters on the way out, and a close persists nothing,
+so awaiting it bought only the risk of hanging exit behind a turn that never
+released its lease.
+
+## Exit latency
+
+Retiring coordinators by dropping their handles rather than awaiting a close
+made exit wait three seconds. The storage writer's thread stops when its wake
+channel closes, but every coordinator's checkpoint writer holds a clone of that
+sender, and those live in tasks that exit when next polled rather than when the
+handle drops. So the channel usually still had a live sender at exit and the
+drain ran to its timeout -- intermittently, which is why it looked like a hang
+rather than a constant cost.
+
+The thread stops on an explicit flag now instead of inferring it from the last
+sender going away. Nothing that merely holds a wake clone can delay exit.
+
+## Known ordering wart
+
+`settle_turn` resolves a turn's ticket inside `finalize_turn`, which runs before the actor flips to idle. A plugin that calls `sess:prompt()` and then `sess:status()` can see `running`, with no error, for a turn that has already returned. The test that caught this waits for the status to settle; the ordering is unchanged. Correcting it means resolving the ticket after the idle flip rather than inside `finalize_turn`, which has eight call sites, and setting idle first is wrong because `status` reads the retained outcome and would then see a stale one. This is upstream of the plan and left for a separate change.
