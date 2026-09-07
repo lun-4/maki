@@ -376,6 +376,11 @@ pub struct App {
     pub(crate) cmd_tx: Option<flume::Sender<super::AgentCommand>>,
     pub(super) pending_input: PendingInput,
     pub(crate) run_id: u64,
+    /// The model the in-flight turn started on. A turn captures its provider
+    /// when it starts, so a model changed part-way through applies to the next
+    /// turn; this is what lets the status bar say so instead of showing a name
+    /// the running turn is not using.
+    pub(crate) run_model: Option<String>,
     pub(super) retry_info: Option<RetryInfo>,
     pub(super) zones: ZoneRegistry,
     pub(super) selection_state: Option<SelectionState>,
@@ -494,6 +499,7 @@ impl App {
             cmd_tx: None,
             pending_input: PendingInput::None,
             run_id: 0,
+            run_model: None,
             retry_info: None,
             zones: ZoneRegistry::new(),
             selection_state: None,
@@ -1676,6 +1682,14 @@ impl App {
             return vec![];
         }
 
+        // The run reached its next request and picked the model up; the bar
+        // can stop marking the switch as queued.
+        if envelope.subagent.is_none()
+            && let AgentEvent::ModelSwitched { spec } = &envelope.event
+        {
+            self.run_model = Some(spec.clone());
+            return vec![];
+        }
         if let (Some(subagent), AgentEvent::TurnOutcome(outcome)) =
             (&envelope.subagent, &envelope.event)
         {
