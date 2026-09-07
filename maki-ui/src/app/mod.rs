@@ -2116,18 +2116,52 @@ impl App {
         actions
     }
 
-    fn toggle_coordinator_option(&self, id: &str, current: bool) -> Result<bool, String> {
-        let Some(coordinator) = &self.coordinator else {
-            return Ok(!current);
+    /// Hands the toggle to the event loop rather than awaiting the
+    /// coordinator here. A running turn holds the session lease for its whole
+    /// duration and the coordinator parks every other operation behind it, so
+    /// blocking on this thread freezes the UI until the turn ends -- and
+    /// deadlocks outright when the turn is itself waiting on the UI.
+    /// Without a coordinator there is nothing to await, so it applies at once.
+    fn toggle_coordinator_option(&mut self, id: &'static str, current: bool) -> Vec<Action> {
+        let enabled = !current;
+        if self.coordinator.is_none() {
+            self.apply_toggled_option(id, enabled);
+            return Vec::new();
+        }
+        vec![Action::ToggleSessionOption { id, enabled }]
+    }
+
+    /// The app-side half of a toggle, run once the coordinator has committed
+    /// it (or immediately when there is no coordinator).
+    pub(crate) fn apply_toggled_option(&mut self, id: &str, enabled: bool) {
+        use maki_agent::session_options::{FAST_OPTION_ID, WORKFLOW_OPTION_ID, YOLO_OPTION_ID};
+        let message = match id {
+            YOLO_OPTION_ID => {
+                self.permissions.set_yolo(enabled);
+                if enabled {
+                    "YOLO mode enabled"
+                } else {
+                    "YOLO mode disabled"
+                }
+            }
+            FAST_OPTION_ID => {
+                self.state.fast = enabled;
+                if enabled { FAST_ON_MSG } else { FAST_OFF_MSG }
+            }
+            WORKFLOW_OPTION_ID => {
+                self.state.workflow = enabled;
+                if enabled {
+                    WORKFLOW_ON_MSG
+                } else {
+                    WORKFLOW_OFF_MSG
+                }
+            }
+            other => {
+                self.flash(format!("unknown session option: {other}"));
+                return;
+            }
         };
-        let value = if current {
-            maki_agent::session_options::DISABLED_VALUE
-        } else {
-            maki_agent::session_options::ENABLED_VALUE
-        };
-        smol::block_on(coordinator.set_option(id, value))
-            .map(|_| !current)
-            .map_err(|error| error.to_string())
+        self.flash(message.into());
     }
 
     pub(crate) fn execute_host_request(
@@ -2248,26 +2282,10 @@ impl App {
                     .collect();
                 vec![Action::Btw(question.to_string(), images)]
             }
-            BuiltinOperation::ToggleYolo => {
-                match self.toggle_coordinator_option(
-                    maki_agent::session_options::YOLO_OPTION_ID,
-                    self.permissions.is_yolo(),
-                ) {
-                    Ok(enabled) => {
-                        self.permissions.set_yolo(enabled);
-                        self.flash(
-                            if enabled {
-                                "YOLO mode enabled"
-                            } else {
-                                "YOLO mode disabled"
-                            }
-                            .into(),
-                        );
-                    }
-                    Err(error) => self.flash(error),
-                }
-                vec![]
-            }
+            BuiltinOperation::ToggleYolo => self.toggle_coordinator_option(
+                maki_agent::session_options::YOLO_OPTION_ID,
+                self.permissions.is_yolo(),
+            ),
             BuiltinOperation::SetThinking { config } => {
                 if !self.state.model.supports_thinking() {
                     self.flash("Thinking requires a model that supports it".into());
@@ -2277,39 +2295,14 @@ impl App {
                 }
                 vec![]
             }
-            BuiltinOperation::ToggleFast => {
-                match self.toggle_coordinator_option(
-                    maki_agent::session_options::FAST_OPTION_ID,
-                    self.state.fast,
-                ) {
-                    Ok(enabled) => {
-                        self.state.fast = enabled;
-                        self.flash(if enabled { FAST_ON_MSG } else { FAST_OFF_MSG }.into());
-                    }
-                    Err(error) => self.flash(error),
-                }
-                vec![]
-            }
-            BuiltinOperation::ToggleWorkflow => {
-                match self.toggle_coordinator_option(
-                    maki_agent::session_options::WORKFLOW_OPTION_ID,
-                    self.state.workflow,
-                ) {
-                    Ok(enabled) => {
-                        self.state.workflow = enabled;
-                        self.flash(
-                            if enabled {
-                                WORKFLOW_ON_MSG
-                            } else {
-                                WORKFLOW_OFF_MSG
-                            }
-                            .into(),
-                        );
-                    }
-                    Err(error) => self.flash(error),
-                }
-                vec![]
-            }
+            BuiltinOperation::ToggleFast => self.toggle_coordinator_option(
+                maki_agent::session_options::FAST_OPTION_ID,
+                self.state.fast,
+            ),
+            BuiltinOperation::ToggleWorkflow => self.toggle_coordinator_option(
+                maki_agent::session_options::WORKFLOW_OPTION_ID,
+                self.state.workflow,
+            ),
             BuiltinOperation::Exit => self.quit(),
             BuiltinOperation::Reload => self.quit_with(ExitRequest::Reload),
         };
@@ -2393,30 +2386,36 @@ impl App {
             .fire_autocmd(SESSION_PICKER_REQUESTED_EVENT, serde_json::json!({}));
     }
 
+    /// Adoption goes through the event loop for the same reason a toggle does:
+    /// awaiting the coordinator on this thread blocks every frame behind a
+    /// running turn's lease.
     fn change_directory(&mut self, path: PathBuf) -> Vec<Action> {
-        let result = match &self.coordinator {
-            Some(coordinator) => smol::block_on(coordinator.change_directory(path))
-                .map_err(|error| error.to_string()),
-            None => path
-                .canonicalize()
-                .and_then(|path| {
-                    path.is_dir()
-                        .then_some(path)
-                        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotADirectory))
-                })
-                .map_err(|error| error.to_string()),
-        };
+        if self.coordinator.is_some() {
+            return vec![Action::ChangeDirectory(path)];
+        }
+        let result = path
+            .canonicalize()
+            .and_then(|path| {
+                path.is_dir()
+                    .then_some(path)
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotADirectory))
+            })
+            .map_err(|error| error.to_string());
         match result {
-            Ok(path) => {
-                self.state
-                    .session_mut()
-                    .set_cwd(path.to_string_lossy().into_owned());
-                self.status_bar.set_cwd(path.clone());
-                self.flash(format!("cd {}", path.display()))
-            }
+            Ok(path) => self.apply_directory_change(path),
             Err(error) => self.flash(format!("cd: {error}")),
         }
         vec![]
+    }
+
+    /// The app-side half of `/cd`, run once the coordinator has adopted the
+    /// canonical path.
+    pub(crate) fn apply_directory_change(&mut self, path: PathBuf) {
+        self.state
+            .session_mut()
+            .set_cwd(path.to_string_lossy().into_owned());
+        self.status_bar.set_cwd(path.clone());
+        self.flash(format!("cd {}", path.display()));
     }
 
     fn overlays(&self) -> [&dyn Overlay; 13] {

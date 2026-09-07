@@ -616,6 +616,13 @@ enum SessionOpKind {
     },
     /// `/model` from a keybinding or command: apply the adopted model.
     ModelChanged { spec: String },
+    /// `/yolo`, `/fast`, `/workflow`: apply the toggle the coordinator took.
+    OptionToggled { id: &'static str, enabled: bool },
+    /// `/cd`: apply the canonical path the coordinator resolved, which is not
+    /// necessarily the one that was typed.
+    DirectoryChanged {
+        adopted: Arc<std::sync::Mutex<Option<PathBuf>>>,
+    },
     /// `maki.model.set` from Lua, which owes its caller a reply.
     ModelSet {
         spec: Option<String>,
@@ -2238,6 +2245,38 @@ impl<'t> EventLoop<'t> {
                     },
                 );
             }
+            Action::ToggleSessionOption { id, enabled } => {
+                let coordinator = self.sessions[idx].coordinator.clone();
+                let value = Self::boolean_option_value(enabled);
+                self.dispatch_session_op(
+                    idx,
+                    SessionOpKind::OptionToggled { id, enabled },
+                    async move {
+                        coordinator
+                            .set_option(id, value)
+                            .await
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    },
+                );
+            }
+            Action::ChangeDirectory(path) => {
+                let coordinator = self.sessions[idx].coordinator.clone();
+                let adopted: Arc<std::sync::Mutex<Option<PathBuf>>> = Arc::default();
+                let slot = Arc::clone(&adopted);
+                self.dispatch_session_op(
+                    idx,
+                    SessionOpKind::DirectoryChanged { adopted },
+                    async move {
+                        let canonical = coordinator
+                            .change_directory(path)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(canonical);
+                        Ok(())
+                    },
+                );
+            }
             Action::ChangeModel(spec) => self.change_model(idx, &spec),
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
             Action::AssignTier(spec, tier) => {
@@ -2369,6 +2408,19 @@ impl<'t> EventLoop<'t> {
             SessionOpKind::ModelChanged { spec } => match result {
                 Ok(()) => self.apply_model_change(idx, &spec),
                 Err(error) => self.sessions[idx].app.flash(error),
+            },
+            SessionOpKind::OptionToggled { id, enabled } => match result {
+                Ok(()) => self.sessions[idx].app.apply_toggled_option(id, enabled),
+                Err(error) => self.sessions[idx].app.flash(error),
+            },
+            SessionOpKind::DirectoryChanged { adopted } => match result {
+                Ok(()) => {
+                    let adopted = adopted.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    if let Some(path) = adopted {
+                        self.sessions[idx].app.apply_directory_change(path);
+                    }
+                }
+                Err(error) => self.sessions[idx].app.flash(format!("cd: {error}")),
             },
             SessionOpKind::ModelSet {
                 spec,
