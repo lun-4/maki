@@ -358,7 +358,124 @@ struct SpawnCtx {
     command_runtime: Arc<CommandRuntime>,
 }
 
+/// The slice of [`SpawnCtx`] that registering a coordinator needs. Split out
+/// so the session-rotation invariant can be tested without standing up an
+/// event loop, which owns a terminal and has no test harness.
+struct CoordinatorDeps {
+    catalog: maki_agent::session_coordinator::SessionOptionCatalog,
+    model_policy: Arc<ModelPolicy>,
+    timeouts: Timeouts,
+    checkpoint: Arc<
+        dyn maki_storage::checkpoint::CheckpointWriter<
+                maki_agent::session_coordinator::SessionCheckpoint,
+            >,
+    >,
+}
+
+/// Registers the coordinator that owns a session's options, history and lease.
+/// Keyed to the session id, so anything that changes a tab's session -- `/new`
+/// rotates to a fresh one -- must register again rather than keep the old
+/// handle.
+fn register_coordinator(
+    deps: &CoordinatorDeps,
+    session: &AppSession,
+    history: Vec<Message>,
+    available_models: Vec<Arc<str>>,
+    model_slot: &Arc<ProviderSlot>,
+    handles: &AgentHandles,
+    permissions: &Arc<PermissionManager>,
+) -> Result<SessionCoordinatorHandle> {
+    let model_spec = session.model.clone();
+    let definitions = builtin_option_definitions(
+        Arc::from(model_spec.as_str()),
+        available_models,
+        session.meta.yolo,
+        session.meta.fast,
+        session.meta.workflow,
+    );
+    SessionCoordinatorHandle::register(SessionCoordinatorParams {
+        session_id: session.id,
+        catalog: deps.catalog.clone(),
+        definitions,
+        persisted_options: session.meta.session_options.clone(),
+        history,
+        model: Arc::from(model_spec.as_str()),
+        cwd: PathBuf::from(&session.cwd),
+        model_policy: Arc::clone(&deps.model_policy),
+        model_adopter: Arc::new({
+            let model_slot = Arc::clone(model_slot);
+            let timeouts = deps.timeouts;
+            move |mut model: Model| {
+                let model_slot = Arc::clone(&model_slot);
+                Box::pin(async move {
+                    let provider = from_model(&mut model, timeouts)
+                        .map_err(|error| Arc::from(error.to_string()))?;
+                    model_slot.install(model, Arc::from(provider));
+                    Ok(())
+                }) as ModelAdoptionFuture
+            }
+        }),
+        directory_adopter: Arc::new({
+            let cwd = handles.cwd_slot();
+            let permissions = Arc::clone(permissions);
+            move |path: PathBuf| {
+                let cwd = Arc::clone(&cwd);
+                let permissions = Arc::clone(&permissions);
+                Box::pin(async move {
+                    let canonical = path
+                        .canonicalize()
+                        .map_err(|error| Arc::from(error.to_string()))?;
+                    cwd.store(Arc::new(canonical.clone()));
+                    permissions.set_cwd(canonical.clone());
+                    Ok(canonical)
+                }) as DirectoryAdoptionFuture
+            }
+        }),
+        checkpoint: Arc::clone(&deps.checkpoint),
+        mailbox: handles
+            .mailbox()
+            .ok_or_else(|| eyre!("session mailbox unavailable"))?,
+    })
+    .map_err(|error| eyre!(error))
+}
+
+/// Retires a tab's coordinator and registers one for the session id its app
+/// has just rotated onto, returning the retired handle for the caller to
+/// close. A runtime's coordinator, mailbox and app session id must always
+/// agree: `/new` mints a new session, and a coordinator left on the old id
+/// makes the previous session unrestorable and denies the new one a lease.
+fn rotate_session_coordinator(
+    deps: &CoordinatorDeps,
+    rt: &mut SessionRuntime,
+    available_models: Vec<Arc<str>>,
+) -> Result<SessionCoordinatorHandle> {
+    let session = Arc::clone(&rt.app.state.session);
+    rt.handles.rotate_mailbox(session.id);
+    let permissions = Arc::clone(&rt.app.permissions);
+    let coordinator = register_coordinator(
+        deps,
+        &session,
+        Vec::new(),
+        available_models,
+        &rt.model_slot,
+        &rt.handles,
+        &permissions,
+    )?;
+    let retired = std::mem::replace(&mut rt.coordinator, coordinator.clone());
+    rt.app.coordinator = Some(coordinator);
+    Ok(retired)
+}
+
 impl SpawnCtx {
+    fn coordinator_deps(&self) -> CoordinatorDeps {
+        CoordinatorDeps {
+            catalog: self.lua_event_handle.session_option_catalog(),
+            model_policy: Arc::clone(&self.model_policy),
+            timeouts: self.timeouts,
+            checkpoint: self.storage_writer.coordinator_checkpoint(),
+        }
+    }
+
     fn available_model_specs(&self) -> Vec<Arc<str>> {
         self.available_models
             .load_full()
@@ -369,73 +486,6 @@ impl SpawnCtx {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default()
-    }
-
-    /// Registers the coordinator that owns a session's options, history and
-    /// lease. Keyed to the session id, so anything that changes a tab's
-    /// session -- `/new` rotates to a fresh one -- must register again rather
-    /// than keep the old handle.
-    fn register_coordinator(
-        &self,
-        session: &AppSession,
-        history: Vec<Message>,
-        available_models: Vec<Arc<str>>,
-        model_slot: &Arc<ProviderSlot>,
-        handles: &AgentHandles,
-        permissions: &Arc<PermissionManager>,
-    ) -> Result<SessionCoordinatorHandle> {
-        let model_spec = session.model.clone();
-        let definitions = builtin_option_definitions(
-            Arc::from(model_spec.as_str()),
-            available_models,
-            session.meta.yolo,
-            session.meta.fast,
-            session.meta.workflow,
-        );
-        SessionCoordinatorHandle::register(SessionCoordinatorParams {
-            session_id: session.id,
-            catalog: self.lua_event_handle.session_option_catalog(),
-            definitions,
-            persisted_options: session.meta.session_options.clone(),
-            history,
-            model: Arc::from(model_spec.as_str()),
-            cwd: PathBuf::from(&session.cwd),
-            model_policy: Arc::clone(&self.model_policy),
-            model_adopter: Arc::new({
-                let model_slot = Arc::clone(model_slot);
-                let timeouts = self.timeouts;
-                move |mut model: Model| {
-                    let model_slot = Arc::clone(&model_slot);
-                    Box::pin(async move {
-                        let provider = from_model(&mut model, timeouts)
-                            .map_err(|error| Arc::from(error.to_string()))?;
-                        model_slot.install(model, Arc::from(provider));
-                        Ok(())
-                    }) as ModelAdoptionFuture
-                }
-            }),
-            directory_adopter: Arc::new({
-                let cwd = handles.cwd_slot();
-                let permissions = Arc::clone(permissions);
-                move |path: PathBuf| {
-                    let cwd = Arc::clone(&cwd);
-                    let permissions = Arc::clone(&permissions);
-                    Box::pin(async move {
-                        let canonical = path
-                            .canonicalize()
-                            .map_err(|error| Arc::from(error.to_string()))?;
-                        cwd.store(Arc::new(canonical.clone()));
-                        permissions.set_cwd(canonical.clone());
-                        Ok(canonical)
-                    }) as DirectoryAdoptionFuture
-                }
-            }),
-            checkpoint: self.storage_writer.coordinator_checkpoint(),
-            mailbox: handles
-                .mailbox()
-                .ok_or_else(|| eyre!("session mailbox unavailable"))?,
-        })
-        .map_err(|error| eyre!(error))
     }
 
     fn spawn_runtime(&self, session: AppSession) -> Result<SessionRuntime> {
@@ -463,6 +513,7 @@ impl SpawnCtx {
         // so an install or a re-auth here still reaches the usage coordinator.
         let model_slot =
             ProviderSlot::with_change_tx(model.clone(), provider, self.model_slot.change_tx());
+        self.storage_writer.send(Arc::new(session.clone()));
         let permissions = Arc::new(self.permissions.fork());
         permissions.set_yolo(session.meta.yolo);
         permissions.load_session_rules(crate::app::stored_to_rules(&session.meta.session_rules));
@@ -481,9 +532,9 @@ impl SpawnCtx {
             Arc::clone(&self.model_policy),
             self.system_prompt.clone(),
         );
-        self.storage_writer.send(Arc::new(session.clone()));
         let available_models = self.available_model_specs();
-        let coordinator = self.register_coordinator(
+        let coordinator = register_coordinator(
+            &self.coordinator_deps(),
             &session,
             history,
             available_models,
@@ -622,6 +673,27 @@ struct BackgroundModels {
     warn_rx: flume::Receiver<String>,
     warn_tx: flume::Sender<String>,
     task: smol::Task<()>,
+}
+
+/// Brings each tab's displayed model in line with the slot that tab actually
+/// runs on. It takes only the sessions on purpose: reading the event loop's
+/// global slot here would rewrite -- and persist -- every session's model as
+/// the last one to change, while inference kept using the session's real
+/// provider.
+fn sync_session_models(sessions: &mut [SessionRuntime]) -> bool {
+    let mut changed = false;
+    for rt in sessions {
+        let slot_model = rt.model_slot.load();
+        if rt.app.state.session.model != slot_model.model.spec()
+            || rt.app.state.model.context_window != slot_model.model.context_window
+        {
+            let model = slot_model.model.clone();
+            drop(slot_model);
+            rt.app.update_model(&model);
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn merge_batch(
@@ -1226,19 +1298,8 @@ impl<'t> EventLoop<'t> {
 
         self.sync_model_values();
 
-        // Each tab follows its own slot. Reading the global one here would
-        // rewrite -- and persist -- every session's model as the last one to
-        // change, while inference kept using the session's real provider.
-        for rt in &mut self.sessions {
-            let slot_model = rt.model_slot.load();
-            if rt.app.state.session.model != slot_model.model.spec()
-                || rt.app.state.model.context_window != slot_model.model.context_window
-            {
-                let model = slot_model.model.clone();
-                drop(slot_model);
-                rt.app.update_model(&model);
-                dirty = Dirty::YES;
-            }
+        if sync_session_models(&mut self.sessions) {
+            dirty = Dirty::YES;
         }
 
         // These two only fire Lua autocmds. Anything a handler does comes back
@@ -2085,27 +2146,16 @@ impl<'t> EventLoop<'t> {
     /// Retires the tab's coordinator and registers one for the session id the
     /// app just rotated onto, then respawns the agent against it.
     fn rotate_session(&mut self, idx: usize) {
+        let deps = self.ctx.coordinator_deps();
         let available_models = self.ctx.available_model_specs();
-        let rt = &mut self.sessions[idx];
-        let session = Arc::clone(&rt.app.state.session);
-        rt.handles.rotate_mailbox(session.id);
-        let permissions = Arc::clone(&rt.app.permissions);
-        let coordinator = match self.ctx.register_coordinator(
-            &session,
-            Vec::new(),
-            available_models,
-            &rt.model_slot,
-            &rt.handles,
-            &permissions,
-        ) {
-            Ok(coordinator) => coordinator,
-            Err(error) => {
-                rt.app.flash(error.to_string());
-                return;
-            }
-        };
-        let retired = std::mem::replace(&mut rt.coordinator, coordinator.clone());
-        rt.app.coordinator = Some(coordinator);
+        let retired =
+            match rotate_session_coordinator(&deps, &mut self.sessions[idx], available_models) {
+                Ok(retired) => retired,
+                Err(error) => {
+                    self.sessions[idx].app.flash(error.to_string());
+                    return;
+                }
+            };
         // The previous session keeps the history it ended with; closing is the
         // only thing owed to it.
         smol::spawn(async move {
@@ -2628,6 +2678,228 @@ mod tests {
     use test_case::test_case;
 
     const OBSERVATION: &str = "failed";
+
+    fn model_named(id: &str) -> Model {
+        let mut model = crate::components::test_model();
+        model.id = id.into();
+        model
+    }
+
+    /// A runtime whose app and provider slot both start on `model`.
+    fn test_runtime(model: Model) -> SessionRuntime {
+        let (model_slot, _change_rx) = ProviderSlot::new(model.clone(), Arc::new(StubProvider));
+        let permissions = Arc::new(PermissionManager::new(
+            maki_config::PermissionsConfig::default(),
+            PathBuf::from("/tmp"),
+            Arc::default(),
+        ));
+        let mut app = crate::app::tests::test_app();
+        app.update_model(&model);
+        let handles = AgentHandles::spawn(
+            &model_slot,
+            Vec::new(),
+            AgentConfig::default(),
+            maki_agent::ToolOutputLines::default(),
+            &permissions,
+            PathBuf::from("/tmp"),
+            None,
+            Timeouts::default(),
+            EventHandle::disconnected_for_test(),
+            None,
+            McpConfigErrors::new(PathBuf::new()),
+            Arc::new(ModelPolicy::default()),
+            SystemPromptOverride::default(),
+        );
+        let coordinator = test_coordinator(app.state.session.id);
+        let (shell_tx, shell_rx) = flume::unbounded();
+        SessionRuntime {
+            app,
+            handles,
+            model_slot,
+            coordinator,
+            shell_tx,
+            shell_rx,
+            last_status: SessionStatus::Idle,
+            notifications: RunNotificationState::default(),
+        }
+    }
+
+    fn test_coordinator(session_id: MakiId) -> SessionCoordinatorHandle {
+        use maki_storage::checkpoint::{CheckpointAck, CheckpointFuture, CheckpointRequest};
+        SessionCoordinatorHandle::register(SessionCoordinatorParams {
+            session_id,
+            catalog: Default::default(),
+            definitions: builtin_option_definitions(
+                "anthropic/test-model",
+                [Arc::from("anthropic/test-model")],
+                false,
+                false,
+                false,
+            ),
+            persisted_options: Default::default(),
+            history: Vec::new(),
+            model: Arc::from("anthropic/test-model"),
+            cwd: PathBuf::from("/tmp"),
+            model_policy: Arc::default(),
+            model_adopter: Arc::new(|_: Model| Box::pin(async { Ok(()) }) as ModelAdoptionFuture),
+            directory_adopter: Arc::new(|path: PathBuf| {
+                Box::pin(async move { Ok(path) }) as DirectoryAdoptionFuture
+            }),
+            checkpoint: Arc::new(
+                |request: CheckpointRequest<maki_agent::session_coordinator::SessionCheckpoint>| {
+                    Box::pin(async move {
+                        Ok(CheckpointAck {
+                            session_id: request.session_id,
+                            version: request.version,
+                        })
+                    }) as CheckpointFuture
+                },
+            ),
+            mailbox: maki_agent::SessionMailbox::new(session_id),
+        })
+        .expect("coordinator registration")
+    }
+
+    struct StubProvider;
+
+    impl Provider for StubProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a serde_json::Value,
+            _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
+            _opts: maki_providers::RequestOptions,
+            _session_id: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<
+            'a,
+            Result<maki_providers::StreamResponse, maki_providers::AgentError>,
+        > {
+            Box::pin(std::future::pending())
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn test_coordinator_deps() -> CoordinatorDeps {
+        use maki_storage::checkpoint::{CheckpointAck, CheckpointFuture, CheckpointRequest};
+        CoordinatorDeps {
+            catalog: Default::default(),
+            model_policy: Arc::default(),
+            timeouts: Timeouts::default(),
+            checkpoint: Arc::new(
+                |request: CheckpointRequest<maki_agent::session_coordinator::SessionCheckpoint>| {
+                    Box::pin(async move {
+                        Ok(CheckpointAck {
+                            session_id: request.session_id,
+                            version: request.version,
+                        })
+                    }) as CheckpointFuture
+                },
+            ),
+        }
+    }
+
+    /// `/new` swaps the app onto a fresh session id. The coordinator is keyed
+    /// to the id, so it has to move with it: leaving it behind made the
+    /// previous session unrestorable ("session already live"), denied the new
+    /// session a lease, and left the tab's mailbox on the retired session.
+    #[test]
+    fn rotating_a_session_moves_its_coordinator_and_mailbox() {
+        let deps = test_coordinator_deps();
+        let mut rt = test_runtime(model_named("first"));
+        let old_id = rt.id();
+        assert_eq!(rt.coordinator.read().session_id(), old_id);
+
+        // What `reset_session` does: a brand new session in the same tab.
+        rt.app.state.session = Arc::new(AppSession::new("anthropic/test-model", "/tmp"));
+        let new_id = rt.id();
+        assert_ne!(new_id, old_id);
+
+        let retired = rotate_session_coordinator(&deps, &mut rt, Vec::new())
+            .expect("rotation registers a coordinator for the new session");
+
+        assert_eq!(retired.read().session_id(), old_id);
+        assert_eq!(
+            rt.coordinator.read().session_id(),
+            new_id,
+            "the tab's coordinator must follow its session id"
+        );
+        assert_eq!(
+            rt.handles.mailbox().map(|mailbox| mailbox.session_id()),
+            Some(new_id),
+            "the new coordinator hands out the mailbox the agent polls"
+        );
+        assert!(
+            SessionCoordinatorHandle::resolve(new_id).is_ok(),
+            "the new session must be addressable"
+        );
+
+        // Restoring the previous session means registering it again, which is
+        // what failed with "session already live" while the retired handle
+        // stayed registered.
+        let _ = smol::block_on(retired.close());
+        let restored = register_coordinator(
+            &deps,
+            &AppSession::new("anthropic/test-model", "/tmp"),
+            Vec::new(),
+            Vec::new(),
+            &rt.model_slot,
+            &rt.handles,
+            &Arc::clone(&rt.app.permissions),
+        );
+        assert!(
+            restored.is_ok(),
+            "a retired session must be re-registerable: {:?}",
+            restored.err().map(|error| error.to_string())
+        );
+
+        let _ = smol::block_on(restored.unwrap().close());
+        let _ = smol::block_on(rt.coordinator.close());
+    }
+
+    /// Tabs hold their own models. A sync that read one shared slot would
+    /// rewrite every tab to the last model changed, and persist it, while each
+    /// agent kept inferring on the model its own slot holds.
+    #[test]
+    fn each_tab_follows_its_own_model_slot() {
+        let mut sessions = vec![
+            test_runtime(model_named("first")),
+            test_runtime(model_named("second")),
+        ];
+
+        // Repoint only the second tab's slot, as `/model` on that tab would.
+        sessions[1]
+            .model_slot
+            .install(model_named("changed"), Arc::new(StubProvider));
+
+        assert!(sync_session_models(&mut sessions));
+        assert_eq!(
+            sessions[0].app.state.session.model,
+            model_named("first").spec(),
+            "an untouched tab must keep its own model"
+        );
+        assert_eq!(
+            sessions[1].app.state.session.model,
+            model_named("changed").spec()
+        );
+        assert!(
+            !sync_session_models(&mut sessions),
+            "a settled set of tabs reports no change"
+        );
+
+        for rt in sessions {
+            let _ = smol::block_on(rt.coordinator.close());
+        }
+    }
     const SHELL_RESULT: &str = "command finished";
 
     #[test]

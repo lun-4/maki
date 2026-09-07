@@ -613,3 +613,136 @@ fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
         .detach();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use maki_agent::{AgentMode, McpPromptRef, ReasonedCancelToken};
+    use maki_config::PermissionsConfig;
+
+    use super::*;
+    use crate::agent::ProviderSlot;
+
+    /// Drives one turn through a backend whose setup cannot succeed, and
+    /// returns everything the run emitted.
+    fn run_failing_turn() -> (Option<TurnOutcome>, Vec<Envelope>) {
+        let (model_slot, _change_rx) =
+            ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
+        let (agent_tx, agent_rx) = flume::unbounded();
+        let (_answer_tx, answer_rx) = flume::unbounded();
+        let (drain_tx, _drain_rx) = flume::unbounded();
+        let (_init_trigger, init_cancel) = CancelToken::new();
+        let agent_id = AgentId::generate();
+        let mut backend = new_backend(
+            agent_id,
+            model_slot,
+            Arc::new(ArcSwap::from_pointee(PathBuf::from("/tmp"))),
+            AgentConfig::default(),
+            ToolOutputLines::default(),
+            Arc::new(ArcSwap::from_pointee(String::new())),
+            // No MCP session, so a prompt-carrying input fails in `prepare_run`.
+            None,
+            &[],
+            Arc::new(PermissionManager::new(
+                PermissionsConfig::default(),
+                PathBuf::from("/tmp"),
+                Arc::default(),
+            )),
+            agent_tx,
+            answer_rx,
+            None,
+            None,
+            maki_providers::Timeouts::default(),
+            EventHandle::disconnected_for_test(),
+            Arc::new(CancelMap::new()),
+            Arc::new(ModelPolicy::default()),
+            SystemPromptOverride::default(),
+            Arc::new(maki_agent::tools::FileWriteLocks::new()),
+            init_cancel,
+            drain_tx,
+            Arc::new(AtomicU64::new(0)),
+        );
+        backend.initialized = true;
+
+        let input = AgentInput {
+            message: "hello".into(),
+            mode: AgentMode::Build,
+            images: Vec::new(),
+            preamble: Vec::new(),
+            thinking: Default::default(),
+            fast: false,
+            workflow: false,
+            prompt: Some(Box::new(McpPromptRef {
+                qualified_name: "srv.missing".into(),
+                arguments: HashMap::new(),
+            })),
+            lease_committer: None,
+        };
+        let context = TurnContext {
+            agent_id,
+            turn_id: None,
+            cancel: CancelToken::none(),
+            cancel_reason: ReasonedCancelToken::none(),
+            correlation: format!("{ROOT_CORRELATION_PREFIX}0"),
+            interrupt: None,
+        };
+        let mut history = History::new(Vec::new());
+        let outcome = smol::block_on(backend.execute_agent(
+            &mut history,
+            &context,
+            input,
+            TurnId::generate(),
+            0,
+        ));
+        drop(backend);
+        (outcome, agent_rx.drain().collect())
+    }
+
+    /// A setup failure never enters a run, and the runner discards the outcome
+    /// it synthesizes when the turn is a root -- which every TUI prompt is. If
+    /// the backend stays quiet the prompt vanishes with no feedback at all, so
+    /// the error has to be emitted here.
+    #[test]
+    fn a_setup_failure_reaches_the_user() {
+        let (outcome, envelopes) = run_failing_turn();
+        assert!(outcome.is_none(), "setup failed, so no run was entered");
+        let reported = envelopes.iter().any(|envelope| {
+            matches!(&envelope.event, AgentEvent::ControlError { message } if message.contains("MCP not available"))
+        });
+        assert!(
+            reported,
+            "a turn that dies in setup must say so: {:?}",
+            envelopes.iter().map(|e| &e.event).collect::<Vec<_>>()
+        );
+    }
+
+    struct StubProvider;
+
+    impl maki_providers::provider::Provider for StubProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a Value,
+            _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
+            _opts: maki_providers::RequestOptions,
+            _session_id: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<
+            'a,
+            Result<maki_providers::StreamResponse, AgentError>,
+        > {
+            Box::pin(std::future::pending())
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, AgentError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+}
