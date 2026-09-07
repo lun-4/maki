@@ -114,6 +114,7 @@ mod tests {
             true,
             false,
             true,
+            maki_agent::ThinkingConfig::Off,
         );
         let options =
             maki_agent::session_options::SessionOptions::new(definitions, &Default::default())
@@ -128,7 +129,7 @@ mod tests {
                 .iter()
                 .map(|option| option["id"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["model", "yolo", "fast", "workflow"]
+            ["model", "yolo", "fast", "workflow", "thinking"]
         );
         assert_eq!(options[0]["category"], "model");
         assert!(

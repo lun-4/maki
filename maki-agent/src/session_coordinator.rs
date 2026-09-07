@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
 use maki_config::ModelPolicy;
-use maki_providers::{Message, Model};
+use maki_providers::{Message, Model, ThinkingConfig};
 use maki_storage::checkpoint::{
     CheckpointError, CheckpointRequest, CheckpointVersion, CheckpointWriter,
 };
@@ -16,10 +16,10 @@ use thiserror::Error;
 
 use crate::SessionMailbox;
 use crate::session_options::{
-    DISABLED_VALUE, ENABLED_VALUE, FAST_OPTION_ID, MODEL_OPTION_ID, SessionOptionCategory,
-    SessionOptionDefinition, SessionOptionError, SessionOptionOwner, SessionOptionValue,
-    SessionOptions, SessionOptionsSnapshot, SessionOptionsSubscription, WORKFLOW_OPTION_ID,
-    YOLO_OPTION_ID,
+    DISABLED_VALUE, ENABLED_VALUE, FAST_OPTION_ID, FreeValueDomain, MODEL_OPTION_ID,
+    SessionOptionCategory, SessionOptionDefinition, SessionOptionError, SessionOptionOwner,
+    SessionOptionValue, SessionOptions, SessionOptionsSnapshot, SessionOptionsSubscription,
+    THINKING_OPTION_ID, WORKFLOW_OPTION_ID, YOLO_OPTION_ID,
 };
 
 #[derive(Default)]
@@ -1132,21 +1132,20 @@ async fn set_model(
         Arc::clone(&state.model)
     };
     let fast_value: Arc<str> = if model.supports_fast() {
-        read.options
-            .snapshot()
-            .options
-            .iter()
-            .find(|option| option.definition.id.as_ref() == FAST_OPTION_ID)
-            .map_or_else(
-                || Arc::from(DISABLED_VALUE),
-                |option| Arc::clone(&option.current_value),
-            )
+        current_option_value(read, FAST_OPTION_ID).unwrap_or_else(|| Arc::from(DISABLED_VALUE))
     } else {
         Arc::from(DISABLED_VALUE)
+    };
+    let thinking_value: Arc<str> = if model.supports_thinking() {
+        current_option_value(read, THINKING_OPTION_ID)
+            .unwrap_or_else(|| Arc::from(ThinkingConfig::Off.to_string()))
+    } else {
+        Arc::from(ThinkingConfig::Off.to_string())
     };
     let Some(candidate) = read.options.prepare_set_values(&[
         (MODEL_OPTION_ID, spec),
         (FAST_OPTION_ID, fast_value.as_ref()),
+        (THINKING_OPTION_ID, thinking_value.as_ref()),
     ])?
     else {
         return Ok(read.options.snapshot());
@@ -1180,6 +1179,15 @@ async fn set_model(
     }
 }
 
+fn current_option_value(read: &SessionReadHandle, id: &str) -> Option<Arc<str>> {
+    read.options
+        .snapshot()
+        .options
+        .iter()
+        .find(|option| option.definition.id.as_ref() == id)
+        .map(|option| Arc::clone(&option.current_value))
+}
+
 async fn set_option(
     read: &SessionReadHandle,
     checkpoint: &dyn CheckpointWriter<SessionCheckpoint>,
@@ -1190,6 +1198,16 @@ async fn set_option(
         let state = lock(&read.state);
         if !Model::from_spec(&state.model).is_ok_and(|model| model.supports_fast()) {
             return Err(SessionOptionError::FastUnsupported.into());
+        }
+    }
+    if id == THINKING_OPTION_ID
+        && value
+            .parse::<ThinkingConfig>()
+            .is_ok_and(ThinkingConfig::is_enabled)
+    {
+        let state = lock(&read.state);
+        if !Model::from_spec(&state.model).is_ok_and(|model| model.supports_thinking()) {
+            return Err(SessionOptionError::ThinkingUnsupported.into());
         }
     }
     let Some(candidate) = read.options.prepare_set(id, value)? else {
@@ -1221,6 +1239,7 @@ pub fn builtin_option_definitions(
     yolo: bool,
     fast: bool,
     workflow: bool,
+    thinking: ThinkingConfig,
 ) -> Vec<SessionOptionDefinition> {
     let current_model = current_model.into();
     let mut models: Vec<_> = model_specs
@@ -1247,6 +1266,7 @@ pub fn builtin_option_definitions(
             description: Arc::from("Model used for future turns"),
             category: SessionOptionCategory::Model,
             values: models.into(),
+            free_value: None,
             initial_value: current_model,
             persistent: true,
         },
@@ -1263,7 +1283,31 @@ pub fn builtin_option_definitions(
             "Enable workflow tools for future turns",
             workflow,
         ),
+        thinking_definition(thinking),
     ]
+}
+
+/// Thinking is the one builtin whose domain is open: the named efforts are
+/// what a client can offer, and a token budget is anything a user types.
+fn thinking_definition(thinking: ThinkingConfig) -> SessionOptionDefinition {
+    SessionOptionDefinition {
+        id: Arc::from(THINKING_OPTION_ID),
+        owner: SessionOptionOwner::Builtin,
+        name: Arc::from("Thinking"),
+        description: Arc::from("Reasoning effort used for future requests"),
+        category: SessionOptionCategory::Mode,
+        values: ThinkingConfig::options()
+            .iter()
+            .map(|value| SessionOptionValue {
+                value: Arc::from(*value),
+                name: Arc::from(*value),
+            })
+            .collect::<Vec<_>>()
+            .into(),
+        free_value: Some(FreeValueDomain::ThinkingSetting),
+        initial_value: Arc::from(thinking.to_string()),
+        persistent: true,
+    }
 }
 
 fn toggle_definition(
@@ -1288,6 +1332,7 @@ fn toggle_definition(
                 name: Arc::from("Disabled"),
             },
         ]),
+        free_value: None,
         initial_value: Arc::from(if enabled {
             ENABLED_VALUE
         } else {
@@ -1334,6 +1379,7 @@ mod tests {
                 false,
                 false,
                 false,
+                ThinkingConfig::Off,
             ),
             persisted_options: BTreeMap::new(),
             history: Vec::new(),
@@ -1381,6 +1427,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
                 .into(),
+            free_value: None,
             initial_value: Arc::from(initial),
             persistent: true,
         }
@@ -1935,6 +1982,7 @@ mod tests {
                 false,
                 false,
                 false,
+                ThinkingConfig::Off,
             );
             params.model_adopter = Arc::new(|_: Model| {
                 Box::pin(async { Err(Arc::from("rejected")) }) as ModelAdoptionFuture
@@ -1966,6 +2014,7 @@ mod tests {
                 false,
                 true,
                 false,
+                ThinkingConfig::Off,
             );
             let coordinator = SessionCoordinatorHandle::register(params).unwrap();
             let before = coordinator.read().options();
@@ -1980,6 +2029,100 @@ mod tests {
             assert_eq!(after.options[2].current_value.as_ref(), DISABLED_VALUE);
             coordinator.close().await.unwrap();
         });
+    }
+
+    /// Thinking is a session option like fast, so a switch to a model that
+    /// cannot think has to take it down with the model rather than leave the
+    /// session claiming an effort no request will carry.
+    #[test]
+    fn model_change_atomically_disables_thinking() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let mut params = params(id, writer(false));
+            params.model = Arc::from("anthropic/claude-opus-4-8");
+            params.definitions = builtin_option_definitions(
+                "anthropic/claude-opus-4-8",
+                [
+                    Arc::from("anthropic/claude-opus-4-8"),
+                    Arc::from("ollama/llama3"),
+                ],
+                false,
+                false,
+                false,
+                ThinkingConfig::Effort(maki_providers::Effort::High),
+            );
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+
+            let after = coordinator
+                .set_option(MODEL_OPTION_ID, "ollama/llama3")
+                .await
+                .unwrap();
+
+            assert_eq!(thinking_value(&after).as_ref(), "off");
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    /// The reverse of the clamp: asking for thinking on a model that has none
+    /// is refused rather than stored and silently dropped at request time.
+    #[test]
+    fn thinking_is_refused_on_a_model_that_cannot_think() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let mut params = params(id, writer(false));
+            params.model = Arc::from("ollama/llama3");
+            params.definitions = builtin_option_definitions(
+                "ollama/llama3",
+                [Arc::from("ollama/llama3")],
+                false,
+                false,
+                false,
+                ThinkingConfig::Off,
+            );
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+
+            let error = coordinator
+                .set_option(THINKING_OPTION_ID, "high")
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                error,
+                SessionCoordinatorError::Option(SessionOptionError::ThinkingUnsupported)
+            ));
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    /// A token budget is not in the option's value list, and has to be
+    /// accepted anyway: the list is what a client can offer, not the domain.
+    #[test]
+    fn thinking_accepts_a_budget_outside_its_value_list() {
+        let definitions = builtin_option_definitions(
+            "anthropic/claude-opus-4-8",
+            [],
+            false,
+            false,
+            false,
+            ThinkingConfig::Off,
+        );
+        let thinking = definitions
+            .iter()
+            .find(|definition| definition.id.as_ref() == THINKING_OPTION_ID)
+            .expect("thinking is a builtin option");
+
+        assert!(thinking.accepts("high"), "a listed effort is selectable");
+        assert!(thinking.accepts("8192"), "a budget is accepted as typed");
+        assert!(!thinking.accepts("deeply"), "nonsense is still rejected");
+    }
+
+    fn thinking_value(snapshot: &SessionOptionsSnapshot) -> Arc<str> {
+        snapshot
+            .options
+            .iter()
+            .find(|option| option.definition.id.as_ref() == THINKING_OPTION_ID)
+            .map(|option| Arc::clone(&option.current_value))
+            .expect("thinking is a builtin option")
     }
 
     #[test]
@@ -1998,6 +2141,7 @@ mod tests {
                 false,
                 false,
                 false,
+                ThinkingConfig::Off,
             );
             params.model_adopter = Arc::new({
                 let adopted = Arc::clone(&adopted);
@@ -2054,7 +2198,14 @@ mod tests {
         smol::block_on(async {
             let id = MakiId::generate();
             let mut params = params(id, writer(false));
-            params.definitions = builtin_option_definitions("test/model", [], false, false, false);
+            params.definitions = builtin_option_definitions(
+                "test/model",
+                [],
+                false,
+                false,
+                false,
+                ThinkingConfig::Off,
+            );
             let coordinator = SessionCoordinatorHandle::register(params).unwrap();
 
             assert!(
@@ -2088,6 +2239,7 @@ mod tests {
             false,
             false,
             false,
+            ThinkingConfig::Off,
         );
         assert_eq!(definitions[0].values[0].value.as_ref(), "current/model");
     }

@@ -171,6 +171,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
             params.permissions_config.yolo,
             false,
             workflow,
+            params.input.thinking,
         ),
         persisted_options: Default::default(),
         history: Vec::new(),

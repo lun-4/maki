@@ -1119,6 +1119,7 @@ mod tests {
                 false,
                 false,
                 false,
+                maki_agent::ThinkingConfig::Off,
             ),
             persisted_options,
             history: Vec::new(),

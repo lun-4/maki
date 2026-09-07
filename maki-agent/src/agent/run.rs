@@ -8,7 +8,8 @@ use tracing::{error, info, warn};
 
 use maki_providers::provider::Provider;
 use maki_providers::{
-    ContentBlock, Message, Model, RequestOptions, Role, StopReason, StreamResponse, TokenUsage,
+    ContentBlock, Message, Model, RequestOptions, Role, StopReason, StreamResponse, ThinkingConfig,
+    TokenUsage,
 };
 
 use super::compaction;
@@ -92,6 +93,7 @@ pub struct RunSettings {
     pub model: Model,
     pub fast: bool,
     pub workflow: bool,
+    pub thinking: ThinkingConfig,
 }
 
 /// Supplies [`RunSettings`] between requests. A frontend that lets a session
@@ -112,7 +114,9 @@ pub struct SessionRunSettings {
 
 impl RunSettingsSource for SessionRunSettings {
     fn current(&self) -> Option<RunSettings> {
-        use crate::session_options::{ENABLED_VALUE, FAST_OPTION_ID, WORKFLOW_OPTION_ID};
+        use crate::session_options::{
+            ENABLED_VALUE, FAST_OPTION_ID, THINKING_OPTION_ID, WORKFLOW_OPTION_ID,
+        };
 
         let (provider, model) = self.model.current()?;
         let options =
@@ -127,13 +131,18 @@ impl RunSettingsSource for SessionRunSettings {
                 .find(|option| option.definition.id.as_ref() == id)
                 .is_some_and(|option| option.current_value.as_ref() == ENABLED_VALUE)
         };
+        let thinking = options
+            .options
+            .iter()
+            .find(|option| option.definition.id.as_ref() == THINKING_OPTION_ID)
+            .and_then(|option| option.current_value.parse().ok())
+            .unwrap_or_default();
         Some(RunSettings {
             provider,
             model,
-            // Thinking is deliberately absent: it has no session-level owner
-            // to read, so it stays whatever the turn was admitted with.
             fast: enabled(FAST_OPTION_ID),
             workflow: enabled(WORKFLOW_OPTION_ID),
+            thinking,
         })
     }
 }
@@ -456,7 +465,11 @@ impl<'h> Agent<'h> {
         };
         let model_changed = settings.model.spec() != self.model.spec();
         let workflow_changed = settings.workflow != self.workflow;
-        if !model_changed && !workflow_changed && settings.fast == self.opts.fast {
+        if !model_changed
+            && !workflow_changed
+            && settings.fast == self.opts.fast
+            && settings.thinking == self.opts.thinking
+        {
             return;
         }
         if model_changed {
@@ -473,8 +486,8 @@ impl<'h> Agent<'h> {
         self.provider = settings.provider;
         self.model = Arc::new(settings.model);
         self.workflow = settings.workflow;
-        // Thinking has no session-level owner, so the turn's value stands.
         self.opts.fast = settings.fast;
+        self.opts.thinking = settings.thinking;
         // The base schema is built per model and workflow, so it is stale
         // whenever either moves. Without this the request would reach a new
         // model carrying the previous one's tool descriptions, and a workflow
@@ -1051,6 +1064,7 @@ mod tests {
                 model: settings.model.clone(),
                 fast: settings.fast,
                 workflow: settings.workflow,
+                thinking: settings.thinking,
             })
         }
     }
@@ -1071,6 +1085,7 @@ mod tests {
             model: default_model(),
             fast: false,
             workflow: true,
+            thinking: ThinkingConfig::Off,
         })));
         agent.settings_source = Some(Arc::clone(&source) as Arc<dyn RunSettingsSource>);
         agent.tool_builder = Some(Arc::new(
@@ -1089,6 +1104,31 @@ mod tests {
         );
     }
 
+    /// `/thinking` mid-turn used to sit unread until the next turn, because
+    /// thinking had no session-level owner. It has one now, so it lands on the
+    /// next request like the model does.
+    #[test]
+    fn adopting_settings_takes_thinking() {
+        let mut history = History::new(Vec::new());
+        let (raw_tx, event_rx) = flume::unbounded();
+        let (mut agent, _rx) =
+            make_agent_with_sender(MockProvider::new(vec![]), &mut history, raw_tx, event_rx);
+
+        let source = Arc::new(StubSettings(std::sync::Mutex::new(RunSettings {
+            provider: Arc::clone(&agent.provider),
+            model: default_model(),
+            fast: false,
+            workflow: false,
+            thinking: ThinkingConfig::Budget(8192),
+        })));
+        agent.settings_source = Some(source as Arc<dyn RunSettingsSource>);
+        agent.opts.thinking = ThinkingConfig::Off;
+
+        agent.adopt_pending_settings();
+
+        assert_eq!(agent.opts.thinking, ThinkingConfig::Budget(8192));
+    }
+
     /// Nothing changed means nothing is rebuilt, so a run does not pay for a
     /// schema build on every request.
     #[test]
@@ -1103,6 +1143,7 @@ mod tests {
             model: default_model(),
             fast: false,
             workflow: false,
+            thinking: ThinkingConfig::Off,
         })));
         agent.settings_source = Some(source as Arc<dyn RunSettingsSource>);
         agent.tool_builder = Some(Arc::new(|_model: &Model, _workflow: bool| {

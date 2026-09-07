@@ -181,6 +181,7 @@ struct InstallSession<'a> {
     cwd: PathBuf,
     fast: bool,
     workflow: bool,
+    thinking: maki_agent::ThinkingConfig,
     persisted_options: &'a BTreeMap<String, String>,
 }
 
@@ -405,6 +406,7 @@ async fn new_session(
             cwd,
             fast: false,
             workflow: false,
+            thinking: maki_agent::ThinkingConfig::Off,
             persisted_options: &persisted_options,
         },
     )
@@ -443,6 +445,12 @@ async fn load_session(
     let fast = restored.meta.fast && recorded_model.supports_fast();
     let yolo = restored.meta.yolo;
     let workflow = restored.meta.workflow;
+    let thinking = restored
+        .meta
+        .thinking
+        .map(maki_agent::ThinkingConfig::from)
+        .filter(|_| recorded_model.supports_thinking())
+        .unwrap_or_default();
     let coordinator_history = restored.history.clone();
     let handle = spawn_session(
         params,
@@ -475,6 +483,7 @@ async fn load_session(
             cwd: session_cwd,
             fast,
             workflow,
+            thinking,
             persisted_options: &restored.meta.session_options,
         },
     )
@@ -636,6 +645,7 @@ fn install_session(
         cwd,
         fast,
         workflow,
+        thinking,
         persisted_options,
     } = session;
     let definitions = maki_agent::session_coordinator::builtin_option_definitions(
@@ -644,6 +654,7 @@ fn install_session(
         handle.permissions.is_yolo(),
         fast,
         workflow,
+        thinking,
     );
     let checkpoint = match maki_agent::session_checkpoint::SessionLogCheckpoint::resolve(
         handle.session_id.id(),
@@ -1921,6 +1932,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    maki_agent::ThinkingConfig::Off,
                 ),
                 persisted_options: Default::default(),
                 history: Vec::new(),
@@ -2169,7 +2181,7 @@ mod tests {
                 update["params"]["update"]["configOptions"]
                     .as_array()
                     .map(Vec::len),
-                Some(4)
+                Some(5)
             );
             let response = out_rx.recv_async().await.unwrap();
             assert_eq!(response["id"], 42);
@@ -2223,7 +2235,7 @@ mod tests {
         let AgentResponse::SetSessionConfigOptionResponse(response) = response else {
             panic!("expected config option response");
         };
-        assert_eq!(response.config_options.len(), 4);
+        assert_eq!(response.config_options.len(), 5);
         let snapshot = coordinator.read().options();
         assert_eq!(snapshot.options[0].current_value.as_ref(), OFFLINE_SPEC);
         assert_eq!(
@@ -2505,7 +2517,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             config_options.len(),
-            4,
+            5,
             "discovery publishes the full snapshot"
         );
         assert_eq!(

@@ -5260,7 +5260,7 @@ fn thinking_restored_from_session_meta() {
         &storage,
         &maki_config::ModelPolicy::default(),
     );
-    assert_eq!(state.thinking, ThinkingConfig::Budget(4096));
+    assert_eq!(state.thinking, maki_domain::ThinkingConfig::Budget(4096));
 }
 
 fn set_opus_model(app: &mut App) {

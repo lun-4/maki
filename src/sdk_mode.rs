@@ -758,6 +758,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         yolo,
         fast,
         workflow,
+        maki_agent::ThinkingConfig::Off,
     );
     let checkpoint = Arc::new(maki_agent::session_checkpoint::SessionLogCheckpoint::open(
         storage.clone(),

@@ -715,6 +715,7 @@ mod tests {
                 false,
                 false,
                 false,
+                maki_agent::ThinkingConfig::Off,
             ),
             persisted_options: Default::default(),
             history: Vec::new(),

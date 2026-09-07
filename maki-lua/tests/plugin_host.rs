@@ -125,6 +125,7 @@ fn test_session(host: &PluginHost) -> maki_agent::session_coordinator::SessionCo
             false,
             false,
             false,
+            maki_agent::ThinkingConfig::Off,
         ),
         persisted_options: Default::default(),
         history: Vec::new(),

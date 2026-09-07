@@ -645,6 +645,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    maki_agent::ThinkingConfig::Off,
                 ),
                 &Default::default(),
             )
@@ -697,6 +698,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    maki_agent::ThinkingConfig::Off,
                 ),
                 &Default::default(),
             )
@@ -741,6 +743,7 @@ mod tests {
                     true,
                     true,
                     true,
+                    maki_agent::ThinkingConfig::Off,
                 ),
                 &Default::default(),
             )

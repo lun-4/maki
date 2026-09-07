@@ -892,7 +892,12 @@ mod tests {
                 session_id,
                 catalog: Default::default(),
                 definitions: crate::session_coordinator::builtin_option_definitions(
-                    model, models, false, false, false,
+                    model,
+                    models,
+                    false,
+                    false,
+                    false,
+                    maki_providers::ThinkingConfig::Off,
                 ),
                 persisted_options: Default::default(),
                 history: Vec::new(),

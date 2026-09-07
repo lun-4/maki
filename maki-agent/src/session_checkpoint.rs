@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use maki_providers::{Message, TokenUsage};
+use maki_providers::{Message, ThinkingConfig, TokenUsage};
 use maki_storage::StateDir;
 use maki_storage::checkpoint::{
     CheckpointAck, CheckpointError, CheckpointFuture, CheckpointRequest, CheckpointWriter,
@@ -9,7 +9,9 @@ use maki_storage::sessions::{Session, SessionMeta};
 
 use crate::ToolOutput;
 use crate::session_coordinator::SessionCheckpoint;
-use crate::session_options::{ENABLED_VALUE, FAST_OPTION_ID, WORKFLOW_OPTION_ID, YOLO_OPTION_ID};
+use crate::session_options::{
+    ENABLED_VALUE, FAST_OPTION_ID, THINKING_OPTION_ID, WORKFLOW_OPTION_ID, YOLO_OPTION_ID,
+};
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
 
@@ -98,6 +100,15 @@ fn checkpoint_meta(current: &SessionMeta, checkpoint: &SessionCheckpoint) -> Ses
             YOLO_OPTION_ID => meta.yolo = enabled,
             FAST_OPTION_ID => meta.fast = enabled,
             WORKFLOW_OPTION_ID => meta.workflow = enabled,
+            // Thinking predates session options and keeps its own field, so
+            // the projection writes there rather than into the generic map.
+            THINKING_OPTION_ID => {
+                meta.thinking = option
+                    .current_value
+                    .parse::<ThinkingConfig>()
+                    .ok()
+                    .map(Into::into);
+            }
             _ if option.definition.persistent && id.contains('.') => {
                 meta.session_options
                     .insert(id.to_string(), option.current_value.to_string());
@@ -134,6 +145,7 @@ mod tests {
                     true,
                     true,
                     true,
+                    ThinkingConfig::Effort(maki_providers::Effort::High),
                 ),
                 &BTreeMap::new(),
             )
@@ -161,6 +173,13 @@ mod tests {
             assert!(loaded.meta.yolo);
             assert!(loaded.meta.fast);
             assert!(loaded.meta.workflow);
+            assert_eq!(
+                loaded.meta.thinking,
+                Some(maki_storage::sessions::StoredThinking::Effort {
+                    level: maki_providers::Effort::High
+                }),
+                "thinking is projected into the field it has always been saved in"
+            );
             assert_eq!(loaded.messages().len(), 1);
             assert_eq!(loaded.model, "test/model");
             assert_eq!(loaded.cwd, "/project");

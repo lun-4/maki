@@ -396,10 +396,23 @@ interpreter's tool list, which is decided when the schema is built, so adopting
 the flag alone would have changed subagent behaviour while the interpreter kept
 its old tools.
 
-Thinking is the exception. It has no session-level owner to read -- it is not a
-session option, it lives in the TUI's own state -- so it stays whatever the turn
-was admitted with. Making it behave like the others means making it a session
-option first.
+Thinking was the exception, so it became a session option too. It differs from
+the others in one way: its value list is not its domain. A client picks from the
+named efforts, but a token budget is any number, so the definition carries an
+open domain alongside the list, and `accepts` consults both. Everything else is
+the same shape as fast -- the coordinator owns it, a model change clamps it off
+when the new model cannot think, asking for it on such a model is refused rather
+than stored, and the run settings source reads it so `/thinking` mid-turn lands
+on the next request.
+
+Storage keeps the field it has always had. `SessionMeta.thinking` predates
+session options, the checkpoint projection writes there rather than into the
+generic map, and `Prefs::default_thinking` still seeds a new session. What
+changed is who owns the value while a session is live: the TUI's `state.thinking`
+is now a mirror of the option, written when the coordinator commits, and the
+`/thinking` plugin keeps its picker and reaches the coordinator through
+`maki.session.set_thinking` as before. ACP gets the option for free -- it is one
+more `select`, and a loaded session restores the effort it was saved with.
 
 ## What the lease still had to guard
 

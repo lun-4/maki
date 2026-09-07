@@ -178,6 +178,7 @@ fn parse_definition(
         description: required_string(spec, &id, "description")?,
         category,
         values: parse_values(spec, &id)?,
+        free_value: None,
         initial_value: required_string(spec, &id, "initial_value")?,
         persistent: spec.get::<Option<bool>>("persistent")?.unwrap_or(false),
     };
@@ -517,6 +518,7 @@ mod tests {
                 false,
                 false,
                 false,
+                maki_agent::ThinkingConfig::Off,
             ),
             persisted_options: Default::default(),
             history: Vec::new(),

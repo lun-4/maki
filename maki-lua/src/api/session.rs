@@ -455,6 +455,7 @@ mod tests {
                 false,
                 false,
                 false,
+                maki_agent::ThinkingConfig::Off,
             ),
             persisted_options: Default::default(),
             history: Vec::new(),
@@ -581,7 +582,7 @@ mod tests {
             .sequence_values::<Table>()
             .map(|option| option.unwrap().get::<String>("id").unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(ids, ["model", "yolo", "fast", "workflow"]);
+        assert_eq!(ids, ["model", "yolo", "fast", "workflow", "thinking"]);
         let model = options.get::<Table>(1).unwrap();
         assert_eq!(model.get::<String>("category").unwrap(), "model");
         assert_eq!(model.get::<String>("current_value").unwrap(), "test/model");

@@ -2,12 +2,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use event_listener::{Event, EventListener};
+use maki_providers::ThinkingConfig;
 use thiserror::Error;
 
 pub const MODEL_OPTION_ID: &str = "model";
 pub const YOLO_OPTION_ID: &str = "yolo";
 pub const FAST_OPTION_ID: &str = "fast";
 pub const WORKFLOW_OPTION_ID: &str = "workflow";
+pub const THINKING_OPTION_ID: &str = "thinking";
 pub const ENABLED_VALUE: &str = "enabled";
 pub const DISABLED_VALUE: &str = "disabled";
 
@@ -29,6 +31,23 @@ pub struct SessionOptionValue {
     pub name: Arc<str>,
 }
 
+/// The domain an option accepts beyond the values it can enumerate. Thinking
+/// is the case that needs one: a client picks from the named efforts, but a
+/// token budget is any number, so the list cannot be the whole domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreeValueDomain {
+    /// Anything [`ThinkingConfig`] can read, which includes a token budget.
+    ThinkingSetting,
+}
+
+impl FreeValueDomain {
+    fn accepts(self, value: &str) -> bool {
+        match self {
+            Self::ThinkingSetting => value.parse::<ThinkingConfig>().is_ok(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionOptionDefinition {
     pub id: Arc<str>,
@@ -37,6 +56,9 @@ pub struct SessionOptionDefinition {
     pub description: Arc<str>,
     pub category: SessionOptionCategory,
     pub values: Arc<[SessionOptionValue]>,
+    /// `None` when `values` is the whole domain, which is every option but
+    /// thinking.
+    pub free_value: Option<FreeValueDomain>,
     pub initial_value: Arc<str>,
     pub persistent: bool,
 }
@@ -67,6 +89,8 @@ pub enum SessionOptionError {
     PolicyRejected(Arc<str>),
     #[error("Fast mode is unsupported by the current model")]
     FastUnsupported,
+    #[error("Thinking is unsupported by the current model")]
+    ThinkingUnsupported,
     #[error("session option callback failed: {0}")]
     CallbackFailed(Arc<str>),
     #[error("invalid session option definition: {0}")]
@@ -132,6 +156,7 @@ impl SessionOptionDefinition {
         self.values
             .iter()
             .any(|candidate| candidate.value.as_ref() == value)
+            || self.free_value.is_some_and(|domain| domain.accepts(value))
     }
 }
 
@@ -509,6 +534,7 @@ mod tests {
                     name: Arc::from("Enabled"),
                 },
             ]),
+            free_value: None,
             initial_value: Arc::from(initial),
             persistent: true,
         }

@@ -390,6 +390,7 @@ fn session_for(host: &PluginHost) -> SessionCoordinatorHandle {
             false,
             false,
             false,
+            maki_agent::ThinkingConfig::Off,
         ),
         persisted_options: Default::default(),
         history: Vec::new(),

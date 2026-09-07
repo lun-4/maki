@@ -37,6 +37,7 @@ use maki_lua::{
     ProviderUsageInvalidation, ProviderUsageLimit, ProviderUsageReply, ProviderUsageSnapshot,
     ProviderUsageWindow, SessionRequest, StatusContentReader, UiAction, UiReply,
 };
+use maki_providers::ThinkingConfigExt;
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
 use maki_providers::{Message, Model, TokenUsage};
@@ -373,6 +374,7 @@ struct CoordinatorDeps {
 /// Keyed to the session id, so anything that changes a tab's session -- `/new`
 /// rotates to a fresh one -- must register again rather than keep the old
 /// handle.
+#[allow(clippy::too_many_arguments)]
 fn register_coordinator(
     deps: &CoordinatorDeps,
     session: &AppSession,
@@ -381,6 +383,7 @@ fn register_coordinator(
     model_slot: &Arc<ProviderSlot>,
     handles: &AgentHandles,
     permissions: &Arc<PermissionManager>,
+    thinking: DomainThinkingConfig,
 ) -> Result<SessionCoordinatorHandle> {
     let mailbox = handles
         .mailbox()
@@ -394,6 +397,7 @@ fn register_coordinator(
         handles,
         permissions,
         mailbox,
+        thinking,
     )
 }
 
@@ -407,6 +411,7 @@ fn register_coordinator_with_mailbox(
     handles: &AgentHandles,
     permissions: &Arc<PermissionManager>,
     mailbox: SessionMailbox,
+    thinking: DomainThinkingConfig,
 ) -> Result<SessionCoordinatorHandle> {
     // The coordinator checkpoints by merging into the writer's snapshot for
     // this session, so the snapshot has to exist first. Seeding it here rather
@@ -420,6 +425,7 @@ fn register_coordinator_with_mailbox(
         session.meta.yolo,
         session.meta.fast,
         session.meta.workflow,
+        thinking,
     );
     SessionCoordinatorHandle::register(SessionCoordinatorParams {
         session_id: session.id,
@@ -477,6 +483,7 @@ fn rotate_session_coordinator(
 ) -> Result<SessionCoordinatorHandle> {
     let session = Arc::clone(&rt.app.state.session);
     let permissions = Arc::clone(&rt.app.permissions);
+    let thinking = rt.app.state.thinking;
     // Registration first: rotating the mailbox is not undoable, and a failure
     // after it would leave the tab on a session id nothing can resolve, with
     // every later operation checkpointing into the retired session's file.
@@ -490,6 +497,7 @@ fn rotate_session_coordinator(
         &rt.handles,
         &permissions,
         mailbox.clone(),
+        thinking,
     )?;
     rt.handles.set_mailbox(mailbox);
     let retired = std::mem::replace(&mut rt.coordinator, coordinator.clone());
@@ -571,6 +579,7 @@ impl SpawnCtx {
             &model_slot,
             &handles,
             &permissions,
+            crate::app::session_state::resolve_thinking(&session, &model, &self.storage),
         )?;
         let mut app = App::new(
             &model,
@@ -653,10 +662,16 @@ enum SessionOpKind {
     DirectoryChanged {
         adopted: Arc<std::sync::Mutex<Option<PathBuf>>>,
     },
+    /// `maki.session.set_thinking` from Lua, which owes its caller a reply.
+    ThinkingSet {
+        thinking: DomainThinkingConfig,
+        set_default: bool,
+        reply_tx: flume::Sender<UiReply>,
+    },
     /// `maki.model.set` from Lua, which owes its caller a reply.
     ModelSet {
         spec: Option<String>,
-        thinking: Option<String>,
+        thinking: Option<DomainThinkingConfig>,
         fast: Option<bool>,
         reply_tx: flume::Sender<UiReply>,
     },
@@ -1887,31 +1902,7 @@ impl<'t> EventLoop<'t> {
             SessionRequest::SetThinking {
                 set_default,
                 thinking,
-            } => {
-                let reply = (|| {
-                    let idx = self.focused;
-                    if !self.sessions[idx].app.state.model.supports_thinking() {
-                        return Err("Thinking requires a model that supports it".into());
-                    }
-                    let parsed = thinking
-                        .parse::<DomainThinkingConfig>()
-                        .map_err(|e| e.to_string())?;
-                    if set_default {
-                        write_prefs(
-                            &self.ctx.storage,
-                            &Prefs {
-                                default_thinking: Some(parsed.into()),
-                            },
-                        )
-                        .map_err(|e| e.to_string())?;
-                    }
-                    self.sessions[idx].app.state.thinking = parsed;
-                    let mode = self.sessions[idx].app.state.thinking.to_string();
-                    self.sessions[idx].app.flash(format!("Thinking: {mode}"));
-                    Ok(json!({ "mode": mode }))
-                })();
-                let _ = reply_tx.send(reply);
-            }
+            } => self.dispatch_thinking_set(set_default, &thinking, reply_tx),
         }
     }
 
@@ -1931,6 +1922,50 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    /// `maki.session.set_thinking`: the coordinator owns thinking, so the value
+    /// is resolved here -- empty input toggles, which only the current value
+    /// can answer -- and committed there before any of it reaches the app.
+    fn dispatch_thinking_set(
+        &mut self,
+        set_default: bool,
+        thinking: &str,
+        reply_tx: flume::Sender<UiReply>,
+    ) {
+        let idx = self.focused;
+        let app = &self.sessions[idx].app;
+        if !app.state.model.supports_thinking() {
+            let _ = reply_tx.send(Err(crate::app::THINKING_UNSUPPORTED_MSG.to_owned()));
+            return;
+        }
+        let resolved = match DomainThinkingConfig::parse(thinking.trim(), app.state.thinking) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let _ = reply_tx.send(Err(error.to_owned()));
+                return;
+            }
+        };
+        let coordinator = self.sessions[idx].coordinator.clone();
+        let value = resolved.to_string();
+        self.dispatch_session_op(
+            idx,
+            SessionOpKind::ThinkingSet {
+                thinking: resolved,
+                set_default,
+                reply_tx,
+            },
+            async move {
+                coordinator
+                    .set_option(
+                        maki_agent::session_options::THINKING_OPTION_ID,
+                        value.as_str(),
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            },
+        );
+    }
+
     /// `maki.model.set`: adopt the model and the fast flag through the
     /// coordinator off-thread, then apply the app-side state and reply.
     fn dispatch_model_set(
@@ -1941,8 +1976,24 @@ impl<'t> EventLoop<'t> {
         reply_tx: flume::Sender<UiReply>,
     ) {
         let idx = self.focused;
+        // Relative input ("" toggles) can only be read against the value the
+        // session is on, so it is resolved here and the coordinator is handed
+        // a concrete setting.
+        let thinking = match thinking
+            .map(|input| {
+                DomainThinkingConfig::parse(input.trim(), self.sessions[idx].app.state.thinking)
+            })
+            .transpose()
+        {
+            Ok(thinking) => thinking,
+            Err(error) => {
+                let _ = reply_tx.send(Err(error.to_owned()));
+                return;
+            }
+        };
         let coordinator = self.sessions[idx].coordinator.clone();
         let op_spec = spec.clone();
+        let op_thinking = thinking.map(|thinking| thinking.to_string());
         self.dispatch_session_op(
             idx,
             SessionOpKind::ModelSet {
@@ -1963,6 +2014,17 @@ impl<'t> EventLoop<'t> {
                         .set_option(
                             maki_agent::session_options::FAST_OPTION_ID,
                             Self::boolean_option_value(fast),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                // After the model, so a switch to a thinking model can turn
+                // thinking on in the same call.
+                if let Some(thinking) = op_thinking {
+                    coordinator
+                        .set_option(
+                            maki_agent::session_options::THINKING_OPTION_ID,
+                            thinking.as_str(),
                         )
                         .await
                         .map_err(|error| error.to_string())?;
@@ -2439,8 +2501,12 @@ impl<'t> EventLoop<'t> {
     ) {
         // The tab may have been closed or reordered while the operation ran.
         let Some(idx) = self.position(session) else {
-            if let SessionOpKind::ModelSet { reply_tx, .. } = kind {
-                let _ = reply_tx.send(Err(NOT_LIVE_ERR.to_owned()));
+            match kind {
+                SessionOpKind::ModelSet { reply_tx, .. }
+                | SessionOpKind::ThinkingSet { reply_tx, .. } => {
+                    let _ = reply_tx.send(Err(NOT_LIVE_ERR.to_owned()));
+                }
+                _ => {}
             }
             return;
         };
@@ -2474,6 +2540,29 @@ impl<'t> EventLoop<'t> {
                 }
                 Err(error) => self.sessions[idx].app.flash(format!("cd: {error}")),
             },
+            SessionOpKind::ThinkingSet {
+                thinking,
+                set_default,
+                reply_tx,
+            } => {
+                let reply = result.and_then(|()| {
+                    if set_default {
+                        write_prefs(
+                            &self.ctx.storage,
+                            &Prefs {
+                                default_thinking: Some(thinking.into()),
+                            },
+                        )
+                        .map_err(|error| error.to_string())?;
+                    }
+                    let app = &mut self.sessions[idx].app;
+                    app.state.thinking = thinking;
+                    let mode = thinking.to_string();
+                    app.flash(format!("Thinking: {mode}"));
+                    Ok(json!({ "mode": mode }))
+                });
+                let _ = reply_tx.send(reply);
+            }
             SessionOpKind::ModelSet {
                 spec,
                 thinking,
@@ -2485,7 +2574,7 @@ impl<'t> EventLoop<'t> {
                         self.apply_model_change(idx, spec);
                     }
                     if let Some(thinking) = thinking {
-                        self.sessions[idx].app.set_thinking(&thinking)?;
+                        self.sessions[idx].app.state.thinking = thinking;
                     }
                     if let Some(fast) = fast {
                         self.sessions[idx].app.set_fast(fast)?;
@@ -2838,6 +2927,7 @@ mod tests {
                 false,
                 false,
                 false,
+                maki_agent::ThinkingConfig::Off,
             ),
             persisted_options: Default::default(),
             history: Vec::new(),
@@ -2966,6 +3056,7 @@ mod tests {
             &rt.model_slot,
             &rt.handles,
             &Arc::clone(&rt.app.permissions),
+            DomainThinkingConfig::Off,
         );
         assert!(
             restored.is_ok(),

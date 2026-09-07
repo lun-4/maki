@@ -4,7 +4,6 @@
 //! places, one per transition: `start_run`, `handle_cancel`, and
 //! `AgentHandles::respawn`. Everything else only reads it.
 
-use maki_providers::ThinkingConfigExt;
 mod btw;
 mod image_paste;
 pub(crate) mod mode;
@@ -71,7 +70,6 @@ use maki_commands::{
     HostContextRequest, HostContextResponse, HostRequest, HostResponse, TargetHandle,
 };
 use maki_config::{ModelPolicy, ToolKey, UiConfig};
-use maki_domain::ThinkingConfig;
 use maki_lua::{
     BuiltinAction, CompletionCtx, EventHandle, FloatConfig, HintReader, HintSnapshot, ItemSpec,
     KeymapReader, Split, StatusContentReader, StatusContentSnapshot, WinCommand, WinEvent, WinView,
@@ -111,7 +109,7 @@ const FLASH_NO_PLAN_BODY: &str = "Plan file is empty or unreadable";
 const PLAN_SUBMIT_TOOL: &str = "plan_submit";
 const SESSION_PICKER_REQUESTED_EVENT: &str = "SessionPickerRequested";
 const FAST_UNSUPPORTED_MSG: &str = maki_agent::command::FAST_UNSUPPORTED;
-const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
+pub(crate) const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
 const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
@@ -567,15 +565,6 @@ impl App {
             );
         }
         self.lua_event_handle.fire_autocmd(event, data);
-    }
-
-    pub(crate) fn set_thinking(&mut self, input: &str) -> Result<ThinkingConfig, String> {
-        if !self.state.model.supports_thinking() {
-            return Err(THINKING_UNSUPPORTED_MSG.into());
-        }
-        self.state.thinking =
-            ThinkingConfig::parse(input.trim(), self.state.thinking).map_err(str::to_owned)?;
-        Ok(self.state.thinking)
     }
 
     pub(crate) fn set_fast(&mut self, fast: bool) -> Result<(), String> {
