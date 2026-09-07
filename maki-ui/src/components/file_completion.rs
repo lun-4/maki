@@ -2268,12 +2268,15 @@ mod tests {
                 });
         }
         menu.sync_query("");
-        for _ in 0..100 {
-            let _ = menu.tick();
-            if menu.session.as_ref().unwrap().file_matches.len() == 2 {
-                break;
-            }
-        }
+        wait_for_matcher(
+            &mut menu,
+            |menu| {
+                menu.session
+                    .as_ref()
+                    .is_some_and(|session| session.file_matches.len() == 2)
+            },
+            "both injected files must match before order is asserted",
+        );
         let session = menu.session.as_ref().unwrap();
         let labels: Vec<_> = session
             .file_matches

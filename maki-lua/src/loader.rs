@@ -539,6 +539,7 @@ impl PluginHost {
     pub fn event_handle(&self) -> EventHandle {
         EventHandle {
             tx: self.inner.tx.clone(),
+            shutdown: Arc::clone(&self.inner.shutdown),
             prio_tx: self.inner.prio_tx.clone(),
             modes: Arc::clone(&self.inner.modes),
             session_options: self.inner.session_options.clone(),
@@ -578,6 +579,10 @@ impl PluginHost {
 #[derive(Clone)]
 pub struct EventHandle {
     tx: flume::Sender<Request>,
+    /// Set once the host starts shutting down. A handle outlives
+    /// `begin_shutdown` -- it holds its own sender clone -- so without this it
+    /// would race the dispatch loop for whether a request still gets served.
+    shutdown: Arc<AtomicBool>,
     /// User-initiated requests bypass queued bulk work (session restores).
     prio_tx: flume::Sender<Request>,
     /// Shared mode registry; `None`-less so plugins and the Rust agent see
@@ -665,6 +670,7 @@ impl EventHandle {
     pub(crate) fn from_tx(tx: flume::Sender<Request>) -> Self {
         Self {
             tx: tx.clone(),
+            shutdown: Arc::default(),
             prio_tx: flume::unbounded().0,
             modes: Arc::new(maki_agent::ModeRegistry::builtin()),
             session_options: SessionOptionCatalog::default(),
@@ -705,6 +711,7 @@ impl EventHandle {
     pub fn disconnected_for_test_with_modes(modes: Arc<maki_agent::ModeRegistry>) -> Self {
         Self {
             tx: flume::unbounded().0,
+            shutdown: Arc::default(),
             prio_tx: flume::unbounded().0,
             modes,
             session_options: SessionOptionCatalog::default(),
@@ -720,6 +727,7 @@ impl EventHandle {
     #[doc(hidden)]
     pub fn with_completion_for_test(backend: Arc<TestCompletionBackend>) -> Self {
         Self {
+            shutdown: Arc::default(),
             tx: flume::unbounded().0,
             prio_tx: flume::unbounded().0,
             modes: Arc::new(maki_agent::ModeRegistry::builtin()),
@@ -747,6 +755,7 @@ impl EventHandle {
     #[cfg(feature = "test-support")]
     pub(crate) fn probed_for_test(shared: flume::Sender<Request>) -> Self {
         Self {
+            shutdown: Arc::default(),
             tx: shared.clone(),
             prio_tx: shared.clone(),
             modes: Arc::new(maki_agent::ModeRegistry::builtin()),
@@ -803,6 +812,9 @@ impl EventHandle {
     }
 
     pub fn collect_prompt_slots(&self) -> ResolvedSlots {
+        if self.shutdown.load(Ordering::Acquire) {
+            return ResolvedSlots::default();
+        }
         let (tx, rx) = flume::bounded(1);
         let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
         rx.recv().unwrap_or_default()
@@ -883,6 +895,9 @@ impl EventHandle {
     }
 
     pub async fn collect_prompt_slots_async(&self) -> ResolvedSlots {
+        if self.shutdown.load(Ordering::Acquire) {
+            return ResolvedSlots::default();
+        }
         let (tx, rx) = flume::bounded(1);
         let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
         rx.recv_async().await.unwrap_or_default()
@@ -1373,6 +1388,7 @@ mod tests {
         let (tx, _rx) = flume::bounded(8);
         let handle = EventHandle {
             tx,
+            shutdown: Arc::default(),
             prio_tx: prio_tx.clone(),
             modes: Arc::new(maki_agent::ModeRegistry::builtin()),
             session_options: SessionOptionCatalog::default(),
