@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::mem;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -64,6 +65,12 @@ pub struct StorageWriter {
     pending: Pending,
     wake: flume::Sender<()>,
     done_rx: flume::Receiver<()>,
+    /// Asks the writer thread to finish. Closing the wake channel is not
+    /// enough: every coordinator's checkpoint writer holds a clone of the
+    /// sender, and those live in tasks that exit on their own schedule, so
+    /// waiting for the last one to drop makes exit take as long as the
+    /// timeout allows.
+    stop: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -126,6 +133,8 @@ impl StorageWriter {
         let writer_pending = Arc::clone(&pending);
         let (wake, wake_rx) = flume::unbounded::<()>();
         let (done_tx, done_rx) = flume::bounded::<()>(1);
+        let stop: Arc<AtomicBool> = Arc::default();
+        let writer_stop = Arc::clone(&stop);
 
         std::thread::Builder::new()
             .name("storage-writer".into())
@@ -138,6 +147,9 @@ impl StorageWriter {
                 };
                 while wake_rx.recv().is_ok() {
                     writer.flush(&writer_pending);
+                    if writer_stop.load(Ordering::Acquire) {
+                        break;
+                    }
                 }
                 writer.flush(&writer_pending);
                 let _ = done_tx.send(());
@@ -148,6 +160,7 @@ impl StorageWriter {
             pending,
             wake,
             done_rx,
+            stop,
         }
     }
 
@@ -210,6 +223,16 @@ impl StorageWriter {
         })
     }
 
+    /// Drops an in-memory snapshot kept alive by `delete_empty`. A session
+    /// cleaned up as empty is never deleted through the picker, so without
+    /// this its snapshot outlives it: `/new` on an untouched session would
+    /// leave one behind every time.
+    pub fn forget(&self, id: MakiId) {
+        let mut state = lock(&self.pending);
+        state.latest.remove(&id);
+        state.coordinator_history_bases.remove(&id);
+    }
+
     /// Removes an empty session's files while keeping its in-memory snapshot.
     /// The session is still live in its tab, and its coordinator checkpoints by
     /// merging into that snapshot, so forgetting it would leave the next
@@ -259,6 +282,9 @@ impl StorageWriter {
     }
 
     pub fn shutdown(self, timeout: Duration) {
+        self.stop.store(true, Ordering::Release);
+        // Wake it so it observes the flag; the final flush still runs.
+        let _ = self.wake.send(());
         drop(self.wake);
         if self.done_rx.recv_timeout(timeout).is_err() {
             warn!("storage writer did not drain within {timeout:?}");
@@ -572,6 +598,28 @@ mod tests {
             writer.shutdown(DRAIN_TIMEOUT);
             assert_eq!(AppSession::load(id, &dir).unwrap().title, "second");
         });
+    }
+
+    /// Every coordinator's checkpoint writer holds a clone of the wake
+    /// sender, and those live in tasks that exit on their own schedule. If
+    /// shutdown waited for the last clone to drop, exit would take the whole
+    /// timeout whenever one outlived the event loop.
+    #[test]
+    fn shutdown_does_not_wait_for_a_lingering_checkpoint_writer() {
+        let (_tmp, dir) = state_dir();
+        let (writer, _warn_rx) = writer(&dir);
+        // Stands in for a coordinator task that has not been polled yet.
+        let lingering = writer.coordinator_checkpoint();
+
+        let started = std::time::Instant::now();
+        writer.shutdown(Duration::from_secs(3));
+        let elapsed = started.elapsed();
+
+        drop(lingering);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "shutdown waited {elapsed:?} for a checkpoint writer that outlived the loop"
+        );
     }
 
     /// A session with nothing in it yet gets its files cleaned up, but it is

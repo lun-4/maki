@@ -55,15 +55,18 @@ const FORBIDDEN_ACP_COMMANDS: &[&str] = &[
     "/sessions",
 ];
 
-/// Coordinator operations a running turn's lease can park. The coordinator
-/// serializes its operation loop, so one of these issued while a turn holds
-/// the lease waits for the turn to end.
+/// Coordinator operations a running turn's lease defers, mirroring
+/// `defers_behind_lease` in the coordinator. One of these issued while a turn
+/// holds the lease waits for the turn to end, so awaiting it on the
+/// event-loop thread blocks every frame behind that turn.
+///
+/// `set_option` and `update_model_values` are deliberately absent: the lease
+/// serves them, so awaiting one does not wait for the turn.
 const LEASE_BOUND_COORDINATOR_OPS: &[&str] = &[
     "acquire_lease",
     "change_directory",
+    "close",
     "replace_history",
-    "set_option",
-    "update_model_values",
 ];
 
 /// Awaiting a lease-bound coordinator operation on the event-loop thread

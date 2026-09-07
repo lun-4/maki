@@ -315,8 +315,8 @@ impl AgentHandles {
     /// normally keeps the existing one (the coordinator handed it out and
     /// cannot learn about a replacement), but `/new` rotates the tab onto a
     /// different session, which registers a new coordinator around this.
-    pub(crate) fn rotate_mailbox(&mut self, session_id: maki_storage::id::MakiId) {
-        self.mailbox = Some(SessionMailbox::new(session_id));
+    pub(crate) fn set_mailbox(&mut self, mailbox: SessionMailbox) {
+        self.mailbox = Some(mailbox);
     }
 
     pub(crate) fn cwd_slot(&self) -> Arc<ArcSwap<PathBuf>> {
@@ -991,7 +991,7 @@ mod tests {
     /// leave the new session's notifications going to the retired session's
     /// instance.
     #[test]
-    fn rotate_mailbox_repoints_the_agent_at_the_new_session() {
+    fn setting_a_mailbox_repoints_the_agent_at_the_new_session() {
         let (model_slot, _change_rx) =
             ProviderSlot::new(crate::components::test_model(), Arc::new(StubProvider));
         let permissions = Arc::new(PermissionManager::new(
@@ -1018,7 +1018,7 @@ mod tests {
         assert_eq!(handles.mailbox().map(|m| m.session_id()), Some(first));
 
         let second = maki_storage::id::MakiId::generate();
-        handles.rotate_mailbox(second);
+        handles.set_mailbox(SessionMailbox::new(second));
         assert_eq!(
             handles.mailbox().map(|m| m.session_id()),
             Some(second),

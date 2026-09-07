@@ -20,6 +20,7 @@ use color_eyre::eyre::{Context, eyre};
 use crossterm::event::{
     Event, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
+use maki_agent::SessionMailbox;
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session_coordinator::{
@@ -381,6 +382,32 @@ fn register_coordinator(
     handles: &AgentHandles,
     permissions: &Arc<PermissionManager>,
 ) -> Result<SessionCoordinatorHandle> {
+    let mailbox = handles
+        .mailbox()
+        .ok_or_else(|| eyre!("session mailbox unavailable"))?;
+    register_coordinator_with_mailbox(
+        deps,
+        session,
+        history,
+        available_models,
+        model_slot,
+        handles,
+        permissions,
+        mailbox,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn register_coordinator_with_mailbox(
+    deps: &CoordinatorDeps,
+    session: &AppSession,
+    history: Vec<Message>,
+    available_models: Vec<Arc<str>>,
+    model_slot: &Arc<ProviderSlot>,
+    handles: &AgentHandles,
+    permissions: &Arc<PermissionManager>,
+    mailbox: SessionMailbox,
+) -> Result<SessionCoordinatorHandle> {
     // The coordinator checkpoints by merging into the writer's snapshot for
     // this session, so the snapshot has to exist first. Seeding it here rather
     // than at each call site is what keeps a newly rotated session from
@@ -433,9 +460,7 @@ fn register_coordinator(
             }
         }),
         checkpoint: deps.storage_writer.coordinator_checkpoint(),
-        mailbox: handles
-            .mailbox()
-            .ok_or_else(|| eyre!("session mailbox unavailable"))?,
+        mailbox,
     })
     .map_err(|error| eyre!(error))
 }
@@ -451,9 +476,12 @@ fn rotate_session_coordinator(
     available_models: Vec<Arc<str>>,
 ) -> Result<SessionCoordinatorHandle> {
     let session = Arc::clone(&rt.app.state.session);
-    rt.handles.rotate_mailbox(session.id);
     let permissions = Arc::clone(&rt.app.permissions);
-    let coordinator = register_coordinator(
+    // Registration first: rotating the mailbox is not undoable, and a failure
+    // after it would leave the tab on a session id nothing can resolve, with
+    // every later operation checkpointing into the retired session's file.
+    let mailbox = SessionMailbox::new(session.id);
+    let coordinator = register_coordinator_with_mailbox(
         deps,
         &session,
         Vec::new(),
@@ -461,7 +489,9 @@ fn rotate_session_coordinator(
         &rt.model_slot,
         &rt.handles,
         &permissions,
+        mailbox.clone(),
     )?;
+    rt.handles.set_mailbox(mailbox);
     let retired = std::mem::replace(&mut rt.coordinator, coordinator.clone());
     rt.app.coordinator = Some(coordinator);
     Ok(retired)
@@ -2163,10 +2193,14 @@ impl<'t> EventLoop<'t> {
                     return;
                 }
             };
-        // The previous session keeps the history it ended with; closing is the
-        // only thing owed to it.
+        // The previous session keeps the history it ended with; closing, and
+        // then forgetting the snapshot the empty-session cleanup may have left
+        // behind, is all that is owed to it.
+        let retired_id = retired.read().session_id();
+        let storage_writer = Arc::clone(&self.ctx.storage_writer);
         smol::spawn(async move {
             let _ = retired.close().await;
+            storage_writer.forget(retired_id);
         })
         .detach();
         self.respawn_agent(idx, Vec::new());
@@ -2600,13 +2634,12 @@ impl<'t> EventLoop<'t> {
         }
         let save_sessions_ms = lap();
         crate::agent::join_all(agent_tasks, AGENT_SHUTDOWN_TIMEOUT);
-        // Only once the agents are done: a turn still unwinding holds its
-        // session lease, and the coordinator parks `close` behind it.
-        for coordinator in coordinators {
-            if let Err(error) = smol::block_on(coordinator.close()) {
-                warn!(%error, "session coordinator close failed");
-            }
-        }
+        // Dropping the handles is the teardown: the coordinator's loop ends
+        // when its channel closes and unregisters on the way out, and `Close`
+        // persists nothing. Awaiting it would buy nothing and could hang exit,
+        // because a turn that never releases its lease defers the close
+        // forever.
+        drop(coordinators);
         let join_agents_ms = lap();
         if let Some(ref h) = self.ctx.mcp_handle {
             smol::block_on(h.shutdown());
