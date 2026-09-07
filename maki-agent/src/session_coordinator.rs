@@ -1861,6 +1861,41 @@ mod tests {
         });
     }
 
+    /// A session registered before providers finish discovering models knows
+    /// only the model it started on, so selecting anything else is refused.
+    /// Every frontend must republish the discovered list, or that session is
+    /// stuck on its startup model for as long as it lives.
+    #[test]
+    fn a_model_discovered_after_registration_becomes_selectable() {
+        smol::block_on(async {
+            let id = MakiId::generate();
+            let mut params = params(id, writer(false));
+            params.definitions = builtin_option_definitions("test/model", [], false, false, false);
+            let coordinator = SessionCoordinatorHandle::register(params).unwrap();
+
+            assert!(
+                matches!(
+                    coordinator.set_option("model", "openai/gpt-5").await,
+                    Err(SessionCoordinatorError::Option(
+                        SessionOptionError::InvalidValue { .. }
+                    ))
+                ),
+                "a model the session has never been told about must be refused"
+            );
+
+            coordinator
+                .update_model_values(vec![Arc::from("openai/gpt-5")])
+                .await
+                .expect("discovery republishes the model list");
+            coordinator
+                .set_option("model", "openai/gpt-5")
+                .await
+                .expect("a discovered model must become selectable");
+
+            coordinator.close().await.unwrap();
+        });
+    }
+
     #[test]
     fn model_snapshot_retains_current_model_missing_from_discovery() {
         let definitions = builtin_option_definitions(

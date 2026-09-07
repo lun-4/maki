@@ -278,6 +278,22 @@ impl TuiActorBackend {
         }
     }
 
+    /// A setup failure never enters a run, and the runner drops the outcome it
+    /// synthesizes when the turn is a root -- which every TUI prompt is. Emit
+    /// the error here or the prompt vanishes with no feedback at all.
+    fn report_setup_failure(
+        &self,
+        run_id: u64,
+        turn_id: TurnId,
+        context: &str,
+        error: &AgentError,
+    ) {
+        info!(error = %error, %turn_id, "{context}");
+        let _ = EventSender::new(self.agent_tx.clone(), run_id).send(AgentEvent::ControlError {
+            message: format!("{context}: {}", error.user_message()),
+        });
+    }
+
     /// The one place an executed turn constructs the transient [`Agent`].
     /// Returns `Some` outcome when the run entered, `None` when setup failed
     /// before `Agent::run` (the actor then synthesizes one `Failed` delivery).
@@ -292,15 +308,14 @@ impl TuiActorBackend {
         let lease = match self.acquire_lease().await {
             Ok(lease) => lease,
             Err(error) => {
-                info!(error = %error, %turn_id, "session lease unavailable for turn");
+                self.report_setup_failure(run_id, turn_id, "session lease unavailable", &error);
                 return None;
             }
         };
-        input.lease_committer = lease.as_ref().and_then(|lease| lease.committer());
         let (system, tools, prompt_slots) = match self.prepare_run(&mut input).await {
             Ok(prepared) => prepared,
             Err(error) => {
-                info!(error = %error, %turn_id, "agent turn setup failed before run");
+                self.report_setup_failure(run_id, turn_id, "agent turn setup failed", &error);
                 return None;
             }
         };
@@ -506,7 +521,7 @@ impl ActorBackend for TuiActorBackend {
                         message: error.user_message(),
                     });
                     let _ = self.drain_tx.try_send(run_id);
-                    return BackendResult::ControlFailed;
+                    return BackendResult::CompactDone;
                 }
             };
             let mut result = maki_agent::agent::compact(
@@ -530,7 +545,7 @@ impl ActorBackend for TuiActorBackend {
             }
             let _ = self.drain_tx.try_send(run_id);
             match result {
-                Ok(()) => BackendResult::ControlDone,
+                Ok(()) => BackendResult::CompactDone,
                 Err(e) => {
                     warn!(error = %e, "idle compaction failed");
                     let _ = event_tx.send(AgentEvent::ControlError {
