@@ -469,7 +469,7 @@ function Batch:run_child(c, ctx)
   -- keeping.
   if TERMINAL[c.status] then
     if err and c.swept and err ~= c.output then
-      self:settle(c, STATUS.ERROR, err)
+      self:settle(c, STATUS.ERROR, err, state)
     end
     return
   end

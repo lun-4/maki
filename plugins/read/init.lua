@@ -140,7 +140,7 @@ local function read_file(path, offset, limit, ctx)
     body = build_file_view(lines, start, total_lines, path, ctx),
     annotation = annotation,
     -- What the view was built from, kept so restore can build it again.
-    state = { lines = lines, start_line = start, total_lines = total_lines },
+    state = { lines = lines, start_line = start, total_lines = total_lines, path = path },
   }
 end
 
@@ -193,12 +193,12 @@ maki.api.register_tool({
 
   -- Same view as the live handler, so an expand that goes through restore
   -- keeps its highlighting. Sessions saved without state get the plain view.
-  restore = function(input, output, _is_error, ctx)
+  restore = function(_input, output, _is_error, ctx)
     local st = ctx:state()
-    if not (st and type(st.lines) == "table" and st.start_line and st.total_lines) then
+    if not (st and type(st.lines) == "table" and st.start_line and st.total_lines and st.path) then
       return ToolView.restore(output, read_view_opts(ctx))
     end
-    return build_file_view(st.lines, st.start_line, st.total_lines, input.path or "", ctx)
+    return build_file_view(st.lines, st.start_line, st.total_lines, st.path, ctx)
   end,
 
   handler = function(input, ctx)

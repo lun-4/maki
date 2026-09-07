@@ -8,7 +8,7 @@ use std::sync::Arc;
 use maki_agent::AgentEvent;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PERMISSION_DENIED_PREFIX};
-use maki_agent::tools::ToolRegistry;
+use maki_agent::tools::{FILE_TRUNCATED_MARKER, ToolRegistry};
 use maki_agent::{SnapshotLine, SpanStyle, ToolOutput};
 use maki_config::{
     DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey, ToolOutputLines,
@@ -380,15 +380,18 @@ fn has_syntax_colors(lines: &[SnapshotLine]) -> bool {
 /// gone (cache eviction, theme rebake), so restore must produce the same
 /// highlighted view the live handler did, truncation notice included.
 /// Anything less shows up as "clicking lost the syntax highlighting".
-#[test_case::test_case(0 ; "whole_file")]
-#[test_case::test_case(2 ; "truncated")]
-fn read_renders_identically_live_and_restored(limit: usize) {
+/// `path_key` is the model's spelling: restore gets the raw input, before
+/// alias resolution, so the view must not depend on it.
+#[test_case::test_case(0, "path" ; "whole_file")]
+#[test_case::test_case(2, "path" ; "truncated")]
+#[test_case::test_case(0, "file_path" ; "aliased_path")]
+fn read_renders_identically_live_and_restored(limit: usize, path_key: &str) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("main.rs");
     std::fs::write(&path, RUST_SRC).unwrap();
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
-    let input = json!({ "path": path.to_str().unwrap(), "offset": 1, "limit": limit });
+    let input = json!({ path_key: path.to_str().unwrap(), "offset": 1, "limit": limit });
 
     let live = exec_live(&host, &reg, READ_TOOL, input.clone());
     let restored = restore(
@@ -443,6 +446,33 @@ fn grep_renders_identically_live_and_restored() {
     assert_eq!(
         restored.spans, live.spans,
         "restored grep view must match the live one, colors included"
+    );
+}
+
+/// The host appends its truncation marker after the last entry. The view
+/// has to keep it, or a cut result set looks complete.
+#[test]
+fn grep_restore_keeps_truncation_marker() {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let output = format!("src/a.rs:\n  1: fn main() {{}}\n\n{FILE_TRUNCATED_MARKER}");
+    let restored = restore(
+        &host,
+        GREP_TOOL,
+        json!({ "pattern": "fn" }),
+        &output,
+        None,
+        Vec::new(),
+    );
+    assert!(
+        restored.body.contains("fn main() {}"),
+        "entry rendered: {}",
+        restored.body
+    );
+    assert!(
+        restored.body.ends_with(FILE_TRUNCATED_MARKER),
+        "marker kept as the last line: {}",
+        restored.body
     );
 }
 
