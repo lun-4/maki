@@ -208,13 +208,35 @@ impl StorageWriter {
         })
     }
 
+    /// Removes an empty session's files while keeping its in-memory snapshot.
+    /// The session is still live in its tab, and its coordinator checkpoints by
+    /// merging into that snapshot, so forgetting it would leave the next
+    /// checkpoint with no base to merge into. The files come back if the
+    /// coordinator later has something worth saving.
+    pub fn delete_empty(&self, id: MakiId) {
+        self.delete_inner(id, |_| {}, false);
+    }
+
     /// Delete a session's files on the writer thread; `done` fires there, so
     /// callers never block on disk. Deleting a session that was never written
     /// reports success, and a save enqueued afterwards supersedes the delete.
+    /// The session is forgotten entirely: this is the user asking for it to be
+    /// gone, not the cleanup of a session that has not earned a file yet.
     pub fn delete(&self, id: MakiId, done: impl FnOnce(Result<(), SessionError>) + Send + 'static) {
+        self.delete_inner(id, done, true);
+    }
+
+    fn delete_inner(
+        &self,
+        id: MakiId,
+        done: impl FnOnce(Result<(), SessionError>) + Send + 'static,
+        forget_snapshot: bool,
+    ) {
         let mut state = lock(&self.pending);
-        state.latest.remove(&id);
-        state.coordinator_history_bases.remove(&id);
+        if forget_snapshot {
+            state.latest.remove(&id);
+            state.coordinator_history_bases.remove(&id);
+        }
         let replaced = state.entries.insert(id, Entry::Delete(Box::new(done)));
         drop(state);
         if let Some(Entry::Save(save)) = replaced {
@@ -541,6 +563,106 @@ mod tests {
             assert_eq!(second_ack.unwrap().version, second_version);
             writer.shutdown(DRAIN_TIMEOUT);
             assert_eq!(AppSession::load(id, &dir).unwrap().title, "second");
+        });
+    }
+
+    /// A session with nothing in it yet gets its files cleaned up, but it is
+    /// still live in its tab and its coordinator checkpoints by merging into
+    /// the writer's snapshot. Forgetting that snapshot left the next
+    /// coordinator checkpoint -- the model change on a freshly `/new`ed
+    /// session -- failing with "session snapshot is unavailable".
+    #[test]
+    fn cleaning_up_an_empty_session_keeps_its_coordinator_base() {
+        smol::block_on(async {
+            let (_tmp, dir) = state_dir();
+            let (writer, _warn_rx) = writer(&dir);
+            let session = AppSession::new(MODEL, CWD);
+            let id = session.id;
+            writer.send(Arc::new(session));
+
+            writer.delete_empty(id);
+
+            let options = maki_agent::session_options::SessionOptions::new(
+                maki_agent::session_coordinator::builtin_option_definitions(
+                    "next/model",
+                    [Arc::from("next/model")],
+                    false,
+                    false,
+                    false,
+                ),
+                &Default::default(),
+            )
+            .unwrap()
+            .snapshot();
+            let ack = writer
+                .coordinator_checkpoint()
+                .checkpoint(CheckpointRequest {
+                    session_id: id,
+                    version: CheckpointVersion {
+                        revision: 1,
+                        epoch: 1,
+                    },
+                    snapshot: Arc::new(SessionCheckpoint {
+                        history: Arc::new(Vec::new()),
+                        model: Arc::from("next/model"),
+                        cwd: std::path::PathBuf::from(CWD),
+                        options,
+                    }),
+                })
+                .await;
+            assert!(
+                ack.is_ok(),
+                "an emptied session must still accept a coordinator checkpoint: {ack:?}"
+            );
+        });
+    }
+
+    /// A user-requested delete is different: the session is meant to be gone,
+    /// so its snapshot goes too.
+    #[test]
+    fn deleting_a_session_forgets_its_coordinator_base() {
+        smol::block_on(async {
+            let (_tmp, dir) = state_dir();
+            let (writer, _warn_rx) = writer(&dir);
+            let session = AppSession::new(MODEL, CWD);
+            let id = session.id;
+            writer.send(Arc::new(session));
+
+            let (done_tx, done_rx) = flume::bounded(1);
+            writer.delete(id, move |res| {
+                let _ = done_tx.send(res);
+            });
+            done_rx.recv_async().await.unwrap().unwrap();
+
+            let options = maki_agent::session_options::SessionOptions::new(
+                maki_agent::session_coordinator::builtin_option_definitions(
+                    "next/model",
+                    [Arc::from("next/model")],
+                    false,
+                    false,
+                    false,
+                ),
+                &Default::default(),
+            )
+            .unwrap()
+            .snapshot();
+            let ack = writer
+                .coordinator_checkpoint()
+                .checkpoint(CheckpointRequest {
+                    session_id: id,
+                    version: CheckpointVersion {
+                        revision: 1,
+                        epoch: 1,
+                    },
+                    snapshot: Arc::new(SessionCheckpoint {
+                        history: Arc::new(Vec::new()),
+                        model: Arc::from("next/model"),
+                        cwd: std::path::PathBuf::from(CWD),
+                        options,
+                    }),
+                })
+                .await;
+            assert!(ack.is_err(), "a deleted session must not be resurrected");
         });
     }
 

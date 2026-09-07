@@ -83,7 +83,7 @@ impl App {
             let id = self.state.session.id;
             if self.status == Status::Idle && self.last_sent.take_if(|last| last.id == id).is_some()
             {
-                self.storage_writer.delete(id, |_| {});
+                self.storage_writer.delete_empty(id);
             }
             return;
         }
