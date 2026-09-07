@@ -365,11 +365,7 @@ struct CoordinatorDeps {
     catalog: maki_agent::session_coordinator::SessionOptionCatalog,
     model_policy: Arc<ModelPolicy>,
     timeouts: Timeouts,
-    checkpoint: Arc<
-        dyn maki_storage::checkpoint::CheckpointWriter<
-                maki_agent::session_coordinator::SessionCheckpoint,
-            >,
-    >,
+    storage_writer: Arc<StorageWriter>,
 }
 
 /// Registers the coordinator that owns a session's options, history and lease.
@@ -385,6 +381,11 @@ fn register_coordinator(
     handles: &AgentHandles,
     permissions: &Arc<PermissionManager>,
 ) -> Result<SessionCoordinatorHandle> {
+    // The coordinator checkpoints by merging into the writer's snapshot for
+    // this session, so the snapshot has to exist first. Seeding it here rather
+    // than at each call site is what keeps a newly rotated session from
+    // failing its first checkpoint with "session snapshot is unavailable".
+    deps.storage_writer.send(Arc::new(session.clone()));
     let model_spec = session.model.clone();
     let definitions = builtin_option_definitions(
         Arc::from(model_spec.as_str()),
@@ -431,7 +432,7 @@ fn register_coordinator(
                 }) as DirectoryAdoptionFuture
             }
         }),
-        checkpoint: Arc::clone(&deps.checkpoint),
+        checkpoint: deps.storage_writer.coordinator_checkpoint(),
         mailbox: handles
             .mailbox()
             .ok_or_else(|| eyre!("session mailbox unavailable"))?,
@@ -472,7 +473,7 @@ impl SpawnCtx {
             catalog: self.lua_event_handle.session_option_catalog(),
             model_policy: Arc::clone(&self.model_policy),
             timeouts: self.timeouts,
-            checkpoint: self.storage_writer.coordinator_checkpoint(),
+            storage_writer: Arc::clone(&self.storage_writer),
         }
     }
 
@@ -513,7 +514,6 @@ impl SpawnCtx {
         // so an install or a re-auth here still reaches the usage coordinator.
         let model_slot =
             ProviderSlot::with_change_tx(model.clone(), provider, self.model_slot.change_tx());
-        self.storage_writer.send(Arc::new(session.clone()));
         let permissions = Arc::new(self.permissions.fork());
         permissions.set_yolo(session.meta.yolo);
         permissions.load_session_rules(crate::app::stored_to_rules(&session.meta.session_rules));
@@ -2789,22 +2789,20 @@ mod tests {
         }
     }
 
+    /// A real `StorageWriter`, so the coordinator checkpoint path -- which
+    /// merges into the writer's snapshot for the session -- is exercised
+    /// rather than stubbed away.
     fn test_coordinator_deps() -> CoordinatorDeps {
-        use maki_storage::checkpoint::{CheckpointAck, CheckpointFuture, CheckpointRequest};
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let storage_writer = Arc::new(StorageWriter::new(
+            StateDir::from_path(std::env::temp_dir()),
+            warn_tx,
+        ));
         CoordinatorDeps {
             catalog: Default::default(),
             model_policy: Arc::default(),
             timeouts: Timeouts::default(),
-            checkpoint: Arc::new(
-                |request: CheckpointRequest<maki_agent::session_coordinator::SessionCheckpoint>| {
-                    Box::pin(async move {
-                        Ok(CheckpointAck {
-                            session_id: request.session_id,
-                            version: request.version,
-                        })
-                    }) as CheckpointFuture
-                },
-            ),
+            storage_writer,
         }
     }
 
@@ -2842,6 +2840,16 @@ mod tests {
             SessionCoordinatorHandle::resolve(new_id).is_ok(),
             "the new session must be addressable"
         );
+
+        // The first option change on the rotated session checkpoints, which
+        // merges into the storage writer's snapshot for that id. Registering
+        // without seeding that snapshot failed here with "session snapshot is
+        // unavailable".
+        smol::block_on(rt.coordinator.set_option(
+            maki_agent::session_options::YOLO_OPTION_ID,
+            maki_agent::session_options::ENABLED_VALUE,
+        ))
+        .expect("a rotated session must be able to checkpoint");
 
         // Restoring the previous session means registering it again, which is
         // what failed with "session already live" while the retired handle
