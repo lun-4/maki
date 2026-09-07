@@ -331,10 +331,6 @@ pub enum InteractiveControl {
         lease_committer: Option<crate::session_coordinator::SessionLeaseCommitter>,
     },
     Reset(flume::Sender<Result<(), String>>),
-    AdoptModel {
-        model: Model,
-        reply: flume::Sender<Result<(), String>>,
-    },
     ChangeDirectory {
         path: PathBuf,
         reply: flume::Sender<Result<PathBuf, String>>,
@@ -407,9 +403,6 @@ async fn apply_interactive_control(
                 .await
                 .inspect_err(|_| history.replace(previous))
         }
-        InteractiveControl::AdoptModel { .. } => {
-            Err("model adoption was not intercepted by the session loop".into())
-        }
         InteractiveControl::ChangeDirectory { .. } => {
             Err("directory adoption was not intercepted by the session loop".into())
         }
@@ -418,9 +411,7 @@ async fn apply_interactive_control(
         }
     };
     match control {
-        InteractiveControl::Compact(reply)
-        | InteractiveControl::Reset(reply)
-        | InteractiveControl::AdoptModel { reply, .. } => {
+        InteractiveControl::Compact(reply) | InteractiveControl::Reset(reply) => {
             let _ = reply.send(result);
         }
         InteractiveControl::ChangeDirectory { reply, .. } => {
@@ -533,6 +524,21 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
             }
 
             loop {
+                // The shared source is the authority. A coordinator model
+                // change installs there without passing through this loop, so
+                // the locals have to be refreshed from it or everything built
+                // here -- the tool schema, the system prompt, compaction, an
+                // isolated turn -- keeps using the model the session started
+                // on.
+                {
+                    use crate::ModelSource;
+                    if let Some((current_provider, current_model)) = shared_model.current()
+                        && current_model.spec() != model.spec()
+                    {
+                        provider = current_provider;
+                        model = current_model;
+                    }
+                }
                 let wake = if let Ok(control) = control_rx.try_recv() {
                     Some(Wake::Control(control))
                 } else {
@@ -545,24 +551,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 };
                 let input = match wake {
                     Some(Wake::Input(input)) => input,
-                    Some(Wake::Control(InteractiveControl::AdoptModel {
-                        model: mut candidate,
-                        reply,
-                    })) => {
-                        let result =
-                            match provider::from_model_async(&mut candidate, params.timeouts).await
-                            {
-                                Ok(adopted) => {
-                                    provider = Arc::from(adopted);
-                                    model = candidate;
-                                    shared_model.install(Arc::clone(&provider), model.clone());
-                                    Ok(())
-                                }
-                                Err(error) => Err(error.user_message()),
-                            };
-                        let _ = reply.send(result);
-                        continue;
-                    }
                     Some(Wake::Control(InteractiveControl::ChangeDirectory { path, reply })) => {
                         let result = path
                             .canonicalize()
@@ -730,6 +718,9 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         Ok(p) => {
                             provider = Arc::from(p);
                             model = new_model;
+                            // The run reads the shared source, so an adoption
+                            // that stops here is discarded.
+                            shared_model.install(Arc::clone(&provider), model.clone());
                         }
                         Err(e) => {
                             error!(error = %e, agent_id = %agent_id, %turn_id, "provider error");
@@ -783,15 +774,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
 
                 while answer_rx.lock().await.try_recv().is_ok() {}
 
-                // The run picks the model up per request from the shared
-                // source, so a change part-way through a turn takes effect at
-                // the next inference instead of the next turn.
-                let (turn_provider, turn_model) = {
-                    use crate::ModelSource;
-                    shared_model
-                        .current()
-                        .unwrap_or_else(|| (Arc::clone(&provider), model.clone()))
-                };
                 let mut agent = Agent::new(
                     AgentParams {
                         // Session options travel through the coordinator, so
@@ -801,10 +783,24 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                             model: Arc::new(shared_model.clone()),
                             session_id,
                         })),
-                        tool_builder: None,
+                        // Without this a workflow toggle would flip the flag
+                        // while the interpreter kept the schema built for the
+                        // old one, and a model switch would carry the previous
+                        // model's tool descriptions.
+                        tool_builder: Some({
+                            let vars = turn_vars.clone();
+                            let config = params.config.clone();
+                            let excluded = params.excluded_tools.clone();
+                            let registry = Arc::clone(ToolRegistry::global_arc());
+                            Arc::new(move |model: &Model, workflow: bool| {
+                                tool_definitions(
+                                    &vars, model, &config, &excluded, workflow, &registry,
+                                )
+                            })
+                        }),
                         agent_id,
-                        provider: turn_provider,
-                        model: turn_model,
+                        provider: Arc::clone(&provider),
+                        model: model.clone(),
                         config: params.config.clone(),
                         tool_output_lines: ToolOutputLines::default(),
                         permissions: Arc::clone(&permissions),
