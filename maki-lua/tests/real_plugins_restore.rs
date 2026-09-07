@@ -436,45 +436,6 @@ struct Verdict {
     events: Vec<AgentEvent>,
 }
 
-/// Run the bash tool and return whether it produced an error plus the output
-/// text. Mirrors `exec_live` but surfaces `is_error` (the gate's deny/fallback
-/// paths return error tool output, not live view bodies).
-fn exec_verdict(
-    host: &PluginHost,
-    reg: &ToolRegistry,
-    session: &SessionCoordinatorHandle,
-    input: Value,
-) -> Verdict {
-    let mut ctx = maki_agent::tools::test_support::stub_ctx_with_session(
-        &maki_agent::AgentMode::Build,
-        None,
-        Some("classifier_tool_use_id"),
-        session.read().session_id(),
-    );
-    ctx.tool_output_lines = view_lines();
-    let inv = reg
-        .get("bash")
-        .expect("bash tool registered")
-        .tool
-        .parse(&input)
-        .expect("parse failed");
-    let result = smol::block_on(async { inv.execute(&ctx).await });
-    // Drain the async gate so spawned tasks settle before the host drops.
-    host.load_source("auto_barrier", "").unwrap();
-    let (is_error, output) = match result.output {
-        Ok(maki_agent::ToolOutput::Plain(s)) | Ok(maki_agent::ToolOutput::Markdown(s)) => {
-            (false, s.text)
-        }
-        Err(e) => (true, e),
-        other => panic!("unexpected output: {other:?}"),
-    };
-    Verdict {
-        is_error,
-        output,
-        events: Vec::new(),
-    }
-}
-
 /// Prompt-default `PermissionManager` so unclaimed scopes produce a real
 /// `NeedsPrompt` (the stock stub ctx silently allows them).
 fn prompt_permissions() -> Arc<PermissionManager> {
@@ -585,21 +546,23 @@ fn auto_mode_deny_yolo_rejects_without_running_jobstart() {
 }
 
 #[test]
-fn auto_mode_error_denies_fail_closed_without_prompting() {
+fn auto_mode_error_without_responder_fails_closed() {
     let (host, reg, session) = bash_host_with_classifier(CLASSIFY_ERROR_STUB);
-    let result = exec_verdict(
+    let result = exec_verdict_prompt(
         &host,
         &reg,
         &session,
         json!({ "command": "echo never-runs-2" }),
+        prompt_permissions(),
+        None,
     );
     assert!(
         result.is_error,
-        "a classifier error must fail closed (deny)"
+        "a classifier error without a responder must fail closed"
     );
     assert!(
-        result.output.contains("denied by auto-mode"),
-        "a classifier error must not prompt and never auto-run: {}",
+        result.output.contains(PERMISSION_DENIED_PREFIX),
+        "the fallback permission denial must be reported: {}",
         result.output
     );
 }
@@ -731,9 +694,9 @@ fn automode_deny_blocks_and_approve_runs() {
 }
 
 /// A classifier error (here: a verdict the tool rejects, so none is captured)
-/// fails closed — denied, no prompt, no run.
+/// falls back to permission enforcement and stays denied without a responder.
 #[test]
-fn automode_error_fails_closed_without_prompting() {
+fn automode_error_without_responder_fails_closed() {
     let (host, reg, session) = bash_host_with_real_classifier();
     let provider = Arc::new(common::CannedProvider::new(vec![
         common::canned_tool_use("classifier_verdict", json!({ "approved": "not-a-bool" })),
@@ -747,8 +710,8 @@ fn automode_error_fails_closed_without_prompting() {
         prompt_permissions(),
         json!({ "command": "echo never-runs" }),
     )
-    .expect_err("a classifier error must deny");
-    assert!(err.contains("denied by auto-mode"), "{err}");
+    .expect_err("a classifier error without a responder must deny");
+    assert!(err.contains(PERMISSION_DENIED_PREFIX), "{err}");
 }
 
 /// With auto mode OFF the bash handler runs the plain path and never consults
@@ -859,28 +822,25 @@ fn auto_mode_deny_user_deny_fails() {
 }
 
 #[test]
-fn auto_mode_classifier_error_still_fails_closed() {
+fn auto_mode_classifier_error_user_allow_runs() {
     let (host, reg, session) = bash_host_with_classifier(CLASSIFY_ERROR_STUB);
     let result = exec_verdict_prompt(
         &host,
         &reg,
         &session,
-        json!({ "command": "echo never-runs-ask" }),
+        json!({ "command": "echo classifier-error-allowed" }),
         prompt_permissions(),
         Some("allow"),
     );
     assert!(
-        result.is_error,
-        "a classifier error must fail closed even when a response channel exists"
-    );
-    assert!(
-        result.output.contains("denied by auto-mode"),
-        "a classifier error must never prompt and never auto-run: {}",
+        !result.is_error,
+        "a classifier error should fall back to user approval: {}",
         result.output
     );
+    assert_eq!(result.output, "classifier-error-allowed");
     assert!(
-        permission_requests(&result.events).is_empty(),
-        "a classifier error must not emit a PermissionRequest"
+        !permission_requests(&result.events).is_empty(),
+        "a classifier error must emit a PermissionRequest"
     );
 }
 

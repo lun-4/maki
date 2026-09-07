@@ -257,7 +257,7 @@ local opts = maki.api.register_options(output_limits.extend({
   timeout_secs = {
     default = 120,
     min = 5,
-    desc = "Kill the command after this many seconds. A call's `timeout` param overrides it.",
+    desc = "Kill the command after this many seconds of execution. Approval time is excluded. A call's `timeout` param overrides it.",
   },
   auto_mode = {
     default = false,
@@ -267,6 +267,11 @@ local opts = maki.api.register_options(output_limits.extend({
   auto_model = {
     type = "string",
     desc = "Model spec for the bash auto-mode classifier. Unset: inherits the current session model.",
+  },
+  auto_timeout_secs = {
+    default = 30,
+    min = 5,
+    desc = "Stop the auto-mode classifier after this many seconds and fall back to normal permission handling.",
   },
 }))
 
@@ -343,7 +348,7 @@ maki.api.register_tool({
     type = "object",
     properties = {
       command = { type = "string", description = "The bash command to execute", required = true },
-      timeout = { type = "integer", description = "Timeout in seconds (default 120)" },
+      timeout = { type = "integer", description = "Execution timeout in seconds (default 120)" },
       workdir = { type = "string", description = "Working directory (default: cwd)" },
       description = { type = "string", description = "Short description (3-5 words) of what the command does" },
     },
@@ -406,8 +411,6 @@ maki.api.register_tool({
     local timeout_secs = input.timeout or opts.timeout_secs
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
-    ctx:set_deadline(timeout_secs)
-
     local session_id, session_err = ctx:session_id()
     if not session_id then
       return { llm_output = session_err or "bash requires a live session", is_error = true }
@@ -423,18 +426,18 @@ maki.api.register_tool({
       if verdict == "approve" then
         auto_annotation = { { "auto-mode: allowed", "dim" } }
         -- fall through to the jobstart path unchanged
-      elseif verdict == "deny" then
+      else
+        local failure = reason or err or "no classifier verdict"
         if maki.agent.is_yolo(ctx) then
-          -- YOLO: no prompts, the classifier's deny is final.
           return {
-            llm_output = "command denied by auto-mode: " .. (reason or "no classifier verdict"),
+            llm_output = "command denied by auto-mode: " .. failure,
             is_error = true,
           }
         end
         local scopes = command_scopes(input.command)
         if not scopes then
           return {
-            llm_output = "command denied by auto-mode: " .. (reason or "no classifier verdict"),
+            llm_output = "command denied by auto-mode: " .. failure,
             is_error = true,
           }
         end
@@ -446,7 +449,8 @@ maki.api.register_tool({
           force_prompt = scopes.force_prompt,
         })
         if ok then
-          auto_annotation = { { "auto-mode: denied, allowed by user", "dim" } }
+          local outcome = verdict == "deny" and "denied" or "error"
+          auto_annotation = { { "auto-mode: " .. outcome .. ", allowed by user", "dim" } }
           -- fall through to the jobstart path unchanged
         else
           return {
@@ -454,11 +458,6 @@ maki.api.register_tool({
             is_error = true,
           }
         end
-      else
-        return {
-          llm_output = "command denied by auto-mode: " .. (err or "no classifier verdict"),
-          is_error = true,
-        }
       end
     end
 
@@ -508,6 +507,7 @@ maki.api.register_tool({
 
     view:append({ { "Waiting for output...", "dim" } })
 
+    ctx:set_deadline(timeout_secs)
     maki.fn.jobstart(command, {
       cwd = workdir,
       env = { GIT_TERMINAL_PROMPT = "0" },

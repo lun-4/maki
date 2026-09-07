@@ -1183,6 +1183,13 @@ fn bundled_commands_project_complete_metadata() {
                 maki_commands::ArgumentArity::OPTIONAL,
                 true
             ),
+            (
+                "/usage".into(),
+                "Show provider quota and focused-session token usage".into(),
+                None,
+                maki_commands::ArgumentArity::NONE,
+                true
+            ),
         ]
     );
 }
@@ -4318,6 +4325,32 @@ fn session_close_idempotent_and_prompt_after_close_errors() {
     assert_eq!(out, SESSION_CLOSED_ERR);
 }
 
+#[test]
+fn session_prompt_timeout_cancels_blocked_turn() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "session_timeout_probe",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local semaphore = maki.async.semaphore(1)
+                local permit = semaphore:acquire()
+                local sess = maki.agent.session(ctx, {{ semaphore = semaphore }})
+                local result, err = sess:prompt("x", {{ timeout = 1 }})
+                permit:release()
+                if result ~= nil then return "unexpected result" end
+                return err or "no error"
+            end
+        }})"#
+    );
+    host.load_source("session_timeout_plugin", &src).unwrap();
+    let out = exec_tool(&reg, "session_timeout_probe", serde_json::json!({})).unwrap();
+    assert_eq!(out, "session prompt timed out after 1s");
+}
+
 #[test_case::test_case("{ audience = 'wurkflow' }", "unknown audience: wurkflow" ; "unknown_audience")]
 #[test_case::test_case("{ local_tools = { foo = { handler = function() return '' end } } }", "local_tools.foo: 'description' is required" ; "local_tool_missing_description")]
 #[test_case::test_case("{ local_tools = { foo = { description = 'd' } } }", "local_tools.foo: 'handler' is required" ; "local_tool_missing_handler")]
@@ -5145,4 +5178,114 @@ maki.api.register_tool({
     handle.set_version("1.2.3", Some("9.9.9"));
     let out = exec_tool(&reg, "vprobe", json!({})).unwrap();
     assert_eq!(out, "1.2.3|9.9.9|true", "set store: {out}");
+}
+
+const HOST_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Host roundtrips block the caller on their reply, so a wedged Lua thread
+/// never surfaces as a timeout the caller can observe; it just hangs the
+/// suite. Run the roundtrip on a helper thread and fail on a bounded wait
+/// instead.
+fn host_roundtrip_bounded(
+    guard: maki_lua::test_support::PluginHostGuard,
+    run: impl FnOnce(&maki_lua::PluginHost) -> Result<(), maki_lua::PluginError> + Send + 'static,
+) -> maki_lua::test_support::PluginHostGuard {
+    const ROUNDTRIP_TIMEOUT_MSG: &str = "host roundtrip timed out";
+    let (tx, rx) = flume::bounded(1);
+    std::thread::spawn(move || {
+        let result = run(guard.host());
+        let _ = tx.send((result, guard));
+    });
+    let (result, guard) = rx
+        .recv_timeout(HOST_REPLY_TIMEOUT)
+        .unwrap_or_else(|_| panic!("{ROUNDTRIP_TIMEOUT_MSG}"));
+    result.unwrap();
+    guard
+}
+
+/// `makima --continue` fires `SessionPickerRequested` at startup. The
+/// callback must defer into the command seam instead of suspending async UI
+/// roundtrips inside the synchronous autocmd dispatch, or the host wedges
+/// with an empty, unresponsive picker.
+#[test]
+fn session_picker_requested_autocmd_does_not_wedge_host() {
+    let (_handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["sessions"]);
+    // Answer the deferred `RunCommand` so the wrapper task completes: a bare
+    // host leaves it parked, and load barriers hold up every later request.
+    let ui_rx = guard.host().ui_action_rx();
+    std::thread::spawn(move || {
+        while let Ok(action) = ui_rx.recv() {
+            if let maki_lua::UiAction::RunCommand { reply_tx, .. } = action {
+                let _ = reply_tx.send(Ok(()));
+            }
+        }
+    });
+    // Firing the event must return promptly instead of suspending the dispatch.
+    let guard = host_roundtrip_bounded(guard, |host| {
+        host.load_source("fire", "maki.api.exec_autocmds('SessionPickerRequested')")
+    });
+    // The host request loop must still serve work right after the fire.
+    let _guard = host_roundtrip_bounded(guard, |host| {
+        host.load_source("probe", "local still_alive = true")
+    });
+}
+
+/// The picker must open through the `/sessions` command, which the host runs
+/// as a deadline-free coroutine. A silent no-op autocmd would never emit the
+/// `RunCommand`, and a direct `open()` call would never route through it.
+#[test]
+fn session_picker_requested_routes_through_sessions_command() {
+    const PICKER_TITLE: &str = " Sessions ";
+    let (handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["sessions"]);
+    let ui_rx = guard.host().ui_action_rx();
+    let (saw_run_command_tx, saw_run_command_rx) = flume::bounded(1);
+    let (saw_open_win_tx, saw_open_win_rx) = flume::bounded(1);
+    std::thread::spawn(move || {
+        while let Ok(action) = ui_rx.recv() {
+            match action {
+                maki_lua::UiAction::Session { reply_tx, .. } => {
+                    let _ = reply_tx.send(Ok(json!([])));
+                }
+                maki_lua::UiAction::OpenWin { config, .. } => {
+                    let _ = saw_open_win_tx.send(config.title);
+                }
+                maki_lua::UiAction::RunCommand {
+                    cmdline,
+                    depth,
+                    reply_tx,
+                } => {
+                    let _ = saw_run_command_tx.send(cmdline.clone());
+                    // Play the UI's role in command dispatch so `open()` runs
+                    // end to end as a deadline-free command coroutine.
+                    let _ = handle.run_command_for_test(
+                        Arc::from("sessions"),
+                        Arc::from("/sessions"),
+                        String::new(),
+                        depth,
+                    );
+                    let _ = reply_tx.send(Ok(()));
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let guard = host_roundtrip_bounded(guard, |host| {
+        host.load_source("fire", "maki.api.exec_autocmds('SessionPickerRequested')")
+    });
+
+    let cmdline = saw_run_command_rx
+        .recv_timeout(HOST_REPLY_TIMEOUT)
+        .expect("SessionPickerRequested never ran the /sessions command");
+    assert_eq!(cmdline, "/sessions");
+
+    let title = saw_open_win_rx
+        .recv_timeout(HOST_REPLY_TIMEOUT)
+        .expect("the /sessions command never opened the picker");
+    assert_eq!(title, PICKER_TITLE);
+
+    // The host stays responsive while the picker is parked open.
+    let _guard = host_roundtrip_bounded(guard, |host| {
+        host.load_source("probe", "local still_alive = true")
+    });
 }

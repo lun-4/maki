@@ -14,12 +14,6 @@ use syntect::highlighting::{
 const DEFAULT_THEME: &str = "dracula";
 const RESERVED_KEYS: &[&str] = &["palette", "ui", "inherits"];
 
-/// Endpoints of the quota readout ramp: blue when nearly unused, red when the
-/// lane is exhausted. Chosen to be explicit about usage, independent of the
-/// theme's `accent`/`status` styles.
-const USAGE_BLUE: Color = Color::Rgb(88, 150, 255);
-const USAGE_RED: Color = Color::Rgb(255, 92, 92);
-
 const HELIX_TO_TEXTMATE: &[(&str, &str)] = &[
     ("comment", "comment, comment punctuation.definition.comment"),
     (
@@ -392,6 +386,7 @@ pub fn style_by_name(name: &str) -> Style {
     let t = current();
     match name {
         "dim" | "tool_dim" => t.tool_dim,
+        "status_dim" => t.status_dim,
         "path" | "tool_path" => t.tool_path,
         "tool" => t.tool,
         "tool_prefix" => t.tool_prefix,
@@ -444,6 +439,16 @@ pub fn style_by_name(name: &str) -> Style {
             .unwrap_or(t.item),
         "completion.model" | "completion_model" => {
             t.completion_kinds.get("model").copied().unwrap_or(t.item)
+        }
+        _ if let Some(hex) = name.strip_prefix('#')
+            && hex.len() == 6
+            && let (Ok(r), Ok(g), Ok(b)) = (
+                u8::from_str_radix(&hex[0..2], 16),
+                u8::from_str_radix(&hex[2..4], 16),
+                u8::from_str_radix(&hex[4..6], 16),
+            ) =>
+        {
+            Style::new().fg(Color::Rgb(r, g, b))
         }
         _ => Style::default(),
     }
@@ -812,6 +817,12 @@ impl Theme {
             &["markup.bold", "variable.parameter"],
             Modifier::BOLD,
         );
+        let italic_style = derived_style("italic", &["markup.italic"], Modifier::empty())
+            .add_modifier(Modifier::ITALIC);
+        let bold_italic_style = ui
+            .get("bold_italic")
+            .map(|def| resolve_style(def, &palette).add_modifier(Modifier::BOLD | Modifier::ITALIC))
+            .unwrap_or_else(|| bold_style.add_modifier(Modifier::ITALIC));
 
         Ok(Self {
             background: color("background"),
@@ -837,14 +848,8 @@ impl Theme {
             error: style("error"),
             status_dim: style("status_dim"),
             bold: bold_style,
-            italic: ui
-                .get("italic")
-                .map(|d| resolve_style(d, &palette))
-                .unwrap_or_else(|| Style::default().add_modifier(Modifier::ITALIC)),
-            bold_italic: ui
-                .get("bold_italic")
-                .map(|d| resolve_style(d, &palette))
-                .unwrap_or_else(|| bold_style.add_modifier(Modifier::ITALIC)),
+            italic: italic_style,
+            bold_italic: bold_italic_style,
             inline_code: derived_style(
                 "inline_code",
                 &["function.call", "function"],
@@ -985,19 +990,6 @@ pub(crate) fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0)) as u8
 }
 
-/// Line style for a quota percentage: interpolates blue → red across 0-100%.
-pub fn usage_color(percentage: u32) -> Style {
-    let t = percentage.clamp(0, 100) as f32 / 100.0;
-    let (Color::Rgb(bl, bg, bb), Color::Rgb(rl, rg, rb)) = (USAGE_BLUE, USAGE_RED) else {
-        return Style::new().fg(USAGE_RED);
-    };
-    Style::new().fg(Color::Rgb(
-        lerp_u8(bl, rl, t),
-        lerp_u8(bg, rg, t),
-        lerp_u8(bb, rb, t),
-    ))
-}
-
 pub(crate) fn dim_style(style: Style, factor: f32) -> Style {
     match (style.fg, current().background) {
         (Some(Color::Rgb(fr, fg, fb)), Color::Rgb(br, bg, bb)) => style.fg(Color::Rgb(
@@ -1024,34 +1016,6 @@ fn brighten_toward(style: Style, from: Color, to: Color, t: f32) -> Style {
 mod tests {
     use super::*;
     use test_case::test_case;
-
-    fn rgb(style: Style) -> (u8, u8, u8) {
-        match style.fg {
-            Some(Color::Rgb(r, g, b)) => (r, g, b),
-            other => panic!("expected rgb fg, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn usage_color_ends_are_blue_and_red() {
-        assert_eq!(rgb(usage_color(0)), rgb(Style::new().fg(USAGE_BLUE)));
-        assert_eq!(rgb(usage_color(100)), rgb(Style::new().fg(USAGE_RED)));
-    }
-
-    #[test]
-    fn usage_color_midpoint_between() {
-        let red = rgb(Style::new().fg(USAGE_RED));
-        let mid = rgb(usage_color(50));
-        assert!(
-            mid.0 > 120 && mid.1 > 120 && mid.2 < 200,
-            "midpoint {mid:?} between red {red:?}"
-        );
-    }
-
-    #[test]
-    fn usage_color_clamps_out_of_range() {
-        assert_eq!(rgb(usage_color(150)), rgb(Style::new().fg(USAGE_RED)));
-    }
 
     fn dracula_toml() -> &'static str {
         BUNDLED_THEMES
@@ -1091,6 +1055,124 @@ mod tests {
         assert_eq!(t.code_gutter.fg, Some(Color::Rgb(0xff, 0xb8, 0x6c)));
         assert_eq!(t.list_marker.fg, Some(Color::Rgb(0x8b, 0xe9, 0xfd)));
         assert_eq!(t.bold.fg, Some(Color::Rgb(0xff, 0xb8, 0x6c)));
+        assert_eq!(t.italic.fg, Some(Color::Rgb(0xf1, 0xfa, 0x8c)));
+        assert!(t.italic.add_modifier.contains(Modifier::ITALIC));
+        assert_eq!(t.bold_italic.fg, t.bold.fg);
+        assert_eq!(
+            t.bold_italic.add_modifier,
+            t.bold.add_modifier | Modifier::ITALIC
+        );
+    }
+
+    #[test]
+    fn italic_derives_markup_italic_colour_and_modifier() {
+        let theme = Theme::from_toml(
+            r##"
+"markup.italic" = { fg = "yellow" }
+
+[palette]
+yellow = "#f1fa8c"
+"##,
+        )
+        .unwrap();
+
+        assert_eq!(theme.italic.fg, Some(Color::Rgb(0xf1, 0xfa, 0x8c)));
+        assert_eq!(theme.italic.add_modifier, Modifier::ITALIC);
+    }
+
+    #[test]
+    fn ui_italic_colour_overrides_derivation_and_preserves_modifier() {
+        let theme = Theme::from_toml(
+            r##"
+"markup.italic" = { fg = "yellow" }
+
+[palette]
+yellow = "#f1fa8c"
+pink = "#ff79c6"
+
+[ui]
+italic = { fg = "pink" }
+"##,
+        )
+        .unwrap();
+
+        assert_eq!(theme.italic.fg, Some(Color::Rgb(0xff, 0x79, 0xc6)));
+        assert_eq!(theme.italic.add_modifier, Modifier::ITALIC);
+    }
+
+    #[test]
+    fn bold_italic_preserves_bold_style_and_adds_italic() {
+        let derived = Theme::from_toml(
+            r##"
+"markup.bold" = { fg = "orange", bg = "background", modifiers = ["bold", "underlined"] }
+
+[palette]
+orange = "#ffb86c"
+background = "#282a36"
+"##,
+        )
+        .unwrap();
+        assert_eq!(
+            derived.bold_italic,
+            derived.bold.add_modifier(Modifier::ITALIC)
+        );
+
+        let overridden = Theme::from_toml(
+            r##"
+[palette]
+orange = "#ffb86c"
+background = "#282a36"
+
+[ui]
+bold = { fg = "orange", bg = "background" }
+"##,
+        )
+        .unwrap();
+        assert_eq!(
+            overridden.bold_italic,
+            overridden.bold.add_modifier(Modifier::ITALIC)
+        );
+        assert_eq!(overridden.bold.add_modifier, Modifier::empty());
+        assert_eq!(overridden.bold_italic.add_modifier, Modifier::ITALIC);
+    }
+
+    #[test]
+    fn ui_bold_italic_colour_overrides_fallback_and_preserves_both_modifiers() {
+        let theme = Theme::from_toml(
+            r##"
+[palette]
+orange = "#ffb86c"
+pink = "#ff79c6"
+
+[ui]
+bold = { fg = "orange" }
+bold_italic = { fg = "pink" }
+"##,
+        )
+        .unwrap();
+
+        assert_eq!(theme.bold_italic.fg, Some(Color::Rgb(0xff, 0x79, 0xc6)));
+        assert_eq!(
+            theme.bold_italic.add_modifier,
+            Modifier::BOLD | Modifier::ITALIC
+        );
+    }
+
+    #[test]
+    fn missing_italic_colour_preserves_modifier_only_italic_and_bold_style_fallback() {
+        let theme = Theme::from_toml(
+            r##"
+"markup.bold" = { fg = "orange", modifiers = ["bold"] }
+
+[palette]
+orange = "#ffb86c"
+"##,
+        )
+        .unwrap();
+
+        assert_eq!(theme.italic.fg, None);
+        assert_eq!(theme.italic.add_modifier, Modifier::ITALIC);
+        assert_eq!(theme.bold_italic, theme.bold.add_modifier(Modifier::ITALIC));
     }
 
     #[test]
@@ -1444,6 +1526,10 @@ mode_build = "#112233"
         assert_eq!(style_by_name("warning"), t.todo_in_progress);
         assert_eq!(style_by_name("match"), t.item_match);
         assert_eq!(style_by_name("match_selected"), t.item_match_selected);
+        assert_eq!(
+            style_by_name("#12aBcF").fg,
+            Some(Color::Rgb(0x12, 0xab, 0xcf))
+        );
     }
 
     #[test_case("nonexistent_style")]

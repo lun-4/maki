@@ -13,7 +13,7 @@ local VERDICT_TOOL_NAME = "classifier_verdict"
 local VERDICT_ACK = "Verdict recorded."
 
 function M.defaults()
-  return { auto_mode = false }
+  return { auto_mode = false, auto_timeout_secs = 30 }
 end
 
 -- Strict tri-state decoder: anything that is not `{approved: boolean}` (with an
@@ -108,7 +108,7 @@ function M.classify_verdict(command, cwd, opts, ctx, spawn)
   if sess_err then
     return "error", nil, sess_err
   end
-  local result, prompt_err = sess:prompt(M.build_classifier_message(command, cwd))
+  local result, prompt_err = sess:prompt(M.build_classifier_message(command, cwd), { timeout = opts.auto_timeout_secs })
   sess:close()
   if prompt_err then
     return "error", nil, prompt_err

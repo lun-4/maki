@@ -33,7 +33,7 @@ use crate::components::btw_modal::BtwModal;
 use crate::components::command::ParsedCommand;
 use crate::components::command::{CommandAction, CommandPalette, ConfirmedCommand};
 use crate::components::file_completion::{
-    CompletionAction, CompletionItem, FileCompletionMenu, at_token_range,
+    CompletionAction, CompletionItem, FileCompletionMenu, at_token_query, at_token_range,
 };
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
@@ -52,7 +52,6 @@ use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::status_bar::StatusBar;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
-use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
 };
@@ -73,7 +72,7 @@ use maki_commands::{
 use maki_config::{ModelPolicy, ToolKey, UiConfig};
 use maki_lua::{
     BuiltinAction, CompletionCtx, EventHandle, FloatConfig, HintReader, HintSnapshot, ItemSpec,
-    KeymapReader, Split, WinCommand, WinEvent, WinView,
+    KeymapReader, Split, StatusContentReader, StatusContentSnapshot, WinCommand, WinEvent, WinView,
 };
 use maki_providers::{ContentBlock, Message, Model, Role, ThinkingConfig, add_cost, format_tokens};
 use maki_storage::StateDir;
@@ -83,6 +82,8 @@ use maki_storage::model::persist_model;
 use crate::storage_writer::StorageWriter;
 use crate::theme::ThemesProvider;
 use ratatui::layout::Position;
+
+const SUBAGENT_STREAMING_STATUS: Status = Status::Streaming;
 
 pub(crate) use crate::agent::QueuedMessage;
 
@@ -263,6 +264,7 @@ impl PickerItem for TaskEntry {
 struct SubagentChannels {
     answer_tx: Option<flume::Sender<String>>,
     input_tx: Option<flume::Sender<String>>,
+    cancel: Option<maki_agent::SubagentCancel>,
 }
 
 fn truncate_snippet(text: &str) -> String {
@@ -356,8 +358,6 @@ pub struct App {
     pub(super) mcp_picker: McpPicker,
     pub(super) rewind_picker: RewindPicker,
     pub(super) help_modal: HelpModal,
-    pub(super) usage_modal: UsageModal,
-    usage_readout_watch: Watch<UsageFetchState>,
     pub(super) btw_modal: BtwModal,
     pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
@@ -395,7 +395,6 @@ pub struct App {
 
     pub(crate) storage: StateDir,
     pub(crate) theme_provider: Arc<dyn ThemesProvider>,
-    pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) available_models: Arc<ArcSwapOption<Vec<String>>>,
     pub(crate) shared_history: Option<SharedMessages>,
     pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
@@ -411,6 +410,9 @@ pub struct App {
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
     hints: Watch<HintSnapshot>,
+    pub(super) status_content_reader: StatusContentReader,
+    status_content: Watch<StatusContentSnapshot>,
+    pub(crate) suppress_status_content: Arc<AtomicBool>,
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     /// Per-subagent channels: the `answer_tx` (mid-turn interrupt replies) and,
@@ -419,7 +421,7 @@ pub struct App {
     subagent_channels: HashMap<String, SubagentChannels>,
     /// Stamped child outcomes outrank the later history snapshot, which is
     /// emitted independently and can otherwise make a failed child look done.
-    stamped_subagent_outcomes: HashSet<String>,
+    stamped_subagent_outcomes: HashSet<(String, maki_agent::TurnId)>,
 }
 
 impl App {
@@ -433,6 +435,7 @@ impl App {
         mcp_config_errors: McpConfigErrors,
         keymap_reader: KeymapReader,
         hint_reader: HintReader,
+        status_content_reader: StatusContentReader,
         storage_writer: Arc<StorageWriter>,
         ui_config: UiConfig,
         input_history_size: usize,
@@ -473,8 +476,6 @@ impl App {
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             rewind_picker: RewindPicker::new(),
             help_modal: HelpModal::new(),
-            usage_modal: UsageModal::new(),
-            usage_readout_watch: Watch::default(),
             btw_modal: BtwModal::new(typewriter),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
@@ -505,7 +506,6 @@ impl App {
             submit_released: false,
             storage,
             theme_provider,
-            usage_slot: Arc::new(ArcSwapOption::empty()),
             available_models,
             shared_history: None,
             btw_system: None,
@@ -519,8 +519,11 @@ impl App {
             model_policy: Arc::clone(&model_policy),
             lua_event_handle,
             hints: Watch::seeded(hint_reader.load_full()),
+            status_content: Watch::seeded(status_content_reader.load_full()),
+            suppress_status_content: Arc::new(AtomicBool::new(false)),
             keymap_reader,
             hint_reader,
+            status_content_reader,
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_channels: HashMap::new(),
@@ -541,6 +544,19 @@ impl App {
 
     fn is_main_chat(&self) -> bool {
         self.active_chat == 0
+    }
+
+    fn status_for_chat(&self, chat_idx: usize) -> &Status {
+        if chat_idx > 0
+            && self
+                .chats
+                .get(chat_idx)
+                .is_some_and(|chat| !chat.is_finished())
+        {
+            &SUBAGENT_STREAMING_STATUS
+        } else {
+            &self.status
+        }
     }
 
     fn plan_form_active(&self) -> bool {
@@ -739,10 +755,6 @@ impl App {
             self.help_modal.scroll(delta);
             return None;
         }
-        if self.usage_modal.is_open() {
-            self.usage_modal.scroll(delta);
-            return None;
-        }
         let pos = Position::new(column, row);
         if self.float_mgr.is_focused() && self.float_mgr.contains(pos) {
             self.float_mgr.scroll(delta);
@@ -924,14 +936,6 @@ impl App {
             return Some(vec![]);
         }
 
-        if self.usage_modal.is_open() {
-            if key::REFRESH.matches(key) {
-                return Some(vec![Action::RefreshUsage]);
-            }
-            self.usage_modal.handle_key(key);
-            return Some(vec![]);
-        }
-
         if self.btw_modal.is_open() {
             self.btw_modal.handle_key(key);
             return Some(vec![]);
@@ -1017,7 +1021,7 @@ impl App {
                 KeyCode::Esc => self.queue.unfocus(),
                 _ if key::QUIT.matches(key) => self.queue.unfocus(),
                 _ if key::POP_QUEUE.matches(key) => {
-                    self.queue.remove(0);
+                    self.queue.pop_newest();
                 }
                 _ => {}
             }
@@ -1178,7 +1182,7 @@ impl App {
             BuiltinAction::PlanSubmit => return self.submit_plan(),
             BuiltinAction::EditInput => return vec![Action::EditInputInEditor],
             BuiltinAction::PopQueue => {
-                self.queue.remove(0);
+                self.queue.pop_newest();
             }
             BuiltinAction::PrevChat => self.active_chat = self.active_chat.saturating_sub(1),
             BuiltinAction::NextChat => {
@@ -1343,6 +1347,10 @@ impl App {
                     self.insert_completion(item);
                     return vec![];
                 }
+                CompletionAction::Advance(item) => {
+                    self.advance_completion(item);
+                    return vec![];
+                }
                 CompletionAction::Passthrough => {}
             }
         }
@@ -1473,8 +1481,8 @@ impl App {
 
         let cwd = self.state.session.cwd.clone();
         let query = {
-            let line = &self.input_box.buffer.lines()[self.input_box.buffer.y()];
-            line[start + 1..end].to_string()
+            let buffer = &self.input_box.buffer;
+            at_token_query(&buffer.lines()[buffer.y()], buffer.x()).unwrap_or_default()
         };
         self.file_completion.set_token_byte_range((start, end));
         if self.file_completion.is_active() {
@@ -1488,17 +1496,33 @@ impl App {
         }
     }
 
-    /// Replaces the `@`-token with the chosen completion and drops the popup.
+    /// Replaces the `@` token with a final completion and closes the popup.
     fn insert_completion(&mut self, item: CompletionItem) {
-        let replacement = item.replacement();
+        self.apply_completion(item, true);
+    }
+
+    /// Replaces the `@` token with an explicit directory and refreshes its children.
+    fn advance_completion(&mut self, item: CompletionItem) {
+        let replacement = item.advance_replacement();
+        self.apply_completion_replacement(replacement, false);
+        self.sync_file_completion();
+    }
+
+    fn apply_completion(&mut self, item: CompletionItem, close: bool) {
+        self.apply_completion_replacement(item.replacement(), close);
+    }
+
+    fn apply_completion_replacement(&mut self, replacement: String, close: bool) {
         let (start, end) = self.file_completion.token_byte_range();
-        self.file_completion.close();
+        if close {
+            self.file_completion.close();
+        }
         self.input_box
             .buffer
             .replace_range_on_current_line(start, end, &replacement);
-        let val = self.input_box.buffer.value();
-        self.command_palette.sync(&val);
-        self.sync_command_arguments(&val, self.input_box.buffer.cursor_byte_offset());
+        let value = self.input_box.buffer.value();
+        self.command_palette.sync(&value);
+        self.sync_command_arguments(&value, self.input_box.buffer.cursor_byte_offset());
     }
 
     /// Typing path for a focused subagent tab: characters go into the shared
@@ -1602,10 +1626,14 @@ impl App {
 
         self.chats[self.active_chat].flush();
         self.chats[self.active_chat].cancel_in_progress();
-        self.chats[self.active_chat].mark_finished(DisplayRole::Error, CANCELLED_TEXT);
-        self.subagent_channels.remove(&tool_use_id);
-
-        vec![Action::CancelSubagent { tool_use_id }]
+        if let Some(cancel) = self
+            .subagent_channels
+            .get(&tool_use_id)
+            .and_then(|channels| channels.cancel.as_ref())
+        {
+            cancel.cancel();
+        }
+        vec![]
     }
 
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
@@ -1632,7 +1660,7 @@ impl App {
             }
             return vec![];
         }
-        if envelope.run_id != self.run_id {
+        if envelope.subagent.is_none() && envelope.run_id != self.run_id {
             // A snapshot dropped here degrades the tool body to llm_output.
             if let AgentEvent::ToolSnapshot { id, .. }
             | AgentEvent::ToolHeaderSnapshot { id, .. }
@@ -1652,7 +1680,15 @@ impl App {
             (&envelope.subagent, &envelope.event)
         {
             let tool_use_id = subagent.parent_tool_use_id.clone();
-            if !self.stamped_subagent_outcomes.insert(tool_use_id.clone()) {
+            let turn_id = match outcome {
+                maki_agent::TurnOutcome::Completed { turn_id, .. }
+                | maki_agent::TurnOutcome::Cancelled { turn_id, .. }
+                | maki_agent::TurnOutcome::Failed { turn_id, .. } => *turn_id,
+            };
+            if !self
+                .stamped_subagent_outcomes
+                .insert((tool_use_id.clone(), turn_id))
+            {
                 return vec![];
             }
             let chat_idx = self.resolve_or_create_chat(subagent);
@@ -1686,7 +1722,10 @@ impl App {
         {
             // Workflow sessions use synthetic ids that no ToolDone will match,
             // so we finish them here on SubagentHistory.
-            if !self.stamped_subagent_outcomes.contains(&tool_use_id)
+            if !self
+                .stamped_subagent_outcomes
+                .iter()
+                .any(|(id, _)| id == &tool_use_id)
                 && let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str())
                 && !self.chats[sub_idx].is_finished()
             {
@@ -1745,6 +1784,15 @@ impl App {
             Some(ref subagent) => self.resolve_or_create_chat(subagent),
             None => 0,
         };
+        if chat_idx > 0
+            && !matches!(
+                envelope.event,
+                AgentEvent::TurnOutcome(_) | AgentEvent::SubagentHistory { .. }
+            )
+        {
+            self.chats[chat_idx].reopen();
+            self.sync_task_picker();
+        }
 
         if let AgentEvent::ToolDone(ref e) = envelope.event {
             if self.state.mode == Mode::Plan
@@ -1758,11 +1806,21 @@ impl App {
                 .insert_tool_output(e.id.clone(), e.output.clone());
             if let Some(&sub_idx) = self.chat_index.get(&e.id) {
                 let (role, text) = if e.is_error {
-                    (DisplayRole::Error, ERROR_TEXT)
+                    let text = e.output.as_text();
+                    let text = if text.is_empty() {
+                        ERROR_TEXT.into()
+                    } else {
+                        text
+                    };
+                    (DisplayRole::Error, text)
                 } else {
-                    (DisplayRole::Done, DONE_TEXT)
+                    (DisplayRole::Done, DONE_TEXT.into())
                 };
-                self.chats[sub_idx].mark_finished(role, text);
+                if e.is_error {
+                    self.chats[sub_idx].mark_failed(&text);
+                } else {
+                    self.chats[sub_idx].mark_finished(role, &text);
+                }
             }
             self.sync_task_picker();
         }
@@ -1858,8 +1916,7 @@ impl App {
                 ChatEventResult::Done => {
                     self.status_bar.clear_flash();
                     self.terminalize_turn(MISSING_TOOL_COMPLETION);
-                    self.chat_index.clear();
-                    self.subagent_channels.clear();
+                    self.retain_live_async_subagents();
                     self.status = Status::Idle;
                     self.fire_session_autocmd("TurnEnd", serde_json::json!({}));
                     if self.exit_on_done {
@@ -1872,11 +1929,10 @@ impl App {
                 ChatEventResult::Error(message) => {
                     self.status = Status::error(message.clone());
                     self.status_bar.clear_flash();
-                    self.subagent_channels.clear();
                     self.terminalize_turn(&message);
+                    self.retain_live_async_subagents();
                     self.recoverable_queue = self.queue.text_messages();
                     self.queue.clear();
-                    self.chat_index.clear();
                     self.fire_session_autocmd(
                         "TurnError",
                         serde_json::json!({ "message": message }),
@@ -1888,7 +1944,10 @@ impl App {
                 ChatEventResult::AuthRequired
                 | ChatEventResult::PermissionRequest { .. }
                 | ChatEventResult::QueueItemConsumed { .. } => unreachable!(),
-                ChatEventResult::Continue | ChatEventResult::ControlComplete => {}
+                ChatEventResult::ControlComplete => {
+                    self.status = Status::Idle;
+                }
+                ChatEventResult::Continue => {}
             }
         }
         actions
@@ -1938,6 +1997,7 @@ impl App {
             SubagentChannels {
                 answer_tx: subagent.answer_tx.clone(),
                 input_tx: subagent.input_tx.clone(),
+                cancel: subagent.cancel.clone(),
             },
         );
         self.chats[0].update_tool_summary(id, &subagent.name);
@@ -2133,14 +2193,6 @@ impl App {
             BuiltinOperation::ToggleHelp => {
                 self.help_modal.toggle();
                 vec![]
-            }
-            BuiltinOperation::ToggleUsage => {
-                self.usage_modal.toggle();
-                if self.usage_modal.is_open() {
-                    vec![Action::RefreshUsage]
-                } else {
-                    vec![]
-                }
             }
             BuiltinOperation::FocusQueue => {
                 self.queue.set_focus();
@@ -2367,10 +2419,9 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 14] {
+    fn overlays(&self) -> [&dyn Overlay; 13] {
         [
             &self.help_modal,
-            &self.usage_modal,
             &self.btw_modal,
             &self.float_mgr,
             &self.search_modal,
@@ -2386,10 +2437,9 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
         [
             &mut self.help_modal,
-            &mut self.usage_modal,
             &mut self.btw_modal,
             &mut self.float_mgr,
             &mut self.search_modal,
@@ -2644,6 +2694,12 @@ impl App {
 
     /// Every poller that feeds the screen, in one place and never in `view`;
     /// see [`crate::repaint`] for why.
+    pub(crate) fn reconcile_status_content(&mut self) -> u64 {
+        let snapshot = self.status_content_reader.load_full();
+        let _ = self.status_content.poll(Arc::clone(&snapshot));
+        snapshot.generation
+    }
+
     pub fn tick(&mut self) -> Dirty {
         // `|` never short-circuits: every poller must run on every tick.
         let mut dirty = self.float_mgr.tick()
@@ -2656,9 +2712,10 @@ impl App {
             | self.status_bar.clear_expired_hint()
             | self.mcp_picker.refresh()
             | self.model_picker.refresh()
-            | self.usage_modal.poll(&self.usage_slot)
-            | self.usage_readout_watch.poll(self.usage_slot.load_full())
             | self.hints.poll(self.hint_reader.load_full())
+            | self
+                .status_content
+                .poll(self.status_content_reader.load_full())
             | self.tick_file_picker()
             | self.tick_file_completion()
             | self.command_palette.poll_arguments();
@@ -2704,7 +2761,7 @@ impl App {
         Cadence::any([
             Cadence::any(self.overlays().into_iter().map(Overlay::cadence)),
             StatusBar::cadence(
-                &self.status,
+                self.status_for_chat(self.active_chat),
                 self.restoring.load(Ordering::Relaxed),
                 self.retry_info.is_some(),
             ),
@@ -2727,14 +2784,44 @@ impl App {
     }
 
     /// Terminalizes every tool left in progress when a turn ends, sparing
-    /// shell commands that outlive the agent.
+    /// shell commands and reusable async subagents that outlive the agent.
     fn terminalize_turn(&mut self, message: &str) {
-        self.retain_resolved_subagents(DisplayRole::Error, ERROR_TEXT);
+        let reusable: HashSet<usize> = self
+            .chat_index
+            .iter()
+            .filter(|(id, _)| {
+                self.subagent_channels
+                    .get(id.as_str())
+                    .is_some_and(|channels| channels.input_tx.is_some())
+            })
+            .map(|(_, &index)| index)
+            .collect();
+        self.chat_index.retain(|_, &mut sub_idx| {
+            if reusable.contains(&sub_idx) || self.chats[sub_idx].is_finished() {
+                true
+            } else {
+                self.chats[sub_idx].mark_finished(DisplayRole::Error, ERROR_TEXT);
+                false
+            }
+        });
+        self.sync_subagents();
         self.chats[0].fail_in_progress_except(message.into(), self.shell.active_ids());
-        for chat in self.chats.iter_mut().skip(1) {
-            chat.fail_in_progress_with_message(message.into());
+        for (index, chat) in self.chats.iter_mut().enumerate().skip(1) {
+            if !reusable.contains(&index) {
+                chat.fail_in_progress_with_message(message.into());
+            }
         }
         self.sync_task_picker();
+    }
+
+    fn retain_live_async_subagents(&mut self) {
+        self.chat_index.retain(|id, _| {
+            self.subagent_channels
+                .get(id.as_str())
+                .is_some_and(|channels| channels.input_tx.is_some())
+        });
+        self.subagent_channels
+            .retain(|id, _| self.chat_index.contains_key(id));
     }
 
     /// Marks unfinished subagent chats as ended and drops them from
@@ -2794,6 +2881,7 @@ impl App {
         try_picker!(self.mcp_picker);
         try_picker!(self.login_picker);
         if !self.is_main_chat() {
+            self.input_box.handle_paste(text);
             return;
         }
         if let InputAction::PaletteSync(val) = self.input_box.handle_paste(text) {

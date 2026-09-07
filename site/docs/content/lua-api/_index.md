@@ -109,6 +109,7 @@ The rules:
 | [`maki.model`](#maki-model) | The model behind the focused session. |
 | [`maki.net`](#maki-net) | HTTP client for fetching web content. |
 | [`maki.session`](#maki-session) | Host session primitives. |
+| [`maki.usage`](#maki-usage) | Provider-side quota snapshots. |
 | [`maki.text`](#maki-text) | Text transformation utilities. |
 | [`maki.time`](#maki-time) | Wall-clock timestamps and relative-age formatting. |
 | [`maki.timer`](#maki-timer) | Recurring callbacks on the runtime's timer pump. |
@@ -622,7 +623,9 @@ maki.api.register_completion_source({prefix}, {spec})
 
 Register a completion source for `prefix`. The source's `get_items(ctx)` is
 called once when the `@` popup opens; `ctx` is `{ mode = "...", models = {...} }`.
-Returns its candidates as an array of `{ label, kind, insertion, description? }`.
+Returns candidates as `{ label, kind, insertion, description? }`. `insertion`
+is a logical `@` reference. The UI adds quotes when its value contains
+whitespace or trailing sentence punctuation.
 
 **Parameters:**
 
@@ -648,11 +651,11 @@ maki.api.register_expander({prefix}, {f})
 ```
 
 Register a submit-time expander for `prefix`. Called with `{ value = "..." }`
-(the part after `prefix:`) for each `@prefix:value` token; returns
-`(string, nil)` to splice that string in-place of the token, or
-`(nil, err)` to flash `err` and abort the run. Unknown prefixes pass through
-verbatim, so register an expander under every alias you accept (e.g. both
-`"skill"` and `"s"`).
+(the decoded part after `prefix:`) for each `@prefix:value` token; quoted
+values may contain whitespace and punctuation. Returns `(string, nil)` to
+splice that string in place of the token, or `(nil, err)` to flash `err` and
+abort the run. Unknown prefixes pass through verbatim, so register an
+expander under every alias you accept (e.g. both `"skill"` and `"s"`).
 
 **Parameters:**
 
@@ -683,9 +686,13 @@ Listen for one or more events. Returns an id you can pass to
 
 Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"SessionReset"`,
-`"SessionFocusChanged"`, `"SessionPickerRequested"`, `"SplashShown"`,
+`"SessionFocusChanged"`, `"ProviderChanged"`, `"SessionPickerRequested"`, `"SplashShown"`,
 `"SplashHidden"`, and `"StoreChanged"`. Plugins can
 also fire their own events with `exec_autocmds`.
+
+`"SessionPickerRequested"` opens the `/sessions` picker, but only
+asynchronously: the callback defers through `maki.async.run`, so the
+picker is not open when the event returns.
 
 Except `"SessionPickerRequested"` and `"StoreChanged"`, each host event
 carries `data.session_id`. For `"SessionReset"` that
@@ -1145,8 +1152,9 @@ maki.agent.permission_prompt({ctx}, {opts})
 ```
 
 Run the normal interactive permission prompt for a tool call, without
-dispatching the tool. This is how a plugin escalates a classifier deny to
-the same allow/deny/remember choices a user would see with automode off.
+dispatching the tool. This is how a plugin escalates a classifier deny or
+failure to the same allow/deny/remember choices a user would see with
+automode off.
 Allow and deny rules apply exactly as they do for a plain tool call.
 
 **Parameters:**
@@ -1183,7 +1191,7 @@ maki.agent.is_yolo({ctx})
 ```
 
 Whether this session is in YOLO mode, where permission prompts are skipped
-and the bash automode classifier's deny is final (no escalation).
+and the bash automode classifier's deny or failure is final (no escalation).
 
 YOLO toggles at runtime (`/yolo`, `--yolo`), so query it per call rather
 than caching it.
@@ -1290,7 +1298,7 @@ or let garbage collection handle it.
 ### `Session:prompt()` {#Session-prompt}
 
 ```lua
-Session:prompt({message})
+Session:prompt({message}, {opts?})
 ```
 
 Send a message to the subagent and wait for its full response. The agent
@@ -1307,6 +1315,8 @@ tools).
 **Parameters:**
 
 - `{message}` (`string`) User message to send.
+- `{opts?}` (`table?`) Optional fields:
+  - `timeout` (`integer?`) maximum wait in seconds. A timeout closes the session and returns no partial streamed text.
 
 **Returns:** (`table?`, `string?`) Result table on success, or `(nil, err)` on
 failure. A run cut short after streaming some text hands you both: the
@@ -3355,9 +3365,10 @@ maki.session.list()
 
 Lists sessions stored for the current project. Answered from a
 background scan, so a slow disk never blocks the UI. `open_elsewhere` is
-true while another makima instance has the session open.
+true while another makima instance has the session open. `message_count`
+counts main transcript messages only and excludes subagent histories.
 
-**Returns:** (`table|nil`, `string|nil`) Array of `{id, title, updated_at, cwd, open_elsewhere}`, or nil and an error.
+**Returns:** (`table|nil`, `string|nil`) Array of `{id, title, updated_at, cwd, message_count, open_elsewhere}`, or nil and an error.
 
 **Example:**
 
@@ -3376,9 +3387,10 @@ maki.session.list_all()
 Lists stored sessions across every project directory, most recently
 updated first. Answered from a background scan, so a slow disk never
 blocks the UI. `open_elsewhere` is true while another makima instance has
-the session open.
+the session open. `message_count` counts main transcript messages only
+and excludes subagent histories.
 
-**Returns:** (`table|nil`, `string|nil`) Array of `{id, title, updated_at, cwd, open_elsewhere}`, or nil and an error.
+**Returns:** (`table|nil`, `string|nil`) Array of `{id, title, updated_at, cwd, message_count, open_elsewhere}`, or nil and an error.
 
 **Example:**
 
@@ -3398,7 +3410,9 @@ Lists the sessions currently running in this UI. Status is "working",
 "needs_input", or "idle". A mailbox follow-up stays "working" without an
 intermediate "idle" status.
 
-**Returns:** (`table|nil`, `string|nil`) Array of `{id, title, status, updated_at, focused}`, or nil and an error.
+`message_count` counts main transcript messages only and excludes subagent histories.
+
+**Returns:** (`table|nil`, `string|nil`) Array of `{id, title, status, updated_at, message_count, focused}`, or nil and an error.
 
 **Example:**
 
@@ -3422,6 +3436,29 @@ Returns the id of the currently focused session.
 
 ```lua
 local id = maki.session.current()
+```
+
+---
+
+### `maki.session.usage()` {#maki-session-usage}
+
+```lua
+maki.session.usage()
+```
+
+Returns the focused session's token usage without making a network request.
+Costs are the values recorded when each turn was billed and remain nil when
+no turn for that total or model was priced. Models are sorted by total tokens
+descending, then model spec ascending.
+
+**Returns:** (`table|nil`, `string|nil`) `{total={input, output, cache_creation,
+  cache_read, cost}, models}`, where each model has `{model, input, output,
+  cache_creation, cache_read, cost}`, or nil and an error.
+
+**Example:**
+
+```lua
+local usage, err = maki.session.usage()
 ```
 
 ---
@@ -3664,6 +3701,62 @@ the choice is also persisted as the global default for new sessions.
 ```lua
 maki.session.set_thinking({ mode = "medium", set_default = true })
 ```
+
+
+## maki.usage {#maki-usage}
+
+Provider-side quota snapshots. `get` reads the Lua-thread mirror,
+`fetch` asks the interactive UI to refresh it, and `on_change` observes
+canonical publications. Without an interactive UI `get` stays nil,
+`fetch` returns `nil, "no interactive UI attached"`, and callbacks are idle.
+
+---
+
+### `maki.usage.get()` {#maki-usage-get}
+
+```lua
+maki.usage.get()
+```
+
+Returns the latest provider quota snapshot without starting a network request.
+Returns nil until the interactive UI publishes its first snapshot.
+
+**Returns:** table|nil `{provider_id, provider, model, status}` or nil.
+
+---
+
+### `maki.usage.fetch()` {#maki-usage-fetch}
+
+```lua
+maki.usage.fetch({opts?})
+```
+
+Fetches the active provider account's quota. Ordinary fetches join an
+in-flight request; a forced fetch queues one fresh follow-up.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Optional `{force = boolean}`.
+
+**Returns:** table|nil, string|nil Fresh `{provider_id, provider, model, status}`, or nil and an error.
+
+---
+
+### `maki.usage.on_change()` {#maki-usage-on_change}
+
+```lua
+maki.usage.on_change({callback})
+```
+
+Registers a synchronous callback for provider quota snapshot changes.
+Registrations belong to the plugin and are removed when it unloads.
+Callback failures are logged and do not stop other callbacks.
+
+**Parameters:**
+
+- `{callback}` (`function`) Called with `{provider_id, provider, model, status}`.
+
+**Returns:** function Idempotent unsubscribe callback.
 
 
 ## maki.text {#maki-text}
@@ -5131,6 +5224,23 @@ end
 
 ---
 
+### `maki.ui.format_time()` {#maki-ui-format_time}
+
+```lua
+maki.ui.format_time({epoch_ms}, {style?})
+```
+
+Formats a Unix timestamp as local time using the configured clock.
+
+**Parameters:**
+
+- `{epoch_ms}` (`integer`) Unix timestamp in milliseconds.
+- `{style?}` (`string?`) Output style: `time`, `weekday`, or `date`. Defaults to `time`.
+
+**Returns:** (`string`) Formatted local time.
+
+---
+
 ### `maki.ui.highlight()` {#maki-ui-highlight}
 
 ```lua
@@ -5451,6 +5561,28 @@ local win = maki.ui.open_win(buf, {
   cursor_line = true,
   footer = { { "q", "quit" }, { "Enter", "select" } },
 })
+```
+
+---
+
+### `maki.ui.set_status_content()` {#maki-ui-set_status_content}
+
+```lua
+maki.ui.set_status_content({spans})
+```
+
+Sets styled status content for your plugin. Each span is a {text, style_name} pair. An empty table clears your plugin's content. Only your own content is affected.
+
+**Parameters:**
+
+- `{spans}` (`table`) Sequence of {text, style_name} string pairs.
+
+**Example:**
+
+```lua
+maki.ui.set_status_content({ {"connected", "success"}, {" readonly", "muted"} })
+-- later, clear it:
+maki.ui.set_status_content({})
 ```
 
 ---

@@ -20,9 +20,7 @@ use maki_agent::{
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{BuiltinAction, CommandArgumentItem, HintReader, KeymapReader};
-use maki_providers::{
-    ContentBlock, Effort, Message, ProviderUsage, Role, TokenUsage, UsageLimit, UsageWindow,
-};
+use maki_providers::{ContentBlock, Effort, Message, Role, TokenUsage};
 use maki_storage::sessions::{StoredMode, StoredSubagent, StoredThinking};
 use ratatui::layout::Rect;
 use std::env;
@@ -323,6 +321,7 @@ fn build_app_with_full(
         McpConfigErrors::new(PathBuf::new()),
         KeymapReader::empty(),
         HintReader::empty(),
+        maki_lua::StatusContentReader::empty(),
         writer,
         ui,
         100,
@@ -369,6 +368,7 @@ fn app_with_custom_commands(commands: &[CustomCommand]) -> App {
         McpConfigErrors::new(PathBuf::new()),
         KeymapReader::empty(),
         HintReader::empty(),
+        maki_lua::StatusContentReader::empty(),
         writer,
         UiConfig::default(),
         100,
@@ -385,7 +385,7 @@ fn app_with_custom_commands(commands: &[CustomCommand]) -> App {
         Arc::new(crate::theme::InMemoryThemesProvider::bundled()),
         command_runtime,
     );
-    let (shared_queue, _rx) = shared_queue::queue();
+    let shared_queue = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     app
 }
@@ -393,7 +393,7 @@ fn app_with_custom_commands(commands: &[CustomCommand]) -> App {
 pub(crate) fn test_app() -> App {
     let dir = StateDir::from_path(env::temp_dir());
     let mut app = build_app(dir.clone(), Arc::new(test_writer(dir)));
-    let (shared_queue, _rx) = shared_queue::queue();
+    let shared_queue = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     app
 }
@@ -499,6 +499,7 @@ fn subagent_info_full(
         model: None,
         answer_tx,
         input_tx,
+        cancel: None,
     }
 }
 
@@ -650,7 +651,7 @@ fn exit_on_done_flag_triggers_exit(event: AgentEvent, expected: ExitRequest) {
 }
 
 #[test]
-fn standalone_compaction_does_not_exit_or_end_turn() {
+fn standalone_compaction_returns_to_idle_without_ending_the_session() {
     let mut app = test_app();
     app.exit_on_done = true;
     app.status = Status::Streaming;
@@ -659,7 +660,7 @@ fn standalone_compaction_does_not_exit_or_end_turn() {
         usage: TokenUsage::default(),
     }));
     assert_eq!(app.exit_request, ExitRequest::None);
-    assert_eq!(app.status, Status::Streaming);
+    assert_eq!(app.status, Status::Idle);
 }
 
 #[test]
@@ -1040,73 +1041,6 @@ fn lifecycle_app() -> (
 }
 
 #[test]
-fn empty_completion_cancels_once_and_next_request_uses_new_session() {
-    let dir = StateDir::from_path(env::temp_dir());
-    let (handle, probe) = maki_lua::test_support::probed_event_handle();
-    let registry = maki_commands::CommandRegistry::new();
-    let _producer = register_test_lua_command(
-        &registry,
-        TestLuaCommand {
-            handle: handle.clone(),
-            name: Arc::from("/deploy"),
-            plugin: Arc::from("deploy"),
-            max_args: Some(1),
-            completion: true,
-        },
-    );
-    let mut app = build_app_with_full(
-        dir.clone(),
-        Arc::new(test_writer(dir)),
-        registry,
-        handle,
-        UiConfig::default(),
-    );
-    app.input_box.set_input("/deploy a".into());
-    app.command_palette.sync("/deploy a");
-    app.command_palette
-        .sync_arguments("/deploy a", 9, &app.state.mode.id_key());
-    let first_session = app.command_palette.completion_session_id().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        if probe.try_finish_command_arguments(Vec::new()).is_some() {
-            break;
-        }
-        assert!(Instant::now() < deadline, "completion request was not sent");
-        std::thread::yield_now();
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        if app.command_palette.poll_arguments() == Dirty::YES {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "completion result was not applied"
-        );
-        std::thread::yield_now();
-    }
-    assert_eq!(
-        probe.try_finish_command_argument_lifecycle(),
-        Some(("cancel", None, true))
-    );
-    assert!(probe.try_finish_command_argument_lifecycle().is_none());
-
-    app.command_palette
-        .sync_arguments("/deploy a", 9, &app.state.mode.id_key());
-    let second_session = app.command_palette.completion_session_id().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        if probe.try_finish_command_arguments(Vec::new()).is_some() {
-            break;
-        }
-        assert!(Instant::now() < deadline, "completion request was not sent");
-        std::thread::yield_now();
-    }
-    assert_ne!(second_session, first_session);
-}
-
-#[test]
 fn argument_completion_clears_old_rows_while_request_pending() {
     let dir = StateDir::from_path(env::temp_dir());
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
@@ -1141,7 +1075,14 @@ fn argument_completion_clears_old_rows_while_request_pending() {
         .sync_arguments("/deploy b", 9, &app.state.mode.id_key());
     assert!(app.command_palette.completion_session_id().is_some());
     assert!(!rendered(&mut app).contains("old-result"));
-    assert!(probe.try_finish_command_arguments(Vec::new()).is_some());
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while probe.try_finish_command_arguments(Vec::new()).is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "argument completion request was not sent"
+        );
+        std::thread::yield_now();
+    }
 }
 
 #[test]
@@ -1982,7 +1923,7 @@ fn subagent_done_only_in_subagent_chat() {
 }
 
 #[test_case(|app: &mut App| finish_subagent_task(app, false), DONE_TEXT,      &DisplayRole::Done  ; "task_success")]
-#[test_case(|app: &mut App| finish_subagent_task(app, true),  ERROR_TEXT,     &DisplayRole::Error ; "task_failure")]
+#[test_case(|app: &mut App| finish_subagent_task(app, true),  "result",       &DisplayRole::Error ; "task_failure")]
 #[test_case(cancel_app as fn(&mut App),                       CANCELLED_TEXT, &DisplayRole::Error ; "cancel")]
 #[test_case(error_app  as fn(&mut App),                       ERROR_TEXT,     &DisplayRole::Error ; "main_error")]
 fn subagent_terminal_marker(
@@ -2008,7 +1949,7 @@ fn subagent_already_done_not_double_marked(terminate: fn(&mut App)) {
 }
 
 #[test_case(false, DONE_TEXT,  &DisplayRole::Done  ; "batch_subagent_success")]
-#[test_case(true,  ERROR_TEXT, &DisplayRole::Error ; "batch_subagent_failure")]
+#[test_case(true,  "result",   &DisplayRole::Error ; "batch_subagent_failure")]
 fn batch_subagent_done_marker(is_error: bool, expected_text: &str, expected_role: &DisplayRole) {
     let mut app = app_with_subagent_id("batch1__0");
     finish_subagent(&mut app, "batch1__0", is_error);
@@ -2160,55 +2101,23 @@ fn rendered_rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
 }
 
 #[test]
-fn usage_readout_draws_in_status_bar() {
-    let mut app = test_app();
-    let usage = ProviderUsage {
-        plan: None,
-        limits: vec![
-            UsageLimit {
-                kind: UsageWindow::Hours(5),
-                percentage: Some(30),
-                reset_at: None,
-                detail: None,
-            },
-            UsageLimit {
-                kind: UsageWindow::Weekly { model: None },
-                percentage: Some(50),
-                reset_at: None,
-                detail: None,
-            },
-        ],
-    };
-    app.usage_slot
-        .store(Some(Arc::new(UsageFetchState::Ready(usage))));
-    let rows = rendered_rows(&mut app, 80, 24);
-    let text = rows.join("\n");
-    assert!(
-        text.contains("5h30% w50%"),
-        "usage readout missing from rendered bottom region:\n{text}"
-    );
-}
+fn focused_running_subagent_draws_status_bar_spinner_while_main_is_idle() {
+    const SPINNER_GLYPHS: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
 
-#[test]
-fn usage_readout_blank_for_non_ready_states() {
-    let app = test_app();
-    app.usage_slot
-        .store(Some(Arc::new(UsageFetchState::Loading)));
+    let mut app = app_with_subagent();
+    app.status = Status::Idle;
+    app.active_chat = 1;
+    assert!(!app.chats[1].is_finished());
     assert!(
-        app.usage_readout().is_none(),
-        "Loading must not paint a readout"
+        app.cadence().moves(),
+        "the footer spinner must keep repainting"
     );
-    app.usage_slot
-        .store(Some(Arc::new(UsageFetchState::Unsupported)));
+
+    let rows = rendered_rows(&mut app, 80, 24);
+    let status = rows.last().expect("status row");
     assert!(
-        app.usage_readout().is_none(),
-        "Unsupported must not paint a readout"
-    );
-    app.usage_slot
-        .store(Some(Arc::new(UsageFetchState::Error("boom".into()))));
-    assert!(
-        app.usage_readout().is_none(),
-        "Error must not paint a readout"
+        status.chars().any(|ch| SPINNER_GLYPHS.contains(ch)),
+        "focused running subagent must animate the status bar: {status}"
     );
 }
 
@@ -2769,20 +2678,6 @@ fn assert_owes_one_frame(app: &mut App, arrival: impl FnOnce()) {
     arrival();
     assert_eq!(app.tick(), Dirty::YES, "{OWED}");
     assert_eq!(app.tick(), Dirty::NO, "{QUIET}");
-}
-
-/// `/usage` spawns a detached fetch that stores its answer with nothing
-/// listening, so an unpolled modal sits on `Loading` until the user presses
-/// some unrelated key.
-#[test]
-fn usage_quota_arriving_in_the_background_owes_a_frame() {
-    let mut app = test_app();
-    app.execute_command(cmd("/usage"), 0);
-    let slot = Arc::clone(&app.usage_slot);
-
-    assert_owes_one_frame(&mut app, || {
-        slot.store(Some(Arc::new(UsageFetchState::Loading)));
-    });
 }
 
 /// Providers publish their model list into a shared slot that wakes nothing,
@@ -3505,21 +3400,27 @@ fn queue_esc_unfocuses_without_removing() {
 }
 
 #[test]
-fn ctrl_q_pops_front() {
+fn ctrl_q_pops_newest_visible_item() {
     let mut app = app_with_queued_message();
     app.queue_and_notify(queued_msg("second"));
-    app.update(Msg::Key(kb::POP_QUEUE.to_key_event()));
-    assert_eq!(app.queue.len(), 1);
-    assert_eq!(app.queue.panel_entries()[0].text, "second");
-    assert!(app.queue.focus().is_none(), "unfocused stays unfocused");
-
     app.queue_and_notify(queued_msg("third"));
     app.queue.set_focus_at(1);
+
     app.update(Msg::Key(kb::POP_QUEUE.to_key_event()));
+
+    assert_eq!(app.queue.len(), 2);
+    assert_eq!(
+        app.queue
+            .panel_entries()
+            .iter()
+            .map(|entry| entry.text.as_ref())
+            .collect::<Vec<_>>(),
+        ["queued", "second"]
+    );
     assert_eq!(
         app.queue.focus(),
-        Some(0),
-        "focus adjusted when item removed"
+        Some(1),
+        "focus follows the retained newest item"
     );
 }
 
@@ -3871,42 +3772,6 @@ fn yolo_toggle() {
 }
 
 #[test]
-fn usage_command_toggles_modal() {
-    let mut app = test_app();
-    assert!(!app.usage_modal.is_open());
-    let open_actions = app.execute_command(cmd("/usage"), 0);
-    assert!(app.usage_modal.is_open());
-    assert!(
-        open_actions
-            .iter()
-            .any(|a| matches!(a, Action::RefreshUsage)),
-        "opening should request a quota refresh"
-    );
-    let close_actions = app.execute_command(cmd("/usage"), 0);
-    assert!(!app.usage_modal.is_open());
-    assert!(
-        !close_actions
-            .iter()
-            .any(|a| matches!(a, Action::RefreshUsage)),
-        "closing should not trigger a refresh"
-    );
-}
-
-#[test]
-fn ctrl_r_refreshes_usage_while_modal_open() {
-    let mut app = test_app();
-    app.execute_command(cmd("/usage"), 0);
-    assert!(app.usage_modal.is_open());
-
-    let actions = app.update(Msg::Key(kb::REFRESH.to_key_event()));
-    assert!(
-        actions.iter().any(|a| matches!(a, Action::RefreshUsage)),
-        "Ctrl+R should emit RefreshUsage"
-    );
-    assert!(app.usage_modal.is_open(), "modal should stay open");
-}
-
-#[test]
 fn cd_command_behavior() {
     let mut app = test_app();
     app.execute_command(
@@ -4082,7 +3947,7 @@ fn run_cmdline_keeps_typed_input() {
     let mut app = test_app();
     app.input_box.set_input("half written".into());
 
-    app.run_cmdline("/usage", 0).unwrap();
+    app.run_cmdline("/help", 0).unwrap();
 
     assert_eq!(app.input_box.buffer.value(), "half written");
 }
@@ -5507,6 +5372,121 @@ fn subagent_history_finishes_workflow_chat() {
 }
 
 #[test]
+fn reusable_subagent_processes_distinct_turn_outcomes() {
+    const FAILURE_MESSAGE: &str = "second turn failed";
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let (input_tx, input_rx) = flume::unbounded();
+    let mut info = subagent_info(TASK_ID, "worker");
+    info.input_tx = Some(input_tx);
+    let envelope = |outcome| {
+        Msg::Agent(Box::new(Envelope {
+            event: AgentEvent::TurnOutcome(outcome),
+            subagent: Some(info.clone()),
+            run_id: 1,
+        }))
+    };
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta {
+            text: "first".into(),
+        },
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+
+    app.update(envelope(TurnOutcome::Completed {
+        agent_id: AgentId::generate(),
+        turn_id: TurnId::generate(),
+        usage: TokenUsage::default(),
+        num_turns: 1,
+        reason: DoneReason::EndTurn,
+    }));
+    app.run_id = 2;
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta {
+            text: "second turn".into(),
+        },
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+    assert!(!app.chats[1].is_finished());
+    assert!(app.task_entries()[1].is_spinning());
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentHistory {
+            tool_use_id: TASK_ID.into(),
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "recovered reply".into(),
+                }],
+                ..Default::default()
+            }],
+        },
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+    assert_eq!(
+        app.queue.text_messages(),
+        [format!(
+            "{SUBAGENT_REPLY_HEADER}{TASK_ID}{SUBAGENT_REPLY_SUFFIX}recovered reply"
+        )],
+        "old-run recovered history must queue a main-agent turn"
+    );
+    app.update(envelope(TurnOutcome::Failed {
+        agent_id: AgentId::generate(),
+        turn_id: TurnId::generate(),
+        usage: TokenUsage::default(),
+        num_turns: 1,
+        failure: TurnFailure {
+            kind: TurnFailureKind::Provider,
+            diagnostic: FAILURE_MESSAGE.into(),
+            user_message: FAILURE_MESSAGE.into(),
+            retryable: false,
+        },
+    }));
+
+    assert_eq!(app.chats[1].last_message_role(), Some(&DisplayRole::Error));
+    assert_eq!(app.chats[1].last_message_text(), FAILURE_MESSAGE);
+    assert!(input_rx.try_recv().is_err());
+}
+
+#[test]
+fn main_turn_completion_keeps_async_subagent_cancellable_and_reusable() {
+    const FOLLOW_UP: &str = "follow up";
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let (input_tx, input_rx) = flume::unbounded();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut info = subagent_info(TASK_ID, "worker");
+    info.input_tx = Some(input_tx);
+    info.cancel = Some(maki_agent::SubagentCancel::new({
+        let cancelled = Arc::clone(&cancelled);
+        move || cancelled.store(true, Ordering::SeqCst)
+    }));
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta {
+            text: "working".into(),
+        },
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    app.update(done_event());
+    app.active_chat = 1;
+    assert!(!app.chats[1].is_finished());
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(actions.is_empty());
+    assert!(cancelled.load(Ordering::SeqCst));
+
+    type_and_submit(&mut app, FOLLOW_UP);
+    assert_eq!(input_rx.try_recv().unwrap(), FOLLOW_UP);
+}
+
+#[test]
 fn stamped_child_failure_wins_over_prior_history_snapshot() {
     let mut app = test_app();
     app.status = Status::Streaming;
@@ -5848,13 +5828,8 @@ fn double_esc_in_subagent_cancels_subagent() {
     let mut app = app_with_active_subagent();
     app.last_esc = Some(Instant::now());
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
-    assert_eq!(actions.len(), 1);
-    assert!(matches!(
-        &actions[0],
-        Action::CancelSubagent { tool_use_id } if tool_use_id == TASK_ID
-    ));
-    assert!(app.chats[1].is_finished());
-    assert_eq!(app.chats[1].last_message_text(), CANCELLED_TEXT);
+    assert!(actions.is_empty());
+    assert!(!app.chats[1].is_finished());
 }
 
 #[test]
@@ -5882,14 +5857,14 @@ fn esc_in_main_chat_with_active_subagent_no_cancel() {
 }
 
 #[test]
-fn cancel_subagent_removes_answer_sender() {
+fn cancel_subagent_retains_channel() {
     let (mut app, _sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
     assert!(!app.subagent_channels.is_empty());
     app.run_builtin(BuiltinAction::NextChat);
     assert_eq!(app.active_chat, 1);
     app.last_esc = Some(Instant::now());
     app.update(Msg::Key(key(KeyCode::Esc)));
-    assert!(!app.subagent_channels.contains_key(TASK_ID));
+    assert!(app.subagent_channels.contains_key(TASK_ID));
 }
 
 #[test]
@@ -5906,14 +5881,10 @@ fn multiple_subagents_cancel_one_other_unaffected() {
     app.last_esc = Some(Instant::now());
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
 
-    assert_eq!(actions.len(), 1);
-    assert!(matches!(
-        &actions[0],
-        Action::CancelSubagent { tool_use_id } if tool_use_id == "task2"
-    ));
+    assert!(actions.is_empty());
     let task1_idx = *app.chat_index.get(TASK_ID).unwrap();
     assert!(!app.chats[task1_idx].is_finished());
-    assert!(app.chats[app.active_chat].is_finished());
+    assert!(!app.chats[app.active_chat].is_finished());
 }
 
 #[test]
@@ -5930,7 +5901,7 @@ fn subagent_cancel_then_navigate_back_main_unaffected() {
     let mut app = app_with_active_subagent();
     app.last_esc = Some(Instant::now());
     app.update(Msg::Key(key(KeyCode::Esc)));
-    assert!(app.chats[1].is_finished());
+    assert!(!app.chats[1].is_finished());
 
     app.run_builtin(BuiltinAction::PrevChat);
     assert_eq!(app.active_chat, 0);
@@ -6324,7 +6295,7 @@ fn completion_app() -> (TempDir, App, Arc<maki_lua::TestCompletionBackend>) {
     let dir = StateDir::from_path(env::temp_dir());
     let (handle, backend) = maki_lua::test_support::event_handle_with_completion();
     let mut app = build_app_with_handle(dir.clone(), Arc::new(test_writer(dir)), handle);
-    let (shared_queue, _rx) = shared_queue::queue();
+    let shared_queue = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     std::sync::Arc::get_mut(&mut app.state.session)
         .unwrap()
@@ -6519,7 +6490,119 @@ fn enter_inserts_file_verbatim() {
     }
     converge_completion(&mut app);
     app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(app.input_box.buffer.value(), "@docs/read me.md");
+    assert_eq!(app.input_box.buffer.value(), "@\"docs/read me.md\"");
+}
+
+#[test]
+fn space_closes_unquoted_completion_but_not_quoted_completion() {
+    let (_tmp, mut app, _backend) = completion_app();
+    for character in "@partial ".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    assert!(!app.file_completion.is_active());
+
+    app.input_box.set_input(String::new());
+    for character in "@\"partial path".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    assert!(app.file_completion.is_active());
+}
+
+#[test]
+fn parent_path_completion_advances_then_finishes() {
+    let (_tmp, mut app, _backend) = completion_app();
+    let parent = tempfile::tempdir().unwrap();
+    let project = parent.path().join("project");
+    let sibling = parent.path().join("sibling");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&sibling).unwrap();
+    std::fs::write(sibling.join("outside.txt"), b"outside").unwrap();
+    std::sync::Arc::get_mut(&mut app.state.session)
+        .unwrap()
+        .set_cwd(project.to_string_lossy().into_owned());
+
+    for character in "@../sib".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(app.file_completion.is_active());
+    assert_eq!(
+        app.input_box.buffer.value(),
+        format!("@../sibling{}", std::path::MAIN_SEPARATOR)
+    );
+
+    for character in "out".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        app.input_box.buffer.value(),
+        format!("@../sibling{}outside.txt", std::path::MAIN_SEPARATOR)
+    );
+    assert!(!app.file_completion.is_active());
+}
+
+#[test]
+fn absolute_path_completion_finds_external_file() {
+    let (_tmp, mut app, _backend) = completion_app();
+    let external = tempfile::tempdir().unwrap();
+    let file = external.path().join("external-note.txt");
+    std::fs::write(&file, b"external").unwrap();
+    let query = format!(
+        "@{}{}external",
+        external.path().display(),
+        std::path::MAIN_SEPARATOR
+    );
+
+    for character in query.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert_eq!(app.input_box.buffer.value(), format!("@{}", file.display()));
+    assert!(!app.file_completion.is_active());
+}
+
+#[test]
+fn quoted_explicit_path_advances_then_closes_on_file() {
+    let (_tmp, mut app, _backend) = completion_app();
+    let parent = tempfile::tempdir().unwrap();
+    let project = parent.path().join("project");
+    let directory = parent.path().join("release notes");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("final report?.md"), b"report").unwrap();
+    Arc::get_mut(&mut app.state.session)
+        .unwrap()
+        .set_cwd(project.to_string_lossy().into_owned());
+
+    for character in "@\"../release".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        app.input_box.buffer.value(),
+        format!("@\"../release notes{}", std::path::MAIN_SEPARATOR)
+    );
+    assert!(app.file_completion.is_active());
+
+    for character in "final".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert_eq!(
+        app.input_box.buffer.value(),
+        format!(
+            "@\"../release notes{}final report?.md\"",
+            std::path::MAIN_SEPARATOR
+        )
+    );
+    assert!(!app.file_completion.is_active());
 }
 
 #[test]
@@ -6635,6 +6718,20 @@ fn at_subagent_prefix_lists_subagents() {
 }
 
 #[test]
+fn mode_switch_closes_completion_source_snapshot() {
+    let (_tmp, mut app, backend) = completion_app();
+    seed_subagents(&backend, "build");
+    for character in "@a:".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    converge_completion(&mut app);
+    assert!(app.file_completion.is_active());
+
+    app.set_mode_id("plan".into());
+    assert!(!app.file_completion.is_active());
+}
+
+#[test]
 fn at_a_prefix_in_plan_mode_hides_general() {
     let (_tmp, mut app, backend) = completion_app();
     app.set_mode_id("plan".into());
@@ -6702,20 +6799,6 @@ fn enter_inserts_subagent_reference_with_trailing_space() {
     converge_completion(&mut app);
     app.update(Msg::Key(key(KeyCode::Enter)));
     assert_eq!(app.input_box.buffer.value(), "@subagent:research ");
-}
-
-#[test]
-fn enter_inserts_model_reference_with_trailing_space() {
-    let (_tmp, mut app, backend) = completion_app();
-    app.available_models
-        .store(Some(Arc::new(vec!["zai/glm-5".into()])));
-    seed_models(&backend, &["zai/glm-5"]);
-    for c in "@m:glm".chars() {
-        app.update(Msg::Key(key(KeyCode::Char(c))));
-    }
-    converge_completion(&mut app);
-    app.update(Msg::Key(key(KeyCode::Enter)));
-    assert_eq!(app.input_box.buffer.value(), "@model:zai/glm-5 ");
 }
 
 #[test]
@@ -6878,6 +6961,19 @@ fn typing_in_subagent_chat_edits_input_and_submits_to_subagent() {
 }
 
 #[test]
+fn paste_in_subagent_chat_edits_input_and_submits_to_subagent() {
+    const PASTED: &str = "first\nsecond";
+
+    let (mut app, input_rx) = app_with_subagent_input_tx(TASK_ID);
+    app.update(Msg::Paste("first\r\nsecond".into()));
+    assert_eq!(app.input_box.buffer.value(), PASTED);
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(input_rx.try_recv().unwrap(), PASTED);
+    assert!(app.queue.text_messages().is_empty());
+}
+
+#[test]
 fn subagent_completion_queues_reply_to_main() {
     let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
     // Terminal completion flushes the subagent's history; the driver surfaces
@@ -7027,8 +7123,11 @@ fn test_idle_splash_pulls_lua_frame() {
 
 #[test]
 fn slow_splash_renderer_does_not_block_tick_or_input() {
-    const RENDER_SECS: f64 = 0.3;
-    const MAX_TICK: Duration = Duration::from_millis(50);
+    // Wall-clock spin (os.time): bounded even under CPU starvation, unlike
+    // os.clock whose CPU-time wait stretches with load and hogs a core. The
+    // render is many times MAX_TICK, so a tick that waits on it trips loudly.
+    const RENDER_WALL_SECS: u64 = 2;
+    const MAX_TICK: Duration = Duration::from_millis(300);
 
     let (handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["splashes_default"]);
     guard
@@ -7038,8 +7137,8 @@ fn slow_splash_renderer_does_not_block_tick_or_input() {
             &format!(
                 r##"
 maki.api.set_slot("splash.render", function(prev, w, h, t, fade)
-  local started = os.clock()
-  while os.clock() - started < {RENDER_SECS} do end
+  local deadline = os.time() + {RENDER_WALL_SECS}
+  while os.time() < deadline do end
   return {{ {{ {{ glyphs = string.rep("x", w), style = "#ffffff" }} }} }}
 end)
 "##

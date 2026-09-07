@@ -108,9 +108,10 @@ fn snapshot_table(lua: &Lua, snapshot: &SessionOptionsSnapshot) -> LuaResult<Tab
 
 /// Lists sessions stored for the current project. Answered from a
 /// background scan, so a slow disk never blocks the UI. `open_elsewhere` is
-/// true while another makima instance has the session open.
+/// true while another makima instance has the session open. `message_count`
+/// counts main transcript messages only and excludes subagent histories.
 ///
-/// @return (table|nil, string|nil) Array of `{id, title, updated_at, cwd, open_elsewhere}`, or nil and an error.
+/// @return (table|nil, string|nil) Array of `{id, title, updated_at, cwd, message_count, open_elsewhere}`, or nil and an error.
 /// @example
 /// local stored, err = maki.session.list()
 #[lua_fn]
@@ -121,9 +122,10 @@ async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
 /// Lists stored sessions across every project directory, most recently
 /// updated first. Answered from a background scan, so a slow disk never
 /// blocks the UI. `open_elsewhere` is true while another makima instance has
-/// the session open.
+/// the session open. `message_count` counts main transcript messages only
+/// and excludes subagent histories.
 ///
-/// @return (table|nil, string|nil) Array of `{id, title, updated_at, cwd, open_elsewhere}`, or nil and an error.
+/// @return (table|nil, string|nil) Array of `{id, title, updated_at, cwd, message_count, open_elsewhere}`, or nil and an error.
 /// @example
 /// local stored, err = maki.session.list_all()
 #[lua_fn]
@@ -135,7 +137,9 @@ async fn list_all(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaRe
 /// "needs_input", or "idle". A mailbox follow-up stays "working" without an
 /// intermediate "idle" status.
 ///
-/// @return (table|nil, string|nil) Array of `{id, title, status, updated_at, focused}`, or nil and an error.
+/// `message_count` counts main transcript messages only and excludes subagent histories.
+///
+/// @return (table|nil, string|nil) Array of `{id, title, status, updated_at, message_count, focused}`, or nil and an error.
 /// @example
 /// local live, err = maki.session.live()
 #[lua_fn]
@@ -151,6 +155,21 @@ async fn live(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
 #[lua_fn]
 async fn current(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::Current).await
+}
+
+/// Returns the focused session's token usage without making a network request.
+/// Costs are the values recorded when each turn was billed and remain nil when
+/// no turn for that total or model was priced. Models are sorted by total tokens
+/// descending, then model spec ascending.
+///
+/// @return (table|nil, string|nil) `{total={input, output, cache_creation,
+///   cache_read, cost}, models}`, where each model has `{model, input, output,
+///   cache_creation, cache_read, cost}`, or nil and an error.
+/// @example
+/// local usage, err = maki.session.usage()
+#[lua_fn]
+async fn usage(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
+    roundtrip(lua, tx, SessionRequest::Usage).await
 }
 
 /// Switches the UI to the session with {id}. The session must belong to
@@ -387,7 +406,7 @@ lua_table! {
     /// attached"` without a UI. `notify` instead targets a live agent mailbox
     /// directly, so it also works under ACP and SDK frontends.
     "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), list_all(tx), live(tx), current(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), options(tx), set_option(tx), set_title(tx), thinking(tx), set_thinking(tx)]
+    DOCS [list(tx), list_all(tx), live(tx), current(tx), usage(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), options(tx), set_option(tx), set_title(tx), thinking(tx), set_thinking(tx)]
 }
 
 #[cfg(test)]
@@ -460,6 +479,41 @@ mod tests {
             smol::block_on(lua.load("return session.live()").eval_async()).unwrap();
         assert!(val.is_nil());
         assert_eq!(err.as_deref(), Some(NO_UI_ERR));
+    }
+
+    #[test]
+    fn usage_roundtrips_through_ui_channel() {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        let checker = std::thread::spawn(move || {
+            let Ok(UiAction::Session {
+                req: SessionRequest::Usage,
+                reply_tx,
+            }) = rx.recv()
+            else {
+                panic!("expected usage request");
+            };
+            reply_tx
+                .send(Ok(json!({
+                    "total": {
+                        "input": 1,
+                        "output": 2,
+                        "cache_creation": 3,
+                        "cache_read": 4,
+                        "cost": null,
+                    },
+                    "models": [],
+                })))
+                .unwrap();
+        });
+        let (val, err): (Table, Option<String>) =
+            smol::block_on(lua.load("return session.usage()").eval_async()).unwrap();
+        checker.join().unwrap();
+        assert_eq!(err, None);
+        let total: Table = val.get("total").unwrap();
+        assert_eq!(total.get::<u32>("input").unwrap(), 1);
+        assert!(total.get::<Value>("cost").unwrap().is_nil());
+        assert_eq!(val.get::<Table>("models").unwrap().raw_len(), 0);
     }
 
     #[test]

@@ -78,6 +78,7 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::net::DOCS,
         &api::session::DOCS,
         &api::session_option::DOCS,
+        &api::usage::DOCS,
         &api::text::DOCS,
         &api::time::DOCS,
         &api::timer::DOCS,
