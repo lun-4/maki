@@ -211,6 +211,16 @@ impl ProviderSlot {
     }
 }
 
+impl maki_agent::ModelSource for ProviderSlot {
+    fn current(&self) -> Option<(Arc<dyn Provider>, Model)> {
+        let snapshot = self.load();
+        Some((
+            Arc::clone(&snapshot.provider) as Arc<dyn Provider>,
+            snapshot.model.clone(),
+        ))
+    }
+}
+
 /// Inherited via CLI across every session (including respawns).
 #[derive(Clone, Default)]
 pub(crate) struct SystemPromptOverride {

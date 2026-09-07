@@ -667,23 +667,23 @@ fn install_session(
             cwd: cwd.clone(),
             model_policy: Arc::clone(&params.model_policy),
             model_adopter: Arc::new({
-                let control_tx = handle.control_tx.clone();
-                move |model: Model| {
-                    let control_tx = control_tx.clone();
+                // Installing into the shared source rather than asking the
+                // session loop to adopt: the loop only reads its control
+                // channel between turns, so a round-trip here would wait for
+                // the running turn -- and that turn cannot finish while the
+                // coordinator is blocked on this call. The store also lands on
+                // the run's next request instead of its next turn.
+                let shared = handle.model.clone();
+                let timeouts = params.timeouts;
+                move |mut model: Model| {
+                    let shared = shared.clone();
                     Box::pin(async move {
-                        let (reply, response) = flume::bounded(1);
-                        control_tx
-                            .send_async(maki_agent::headless::InteractiveControl::AdoptModel {
-                                model,
-                                reply,
-                            })
-                            .await
-                            .map_err(|_| Arc::from("session ended before model adoption"))?;
-                        response
-                            .recv_async()
-                            .await
-                            .map_err(|_| Arc::from("session ended during model adoption"))?
-                            .map_err(Arc::from)
+                        let provider =
+                            maki_providers::provider::from_model_async(&mut model, timeouts)
+                                .await
+                                .map_err(|error| Arc::from(error.user_message()))?;
+                        shared.install(Arc::from(provider), model);
+                        Ok(())
                     }) as maki_agent::session_coordinator::ModelAdoptionFuture
                 }
             }),
@@ -1968,6 +1968,7 @@ mod tests {
         let (input_tx, input_rx) = flume::unbounded();
         let session_id = MakiId::generate();
         let handle = InteractiveHandle {
+            model: Default::default(),
             event_rx: flume::unbounded().1,
             tool_names: Vec::new(),
             input_tx,

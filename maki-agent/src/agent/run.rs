@@ -81,11 +81,46 @@ fn filter_tools(all: &Value, allowed: &[String]) -> Value {
     )
 }
 
+/// The provider and model a run should use from its next request onward.
+/// A frontend that can change the model while a run is in flight supplies one
+/// of these; the agent polls it between requests so a change lands on the next
+/// inference rather than waiting for the whole turn to finish.
+pub trait ModelSource: Send + Sync {
+    /// `None` while the source has nothing to offer yet, which reads as "no
+    /// change" rather than forcing a caller to invent a placeholder provider.
+    fn current(&self) -> Option<(Arc<dyn Provider>, Model)>;
+}
+
+/// A [`ModelSource`] a frontend can install into. Adoption is a store rather
+/// than a round-trip to whatever loop owns the run, so a model can be changed
+/// while a turn is in flight without waiting for the turn to end -- and
+/// without a coordinator operation blocking on that wait.
+#[derive(Clone, Default)]
+pub struct SharedModel(Arc<arc_swap::ArcSwapOption<(Arc<dyn Provider>, Model)>>);
+
+impl SharedModel {
+    pub fn install(&self, provider: Arc<dyn Provider>, model: Model) {
+        self.0.store(Some(Arc::new((provider, model))));
+    }
+}
+
+impl ModelSource for SharedModel {
+    fn current(&self) -> Option<(Arc<dyn Provider>, Model)> {
+        self.0
+            .load()
+            .as_ref()
+            .map(|snapshot| (Arc::clone(&snapshot.0), snapshot.1.clone()))
+    }
+}
+
 #[derive(Clone)]
 pub struct AgentParams {
     pub agent_id: AgentId,
     pub provider: Arc<dyn Provider>,
     pub model: Model,
+    /// `None` for a run whose model cannot change once it starts, such as a
+    /// single print-mode invocation.
+    pub model_source: Option<Arc<dyn ModelSource>>,
     pub config: AgentConfig,
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
@@ -116,6 +151,7 @@ pub struct Agent<'h> {
     agent_id: AgentId,
     provider: Arc<dyn Provider>,
     model: Arc<Model>,
+    model_source: Option<Arc<dyn ModelSource>>,
     history: &'h mut History,
     system: String,
     event_tx: EventSender,
@@ -160,6 +196,7 @@ impl<'h> Agent<'h> {
             agent_id: params.agent_id,
             provider: params.provider,
             model: Arc::new(params.model),
+            model_source: params.model_source,
             config: params.config,
             tool_output_lines: params.tool_output_lines,
             permissions: params.permissions,
@@ -343,6 +380,35 @@ impl<'h> Agent<'h> {
     /// `self.tools` holds base tools only; the MCP part is recomputed here
     /// every turn so `tool_search` loads and late-connecting servers take
     /// effect on the next request.
+    /// Picks up a model changed while this run was in flight. Called at the
+    /// top of a request, where every tool call already has its result in
+    /// history, so a change to the advertised tool set cannot orphan one that
+    /// is still outstanding. Everything derived from the model -- the tool
+    /// schema, thinking clamps, cost attribution -- is recomputed per request,
+    /// so swapping the two fields is the whole change.
+    fn adopt_pending_model(&mut self) {
+        let Some(source) = &self.model_source else {
+            return;
+        };
+        let Some((provider, model)) = source.current() else {
+            return;
+        };
+        if model.spec() == self.model.spec() {
+            return;
+        }
+        info!(
+            from = %self.model.spec(),
+            to = %model.spec(),
+            self.num_turns,
+            "adopting a model changed mid-run"
+        );
+        let _ = self
+            .event_tx
+            .send(AgentEvent::ModelSwitched { spec: model.spec() });
+        self.provider = provider;
+        self.model = Arc::new(model);
+    }
+
     fn request_tools(&self) -> Cow<'_, Value> {
         let def = self.modes.current(&self.mode);
         let base = match &def.tools {
@@ -363,6 +429,7 @@ impl<'h> Agent<'h> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
+        self.adopt_pending_model();
         let tools = self.request_tools();
         let response = match stream_with_retry(
             &*self.provider,
@@ -902,6 +969,7 @@ mod tests {
     ) -> (Agent<'_>, flume::Receiver<Envelope>) {
         let agent = Agent::new(
             AgentParams {
+                model_source: None,
                 agent_id: AgentId::generate(),
                 provider: Arc::new(provider),
                 model: default_model(),

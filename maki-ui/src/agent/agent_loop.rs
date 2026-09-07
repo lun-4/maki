@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
+use maki_agent::ModelSource;
 use maki_agent::actor::{ActorBackend, BackendResult, ControlWork, TurnContext, WorkKind};
 use maki_agent::mcp::config::McpServerStatus;
 use maki_agent::mcp::{McpHandle, McpSession};
@@ -326,6 +327,9 @@ impl TuiActorBackend {
                 agent_id: self.agent_id,
                 provider: Arc::clone(&slot.provider) as Arc<dyn maki_providers::provider::Provider>,
                 model: slot.model.clone(),
+                // The session's slot, so a model changed while this run is in
+                // flight is picked up at the next request.
+                model_source: Some(Arc::clone(&self.model_slot) as Arc<dyn ModelSource>),
                 config: self.config.clone(),
                 tool_output_lines: self.tool_output_lines,
                 permissions: Arc::clone(&self.permissions),

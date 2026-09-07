@@ -235,6 +235,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
             let mut history = History::new(Vec::new());
             let mut agent = Agent::new(
                 AgentParams {
+                    model_source: None,
                     agent_id: AgentId::generate(),
                     provider,
                     model,
@@ -438,6 +439,10 @@ pub struct InteractiveHandle {
     pub cancel_tx: flume::Sender<()>,
     pub model_tx: flume::Sender<Model>,
     pub control_tx: flume::Sender<InteractiveControl>,
+    /// Install a model here to change it. Adoption is a store, so it lands on
+    /// the run's next request rather than waiting for the turn to end, and it
+    /// never blocks a caller behind a running turn.
+    pub model: crate::SharedModel,
     pub session_id: SessionRef,
     pub mailbox: SessionMailbox,
     pub permissions: Arc<PermissionManager>,
@@ -476,6 +481,10 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     };
     let mailbox = SessionMailbox::new(session_id);
     let handle_mailbox = mailbox.clone();
+    // Seeded by the task once its provider exists; until then it reports no
+    // change, which is what an unstarted session should say.
+    let shared_model = crate::SharedModel::default();
+    let handle_model = shared_model.clone();
 
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let permissions = Arc::new(PermissionManager::new(
@@ -509,6 +518,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         return;
                     }
                 };
+            shared_model.install(Arc::clone(&provider), model.clone());
 
             let mut history = History::restored(params.initial_history);
             let mut working_dir = PathBuf::from(working_dir);
@@ -544,6 +554,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                                 Ok(adopted) => {
                                     provider = Arc::from(adopted);
                                     model = candidate;
+                                    shared_model.install(Arc::clone(&provider), model.clone());
                                     Ok(())
                                 }
                                 Err(error) => Err(error.user_message()),
@@ -771,11 +782,21 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
 
                 while answer_rx.lock().await.try_recv().is_ok() {}
 
+                // The run picks the model up per request from the shared
+                // source, so a change part-way through a turn takes effect at
+                // the next inference instead of the next turn.
+                let (turn_provider, turn_model) = {
+                    use crate::ModelSource;
+                    shared_model
+                        .current()
+                        .unwrap_or_else(|| (Arc::clone(&provider), model.clone()))
+                };
                 let mut agent = Agent::new(
                     AgentParams {
+                        model_source: Some(Arc::new(shared_model.clone())),
                         agent_id,
-                        provider: Arc::clone(&provider),
-                        model: model.clone(),
+                        provider: turn_provider,
+                        model: turn_model,
                         config: params.config.clone(),
                         tool_output_lines: ToolOutputLines::default(),
                         permissions: Arc::clone(&permissions),
@@ -849,6 +870,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         cancel_tx,
         model_tx,
         control_tx,
+        model: handle_model,
         session_id: session_ref,
         mailbox: handle_mailbox,
         permissions,

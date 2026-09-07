@@ -376,6 +376,7 @@ pub fn run(
                 | AgentEvent::ToolOutput { .. }
                 | AgentEvent::ToolDone(_)
                 | AgentEvent::QueueItemConsumed { .. }
+                | AgentEvent::ModelSwitched { .. }
                 | AgentEvent::QueueDrained
                 | AgentEvent::AutoCompacting
                 | AgentEvent::CompactionDone

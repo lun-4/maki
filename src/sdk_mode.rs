@@ -776,23 +776,20 @@ pub fn run(params: SdkParams) -> Result<()> {
             cwd: cwd.clone(),
             model_policy: Arc::clone(&model_policy),
             model_adopter: Arc::new({
-                let control_tx = handle.control_tx.clone();
-                move |model: Model| {
-                    let control_tx = control_tx.clone();
+                // A store, not a round-trip to the session loop: the loop only
+                // reads its control channel between turns, so asking it to
+                // adopt would wait for the running turn, and that turn cannot
+                // finish while the coordinator is blocked here.
+                let shared = handle.model.clone();
+                move |mut model: Model| {
+                    let shared = shared.clone();
                     Box::pin(async move {
-                        let (reply, response) = flume::bounded(1);
-                        control_tx
-                            .send_async(maki_agent::headless::InteractiveControl::AdoptModel {
-                                model,
-                                reply,
-                            })
-                            .await
-                            .map_err(|_| Arc::from("session ended before model adoption"))?;
-                        response
-                            .recv_async()
-                            .await
-                            .map_err(|_| Arc::from("session ended during model adoption"))?
-                            .map_err(Arc::from)
+                        let provider =
+                            maki_providers::provider::from_model_async(&mut model, timeouts)
+                                .await
+                                .map_err(|error| Arc::from(error.user_message()))?;
+                        shared.install(Arc::from(provider), model);
+                        Ok(())
                     }) as maki_agent::session_coordinator::ModelAdoptionFuture
                 }
             }),
@@ -1564,6 +1561,7 @@ impl EventPump {
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
             | AgentEvent::QueueItemConsumed { .. }
+            | AgentEvent::ModelSwitched { .. }
             | AgentEvent::QueueDrained
             | AgentEvent::AutoCompacting
             | AgentEvent::CompactionDone
