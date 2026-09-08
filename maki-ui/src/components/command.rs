@@ -247,6 +247,12 @@ impl CommandPalette {
                 || self.completion_session.is_some())
     }
 
+    pub(crate) fn selected_command(&self) -> Option<ResolvedCommand> {
+        self.filtered
+            .get(self.command_selected)
+            .map(|item| item.command.clone())
+    }
+
     #[cfg(test)]
     pub(crate) fn argument_generation(&self) -> u64 {
         self.argument_generation

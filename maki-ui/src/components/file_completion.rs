@@ -106,6 +106,12 @@ impl CompletionItem {
         Self::path(path, true)
     }
 
+    fn raw_directory(path: String) -> Self {
+        let mut item = Self::path(path, true);
+        item.insertion = item.label.clone();
+        item
+    }
+
     fn path(mut path: String, directory: bool) -> Self {
         if directory && !path.ends_with(['/', '\\']) {
             path.push(DIRECTORY_SUFFIX);
@@ -188,6 +194,19 @@ struct QueryIntent {
     has_colon: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionMode {
+    Reference,
+    Directory,
+}
+
+impl CompletionMode {
+    fn uses_explicit_discovery(self, query: &str) -> bool {
+        query.starts_with(['~', '/', '.'])
+            || (self == Self::Directory && query.contains(['/', '\\']))
+    }
+}
+
 #[derive(Debug)]
 pub enum CompletionAction {
     Consumed,
@@ -239,6 +258,7 @@ struct Session {
     visible: bool,
 
     token_byte_range: (usize, usize),
+    mode: CompletionMode,
 }
 
 impl Drop for Session {
@@ -409,9 +429,27 @@ impl FileCompletionMenu {
         query: &str,
         token_byte_range: (usize, usize),
     ) {
+        self.open_with_mode(
+            cwd,
+            items,
+            query,
+            token_byte_range,
+            CompletionMode::Reference,
+        );
+    }
+
+    pub fn open_with_mode(
+        &mut self,
+        cwd: &str,
+        items: Vec<ItemSpec>,
+        query: &str,
+        token_byte_range: (usize, usize),
+        mode: CompletionMode,
+    ) {
         self.close();
         let root = PathBuf::from(cwd);
-        let (discovery, walking) = if query.starts_with(['~', '/', '.']) {
+        let explicit = mode.uses_explicit_discovery(query);
+        let (discovery, walking) = if explicit {
             (
                 Discovery::Explicit {
                     candidates: explicit_candidates(
@@ -437,18 +475,22 @@ impl FileCompletionMenu {
             )
         };
 
-        let ref_items = items
-            .into_iter()
-            .map(|spec| {
-                let item = CompletionItem {
-                    label: spec.label,
-                    kind: spec.kind,
-                    insertion: spec.insertion,
-                    description: spec.description,
-                };
-                (item.label.clone(), item)
-            })
-            .collect();
+        let ref_items = if mode == CompletionMode::Reference {
+            items
+                .into_iter()
+                .map(|spec| {
+                    let item = CompletionItem {
+                        label: spec.label,
+                        kind: spec.kind,
+                        insertion: spec.insertion,
+                        description: spec.description,
+                    };
+                    (item.label.clone(), item)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let session = Session {
             discovery,
@@ -477,6 +519,7 @@ impl FileCompletionMenu {
             matching: false,
             visible: false,
             token_byte_range,
+            mode,
         };
         self.session = Some(session);
         self.sync_query(query);
@@ -505,6 +548,16 @@ impl FileCompletionMenu {
             .unwrap_or_default()
     }
 
+    pub fn mode(&self) -> Option<CompletionMode> {
+        self.session.as_ref().map(|session| session.mode)
+    }
+
+    pub fn needs_reopen(&self, cwd: &str, mode: CompletionMode) -> bool {
+        self.session
+            .as_ref()
+            .is_none_or(|session| session.mode != mode || session.root.as_os_str() != cwd)
+    }
+
     pub fn token_byte_range(&self) -> (usize, usize) {
         self.session.as_ref().map_or((0, 0), |s| s.token_byte_range)
     }
@@ -519,7 +572,16 @@ impl FileCompletionMenu {
         let Some(session) = &mut self.session else {
             return;
         };
-        let explicit = query.starts_with(['~', '/', '.']);
+        let explicit = session.mode.uses_explicit_discovery(query);
+        session.intent = if session.mode == CompletionMode::Directory {
+            QueryIntent {
+                payload: query.to_string(),
+                kind: None,
+                has_colon: false,
+            }
+        } else {
+            parse_query(query)
+        };
         let was_explicit = matches!(session.discovery, Discovery::Explicit { .. });
         if explicit {
             if let Discovery::Project { cancel, .. } = &session.discovery {
@@ -555,9 +617,14 @@ impl FileCompletionMenu {
                 session.file_matches.clear();
             }
             if let Discovery::Project { nucleo, .. } = &mut session.discovery {
+                let pattern = if session.mode == CompletionMode::Directory {
+                    query
+                } else {
+                    &query.to_lowercase()
+                };
                 nucleo.pattern.reparse(
                     0,
-                    &query.to_lowercase(),
+                    pattern,
                     CaseMatching::Smart,
                     Normalization::Smart,
                     false,
@@ -568,7 +635,7 @@ impl FileCompletionMenu {
                 session.query_refresh_pending = matches!(&session.discovery, Discovery::Project { nucleo, .. } if nucleo.injector().injected_items() > 0);
             }
             session.ref_matches = fuzzy_match(
-                &parse_query(query),
+                &session.intent,
                 session
                     .ref_items
                     .iter()
@@ -577,7 +644,6 @@ impl FileCompletionMenu {
                     .map(|(order, (label, item))| (label, item, order)),
             );
         }
-        session.intent = parse_query(query);
         session.query = query.to_string();
         session.selected = 0;
         session.scroll_offset = 0;
@@ -603,13 +669,24 @@ impl FileCompletionMenu {
             KeyCode::Esc => return CompletionAction::Close,
             KeyCode::Enter | KeyCode::Tab => {
                 if !s.visible || s.query_refresh_pending {
-                    return CompletionAction::Passthrough;
+                    return if s.mode == CompletionMode::Directory && key.code == KeyCode::Tab {
+                        CompletionAction::Consumed
+                    } else {
+                        CompletionAction::Passthrough
+                    };
                 }
                 return match s.matches.get(s.selected) {
-                    Some(candidate) if candidate.descendable => {
+                    Some(candidate)
+                        if candidate.descendable
+                            && (s.mode == CompletionMode::Reference
+                                || key.code == KeyCode::Tab) =>
+                    {
                         CompletionAction::Advance(candidate.item.clone())
                     }
                     Some(candidate) => CompletionAction::Select(candidate.item.clone()),
+                    None if s.mode == CompletionMode::Directory && key.code == KeyCode::Tab => {
+                        CompletionAction::Consumed
+                    }
                     None => CompletionAction::Passthrough,
                 };
             }
@@ -877,20 +954,42 @@ fn refresh_file_matches(s: &mut Session) {
         return;
     };
     let snapshot = nucleo.snapshot();
-    let coarse_match_count = snapshot.matched_item_count();
-    let materialized_count = coarse_match_count.min(MAX_MATERIALIZED);
-    let mut paths: Vec<String> = snapshot
-        .matched_items(0..materialized_count)
-        .map(|item| item.matcher_columns[0].to_string())
-        .collect();
+    let mut paths = Vec::new();
+    let mut coarse_match_count = 0;
+    let scan_count = if s.mode == CompletionMode::Reference {
+        snapshot.matched_item_count().min(MAX_MATERIALIZED)
+    } else {
+        snapshot.matched_item_count()
+    };
+    for item in snapshot.matched_items(0..scan_count) {
+        let path = item.matcher_columns[0].slice(..);
+        if s.mode == CompletionMode::Directory
+            && (path.len() <= 1 || !matches!(path.chars().next_back(), Some('/' | '\\')))
+        {
+            continue;
+        }
+        coarse_match_count += 1;
+        if paths.len() < MAX_MATERIALIZED as usize {
+            paths.push(path.to_string());
+        }
+    }
+    if s.mode == CompletionMode::Reference {
+        coarse_match_count = snapshot.matched_item_count();
+    }
+    let materialized_count = paths.len() as u32;
     paths.sort();
     s.coarse_match_count = coarse_match_count;
     s.materialized_count = materialized_count;
     s.truncated = coarse_match_count > materialized_count;
     s.file_matches.clear();
     for (order, path) in paths.into_iter().enumerate() {
-        let item = CompletionItem::file(path);
-        if let Some(candidate) = match_candidate(item, &s.intent, 0, order, false) {
+        let directory = s.mode == CompletionMode::Directory && path.ends_with(['/', '\\']);
+        let item = if directory {
+            CompletionItem::raw_directory(path)
+        } else {
+            CompletionItem::file(path)
+        };
+        if let Some(candidate) = match_candidate(item, &s.intent, 0, order, directory) {
             s.file_matches.push(candidate);
         }
     }
@@ -902,11 +1001,16 @@ fn refresh_explicit_matches(s: &mut Session) {
         return;
     };
     let mut paths = candidates.clone();
+    paths.retain(|candidate| s.mode == CompletionMode::Reference || candidate.is_directory);
     paths.sort_by(|a, b| a.path.cmp(&b.path));
     s.file_matches.clear();
     for (order, candidate) in paths.into_iter().enumerate() {
         let item = if candidate.is_directory {
-            CompletionItem::directory(candidate.path)
+            if s.mode == CompletionMode::Directory {
+                CompletionItem::raw_directory(candidate.path)
+            } else {
+                CompletionItem::directory(candidate.path)
+            }
         } else {
             CompletionItem::file(candidate.path)
         };
@@ -1182,6 +1286,7 @@ mod tests {
             matching: false,
             visible: false,
             token_byte_range: (0, 0),
+            mode: CompletionMode::Reference,
         });
         menu
     }
@@ -1411,6 +1516,76 @@ mod tests {
         assert!(candidates[0].is_directory);
     }
 
+    #[test_case(".", "/workspace/project/.", "./archive"; "current_directory")]
+    #[test_case("./ar", "/workspace/project", "./archive"; "current_prefix")]
+    #[test_case("..", "/workspace/project/..", "../archive"; "parent_directory")]
+    #[test_case("../ar", "/workspace/project/..", "../archive"; "parent_prefix")]
+    #[test_case("/outside/", "/outside", "/outside/archive"; "absolute_directory")]
+    #[test_case("/outside/ar", "/outside", "/outside/archive"; "absolute_prefix")]
+    #[test_case("~", "/home/tester", "~/archive"; "home_directory")]
+    #[test_case("~/ar", "/home/tester", "~/archive"; "home_prefix")]
+    #[test_case("nested/", "/workspace/project/nested", "nested/archive"; "relative_directory")]
+    #[test_case("nested/ar", "/workspace/project/nested", "nested/archive"; "relative_prefix")]
+    fn directory_explicit_paths_use_resolver_on_open_and_sync(
+        query: &str,
+        parent: &str,
+        expected: &str,
+    ) {
+        let resolver = Arc::new(CountingResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries: vec![
+                FileCandidate {
+                    path: "archive.txt".into(),
+                    is_directory: false,
+                },
+                FileCandidate {
+                    path: "archive".into(),
+                    is_directory: true,
+                },
+            ],
+        });
+        let mut menu = FileCompletionMenu::with_dependencies(
+            resolver.clone(),
+            Arc::new(|_| Some(test_walker())),
+            Some(PathBuf::from("/home/tester")),
+        );
+        menu.open_with_mode(
+            "/workspace/project",
+            vec![item(query, "skill", "@skill:plugin")],
+            query,
+            (0, query.len()),
+            CompletionMode::Directory,
+        );
+        let expected = format!("{expected}{DIRECTORY_SUFFIX}");
+        assert_eq!(labels(&menu), vec![expected.clone()]);
+        assert!(
+            resolver
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|path| path == Path::new(parent))
+        );
+        menu.sync_query("project");
+        resolver.reads.lock().unwrap().clear();
+        menu.sync_query(query);
+        assert_eq!(
+            resolver.reads.lock().unwrap().as_slice(),
+            &[PathBuf::from(parent)]
+        );
+        assert_eq!(labels(&menu), vec![expected.clone()]);
+        let session = menu.session.as_ref().unwrap();
+        assert!(matches!(session.discovery, Discovery::Explicit { .. }));
+        assert_eq!(session.coarse_match_count, 1);
+        assert_eq!(session.materialized_count, 1);
+        assert_eq!(session.final_match_count, 1);
+        assert!(!session.truncated);
+        assert!(matches!(
+            menu.handle_key(key(KeyCode::Tab)),
+            CompletionAction::Advance(item) if item.insertion == expected
+        ));
+    }
+
     #[test]
     fn home_discovery_preserves_tilde_namespace() {
         let cwd = PathBuf::from("/workspace/project");
@@ -1440,6 +1615,21 @@ mod tests {
         std::os::unix::fs::symlink(tmp.join("missing_target"), tmp.join("dangling")).unwrap();
 
         let candidates = discover_one_level(&tmp).unwrap();
+        let mut menu = FileCompletionMenu::with_resolver(Arc::new(RealFileResolver), None);
+        menu.open_with_mode(
+            tmp.to_str().unwrap(),
+            Vec::new(),
+            "./",
+            (0, 2),
+            CompletionMode::Directory,
+        );
+        assert_eq!(labels(&menu), vec!["./link_dir/", "./real_dir/"]);
+        assert!(matches!(
+            menu.handle_key(key(KeyCode::Tab)),
+            CompletionAction::Advance(item) if item.insertion == "./link_dir/"
+        ));
+        menu.sync_query("./link_dir/");
+        assert!(menu.match_items().is_empty());
 
         std::fs::remove_file(tmp.join("link_file")).unwrap();
         std::fs::remove_file(tmp.join("link_dir")).unwrap();
@@ -2310,6 +2500,168 @@ mod tests {
         assert_eq!(session.final_match_count, 0);
         assert!(!session.truncated);
         assert!(session.file_matches.is_empty());
+    }
+
+    #[test_case(CompletionMode::Directory; "directory_excludes_root_and_files")]
+    #[test_case(CompletionMode::Reference; "reference_preserves_root_and_files")]
+    fn project_root_filter_is_mode_specific(mode: CompletionMode) {
+        let mut menu = session_with_items(Vec::new());
+        let session = menu.session.as_mut().unwrap();
+        session.mode = mode;
+        session.walking = false;
+        let root = DIRECTORY_SUFFIX.to_string();
+        for path in [root.as_str(), "src/", "文档/", "file.rs"] {
+            project_nucleo_mut(session)
+                .injector()
+                .push((), |_, columns| columns[0] = Utf32String::from(path));
+        }
+        wait_for_matcher(
+            &mut menu,
+            |menu| menu.session.as_ref().unwrap().materialized_count > 0,
+            "root filter matcher did not settle",
+        );
+        let expected = if mode == CompletionMode::Directory {
+            vec!["src/", "文档/"]
+        } else {
+            vec![root.as_str(), "file.rs", "src/", "文档/"]
+        };
+        assert_eq!(labels(&menu), expected);
+        let session = menu.session.as_ref().unwrap();
+        assert_eq!(session.coarse_match_count, expected.len() as u32);
+        assert!(!session.truncated);
+    }
+
+    #[test_case(0; "files_and_root_do_not_count")]
+    #[test_case(2; "directories_after_file_cap_are_materialized")]
+    #[test_case(MAX_MATERIALIZED; "exact_directory_cap_is_not_truncated")]
+    #[test_case(MAX_MATERIALIZED + 1; "eligible_count_survives_truncation")]
+    fn directory_filter_precedes_materialization_cap(directory_count: u32) {
+        let mut menu = session_with_items(Vec::new());
+        let session = menu.session.as_mut().unwrap();
+        session.mode = CompletionMode::Directory;
+        session.walking = false;
+        let injector = project_nucleo_mut(session).injector();
+        injector.push((), |_, columns| {
+            columns[0] = Utf32String::from(DIRECTORY_SUFFIX.to_string());
+        });
+        for index in 0..=MAX_MATERIALIZED {
+            injector.push((), |_, columns| {
+                columns[0] = Utf32String::from(format!("file-{index:03}.rs"));
+            });
+        }
+        for index in 0..directory_count {
+            injector.push((), |_, columns| {
+                columns[0] = Utf32String::from(format!("dir-{index:03}{DIRECTORY_SUFFIX}"));
+            });
+        }
+        wait_for_matcher(
+            &mut menu,
+            |menu| {
+                let session = menu.session.as_ref().unwrap();
+                let Discovery::Project { nucleo, .. } = &session.discovery else {
+                    unreachable!();
+                };
+                nucleo.snapshot().matched_item_count() == MAX_MATERIALIZED + directory_count + 2
+            },
+            "directory cap matcher did not settle",
+        );
+        let session = menu.session.as_ref().unwrap();
+        let materialized = directory_count.min(MAX_MATERIALIZED);
+        assert_eq!(session.coarse_match_count, directory_count);
+        assert_eq!(session.materialized_count, materialized);
+        assert_eq!(session.final_match_count, materialized);
+        assert_eq!(session.truncated, directory_count > MAX_MATERIALIZED);
+        assert_eq!(
+            labels(&menu),
+            (0..materialized)
+                .map(|index| format!("dir-{index:03}{DIRECTORY_SUFFIX}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test_case("skill"; "bare_skill")]
+    #[test_case("skill:review"; "skill_prefix")]
+    #[test_case("model:fast"; "model_prefix")]
+    #[test_case("@notes"; "at_prefix")]
+    fn directory_queries_are_literal_and_exclude_lua_items(query: &str) {
+        let mut menu = FileCompletionMenu::with_dependencies(
+            Arc::new(RealFileResolver),
+            Arc::new(|_| Some(test_walker())),
+            None,
+        );
+        menu.open_with_mode(
+            "/project",
+            vec![item(query, "skill", "@skill:plugin")],
+            query,
+            (0, query.len()),
+            CompletionMode::Directory,
+        );
+        let session = menu.session.as_mut().unwrap();
+        session.walking = false;
+        let path = format!("{query}{DIRECTORY_SUFFIX}");
+        project_nucleo_mut(session)
+            .injector()
+            .push((), |_, columns| {
+                columns[0] = Utf32String::from(path.as_str())
+            });
+        wait_for_matcher(
+            &mut menu,
+            |menu| !menu.session.as_ref().unwrap().file_matches.is_empty(),
+            "literal directory matcher did not settle",
+        );
+        let session = menu.session.as_ref().unwrap();
+        assert!(session.ref_items.is_empty());
+        assert!(session.ref_matches.is_empty());
+        assert_eq!(labels(&menu), vec![path.clone()]);
+        assert!(matches!(
+            menu.handle_key(key(KeyCode::Enter)),
+            CompletionAction::Select(item) if item.insertion == path && item.kind == DIRECTORY_KIND
+        ));
+        assert!(matches!(
+            menu.handle_key(key(KeyCode::Tab)),
+            CompletionAction::Advance(item) if item.insertion == path
+        ));
+    }
+
+    #[test_case(KeyCode::Tab; "tab_does_not_advance_stale_directory")]
+    #[test_case(KeyCode::Enter; "enter_does_not_select_stale_directory")]
+    fn directory_query_refresh_blocks_stale_selection(code: KeyCode) {
+        let mut menu = session_with_items(Vec::new());
+        let session = menu.session.as_mut().unwrap();
+        session.mode = CompletionMode::Directory;
+        session.walking = false;
+        for path in ["alpha/", "beta/"] {
+            project_nucleo_mut(session)
+                .injector()
+                .push((), |_, columns| columns[0] = Utf32String::from(path));
+        }
+        wait_for_matcher(
+            &mut menu,
+            |menu| menu.session.as_ref().unwrap().file_matches.len() == 2,
+            "initial directory matcher did not settle",
+        );
+        menu.session.as_mut().unwrap().selected = 1;
+        menu.sync_query("alpha");
+        assert!(menu.session.as_ref().unwrap().query_refresh_pending);
+        assert_eq!(labels(&menu), vec!["alpha/", "beta/"]);
+        let action = menu.handle_key(key(code));
+        assert!(matches!(
+            (code, action),
+            (KeyCode::Tab, CompletionAction::Consumed)
+                | (KeyCode::Enter, CompletionAction::Passthrough)
+        ));
+        wait_for_matcher(
+            &mut menu,
+            |menu| !menu.session.as_ref().unwrap().query_refresh_pending,
+            "filtered directory matcher did not settle",
+        );
+        assert_eq!(menu.session.as_ref().unwrap().selected, 0);
+        assert_eq!(labels(&menu), vec!["alpha/"]);
+        let selected = match menu.handle_key(key(code)) {
+            CompletionAction::Select(item) | CompletionAction::Advance(item) => item,
+            action => panic!("unexpected completion action: {action:?}"),
+        };
+        assert_eq!(selected.insertion, "alpha/");
     }
 
     #[test]

@@ -25,7 +25,7 @@ The active registry combines built-ins, custom Markdown commands, MCP prompts, a
 | `/theme` | Switch color theme | <theme> | yes |
 | `/mcp` | Configure MCP servers |  | yes |
 | `/login` | Authenticate with an LLM provider |  | yes |
-| `/cd` | Change working directory | <path> | no |
+| `/cd` | Change working directory. Paths may contain spaces. | <path> | no |
 | `/btw` | Ask a quick question (no tools, no history pollution) | <question> | no |
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) |  | no |
 | `/fast` | Toggle Anthropic fast mode (Opus only) |  | no |

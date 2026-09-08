@@ -44,6 +44,7 @@ const HINT_STYLE: &str = "fg";
 const RETRY_MESSAGE: &str = "overloaded";
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const MISSING_DIR: &str = "gone";
+const CD_ERROR_PREFIX: &str = "cd:";
 const WALK_TIMEOUT: Duration = Duration::from_secs(5);
 const TEST_IMAGE_DATA: &str = "dGVzdA==";
 const LOCAL_COMMAND_ATTACHMENTS_ERROR: &str =
@@ -6559,6 +6560,406 @@ fn popup_closes_when_token_removed() {
     assert!(app.file_completion.is_active());
     app.update(Msg::Key(key(KeyCode::Backspace)));
     assert_eq!(app.input_box.buffer.value(), "");
+    assert!(!app.file_completion.is_active());
+}
+
+#[test]
+fn cd_completion_filters_directories_and_accepts_before_execution() {
+    let (tmp, mut app, _backend) = completion_app();
+    std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+    std::fs::write(tmp.path().join("alpha.txt"), b"file").unwrap();
+
+    for character in "/cd al".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    converge_completion(&mut app);
+    let items = app.file_completion.match_items();
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].label,
+        format!("alpha{}", std::path::MAIN_SEPARATOR)
+    );
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.input_box.buffer.value(), "/cd alpha/");
+    assert!(!app.file_completion.is_active());
+    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        app.state.session.cwd,
+        tmp.path().join("alpha").to_string_lossy()
+    );
+}
+
+#[test_case("release notes", "release" ; "spaces")]
+#[test_case("日本語 @release notes", "日本語 @rel" ; "unicode_spaces_and_at")]
+fn cd_completion_keeps_paths_raw(directory: &str, query: &str) {
+    let (tmp, mut app, backend) = completion_app();
+    seed_skill(&backend, "release");
+    let path = tmp.path().join(directory);
+    std::fs::create_dir(&path).unwrap();
+
+    app.update(Msg::Paste(format!("/cd {query}")));
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.input_box.buffer.value(), format!("/cd {directory}/"));
+    assert!(!app.file_completion.is_active());
+    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.state.session.cwd, path.to_string_lossy());
+}
+
+#[test]
+fn cd_completion_tab_descends_and_renders_instead_of_slash_rows() {
+    let (tmp, mut app, _backend) = completion_app();
+    std::fs::create_dir_all(tmp.path().join("alpha/bravo/charlie")).unwrap();
+    std::fs::write(tmp.path().join("alpha.txt"), b"file").unwrap();
+    for character in "/cd al".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    converge_completion(&mut app);
+    let screen = rendered(&mut app);
+    assert!(screen.contains("alpha/"));
+    assert!(!screen.contains("alpha.txt"));
+    assert_eq!(screen.matches("/cd").count(), 1);
+
+    for (input, child) in [("/cd alpha/", "bravo/"), ("/cd alpha/bravo/", "charlie/")] {
+        app.update(Msg::Key(key(KeyCode::Tab)));
+        assert_eq!(app.input_box.buffer.value(), input);
+        assert!(app.file_completion.is_active());
+        assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+        converge_completion(&mut app);
+        let screen = rendered(&mut app);
+        assert!(screen.contains(child));
+        assert_eq!(screen.matches("/cd").count(), 1);
+    }
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.input_box.buffer.value(), "/cd alpha/bravo/charlie/");
+    assert!(!app.file_completion.is_active());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        app.state.session.cwd,
+        tmp.path().join("alpha/bravo/charlie").to_string_lossy()
+    );
+}
+
+#[test]
+fn cd_completion_escape_preserves_partial_for_execution() {
+    let (tmp, mut app, _backend) = completion_app();
+    std::fs::create_dir_all(tmp.path().join("alpha/child")).unwrap();
+    app.update(Msg::Paste("/cd ./alpha".into()));
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(!app.file_completion.is_active());
+    assert_eq!(app.input_box.buffer.value(), "/cd ./alpha");
+    let _ = app.tick();
+    assert!(!app.file_completion.is_active());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        app.state.session.cwd,
+        tmp.path().join("alpha").to_string_lossy()
+    );
+}
+
+#[test_case(KeyCode::Esc, "/cd ./alpha"; "dismissed")]
+#[test_case(KeyCode::Enter, "/cd ./alpha/"; "accepted")]
+fn cd_completion_closed_popup_preserves_argument_ownership(close: KeyCode, expected: &str) {
+    let (tmp, mut app, _backend) = completion_app();
+    std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+    app.update(Msg::Paste("/cd ./alpha".into()));
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(close)));
+    assert!(!app.file_completion.is_active());
+    assert_eq!(rendered(&mut app).matches("/cd").count(), 1);
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert_eq!(app.input_box.buffer.value(), expected);
+    assert!(!app.file_completion.is_active());
+    assert_eq!(rendered(&mut app).matches("/cd").count(), 1);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        app.state.session.cwd,
+        tmp.path().join("alpha").to_string_lossy()
+    );
+}
+
+#[test_case("./missing", false ; "no_match")]
+#[test_case("./empty/", true ; "empty_directory")]
+fn cd_completion_no_match_tab_preserves_input_enter_executes(query: &str, exists: bool) {
+    let (tmp, mut app, _backend) = completion_app();
+    std::fs::create_dir(tmp.path().join("empty")).unwrap();
+    let input = format!("/cd {query}");
+    app.update(Msg::Paste(input.clone()));
+    assert!(app.file_completion.is_active());
+    assert!(!app.file_completion.has_selectable());
+    let mode = app.state.mode.clone();
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert_eq!(app.input_box.buffer.value(), input);
+    assert_eq!(app.state.mode, mode);
+    assert!(app.file_completion.is_active());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(app.input_box.buffer.value().is_empty());
+    assert!(!app.file_completion.is_active());
+    let expected = if exists {
+        tmp.path().join("empty")
+    } else {
+        tmp.path().to_path_buf()
+    };
+    assert_eq!(app.state.session.cwd, expected.to_string_lossy());
+    if !exists {
+        assert!(
+            app.status_bar
+                .flash_text()
+                .unwrap()
+                .starts_with(CD_ERROR_PREFIX)
+        );
+    }
+}
+
+#[test_case(false ; "command_name_tab")]
+#[test_case(true ; "paste")]
+fn cd_completion_opens_after_command_name_tab_or_paste(paste: bool) {
+    let (tmp, mut app, _backend) = completion_app();
+    std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+    if paste {
+        app.update(Msg::Paste("/cd ".into()));
+    } else {
+        for character in "/cd".chars() {
+            app.update(Msg::Key(key(KeyCode::Char(character))));
+        }
+        assert!(!app.file_completion.is_active());
+        app.update(Msg::Key(key(KeyCode::Tab)));
+    }
+    assert_eq!(app.input_box.buffer.value(), "/cd ");
+    assert_eq!(app.file_completion.mode(), Some(CompletionMode::Directory));
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert_eq!(app.input_box.buffer.value(), "/cd alpha/");
+}
+
+#[test]
+fn cd_completion_does_not_hijack_plugin_override() {
+    let (tmp, mut app, _backend) = completion_app();
+    std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    let _producer = register_test_lua_command(
+        &app.command_runtime.registry,
+        TestLuaCommand {
+            handle,
+            name: Arc::from("/cd"),
+            plugin: Arc::from("test"),
+            max_args: None,
+            completion: false,
+        },
+    );
+    app.update(Msg::Paste("/cd al".into()));
+    assert!(!app.file_completion.is_active());
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(actions.is_empty(), "{LUA_COMMAND_NOT_SENT}");
+    assert!(probe.try_recv().is_some(), "{LUA_COMMAND_RAN}");
+    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+}
+
+#[test]
+fn cd_completion_switches_back_to_reference_sources() {
+    let (tmp, mut app, backend) = completion_app();
+    std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+    seed_skill(&backend, "review");
+    app.update(Msg::Paste("/cd ./al".into()));
+    converge_completion(&mut app);
+    app.input_box.set_input(String::new());
+    app.update(Msg::Paste("@skill:rev".into()));
+    assert_eq!(app.file_completion.mode(), Some(CompletionMode::Reference));
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.input_box.buffer.value(), "@skill:review");
+    assert!(!app.file_completion.is_active());
+}
+
+#[test_case("/cd ./al", CompletionMode::Directory, false ; "active_directory")]
+#[test_case("/cd ./al", CompletionMode::Directory, true ; "dismissed_directory")]
+#[test_case("@./al", CompletionMode::Reference, false ; "active_reference")]
+#[test_case("@./al", CompletionMode::Reference, true ; "dismissed_reference")]
+fn cd_completion_cwd_change_refreshes_only_active_popup(
+    input: &str,
+    mode: CompletionMode,
+    dismissed: bool,
+) {
+    let (tmp, mut app, _backend) = completion_app();
+    let next = TempDir::new().unwrap();
+    std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+    std::fs::create_dir(next.path().join("alpine")).unwrap();
+    app.update(Msg::Paste(input.into()));
+    converge_completion(&mut app);
+    assert_eq!(app.file_completion.match_items()[0].label, "./alpha/");
+    if dismissed {
+        app.update(Msg::Key(key(KeyCode::Esc)));
+    }
+    app.change_directory(next.path().to_path_buf());
+    assert_eq!(app.state.session.cwd, next.path().to_string_lossy());
+    assert_eq!(app.file_completion.is_active(), !dismissed);
+    assert_eq!(app.input_box.buffer.value(), input);
+    if !dismissed {
+        assert!(
+            !app.file_completion
+                .needs_reopen(&app.state.session.cwd, mode)
+        );
+        assert_eq!(app.file_completion.match_items()[0].label, "./alpine/");
+    }
+    let _ = app.tick();
+    assert_eq!(app.file_completion.is_active(), !dismissed);
+}
+
+#[test]
+fn cd_completion_ctrl_a_enter_executes_original_partial() {
+    let (tmp, mut app, _backend) = completion_app();
+    std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+    app.update(Msg::Paste("/cd ./al".into()));
+    converge_completion(&mut app);
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('a'),
+        KeyModifiers::CONTROL,
+    )));
+    assert_eq!(app.input_box.buffer.x(), 0);
+    assert!(!app.file_completion.is_active());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(app.input_box.buffer.value().is_empty());
+    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+    assert!(
+        app.status_bar
+            .flash_text()
+            .unwrap()
+            .starts_with(CD_ERROR_PREFIX)
+    );
+}
+
+#[test]
+fn cd_completion_click_command_name_closes_popup_before_enter() {
+    let (tmp, mut app, _backend) = completion_app();
+    std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+    app.update(Msg::Paste("/cd ./al".into()));
+    converge_completion(&mut app);
+    let rows = rendered_rows(&mut app, 80, 24);
+    let area = app.zones.find(SelectionZone::Input).unwrap().area;
+    let row = area.y;
+    let column = rows[usize::from(row)]
+        .chars()
+        .collect::<Vec<_>>()
+        .windows("/cd".len())
+        .position(|window| window == ['/', 'c', 'd'])
+        .unwrap() as u16;
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        app.update(mouse_event(kind, column, row));
+    }
+    assert_eq!(app.input_box.buffer.cursor_byte_offset(), 0);
+    assert_eq!(app.input_box.buffer.value(), "/cd ./al");
+    assert!(!app.file_completion.is_active());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(app.input_box.buffer.value().is_empty());
+    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+    assert!(
+        app.status_bar
+            .flash_text()
+            .unwrap()
+            .starts_with(CD_ERROR_PREFIX)
+    );
+}
+
+#[test]
+fn cd_completion_ctrl_left_requeries_before_accepting() {
+    let (tmp, mut app, _backend) = completion_app();
+    for directory in ["release apple", "release notes"] {
+        std::fs::create_dir(tmp.path().join(directory)).unwrap();
+    }
+    app.update(Msg::Paste("/cd ./release no".into()));
+    converge_completion(&mut app);
+    assert_eq!(
+        app.file_completion.match_items()[0].label,
+        "./release notes/"
+    );
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Left,
+        KeyModifiers::CONTROL,
+    )));
+    assert_eq!(
+        app.input_box.buffer.cursor_byte_offset(),
+        "/cd ./release ".len()
+    );
+    assert_eq!(app.file_completion.match_items().len(), 2);
+    assert_eq!(
+        app.file_completion.match_items()[0].label,
+        "./release apple/"
+    );
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.input_box.buffer.value(), "/cd ./release apple/");
+    assert_eq!(app.state.session.cwd, tmp.path().to_string_lossy());
+}
+
+#[test_case("/cd ", 4, Some(("", (4, 4))) ; "empty_argument")]
+#[test_case("/cd \t ", 4, Some(("", (6, 6))) ; "only_whitespace")]
+#[test_case("/cd   alpha", 4, Some(("", (6, 11))) ; "cursor_in_prefix_whitespace")]
+#[test_case("/cd alpha", 4, Some(("", (4, 9))) ; "argument_start")]
+#[test_case("/cd alpha", 6, Some(("al", (4, 9))) ; "argument_middle")]
+#[test_case("/cd alpha", 9, Some(("alpha", (4, 9))) ; "argument_end")]
+#[test_case("/cd alpha \t", 11, Some(("alpha", (4, 9))) ; "cursor_after_trimmed_suffix")]
+#[test_case("/cd release notes", 12, Some(("release ", (4, 17))) ; "internal_space")]
+#[test_case("/cd @release notes", 18, Some(("@release notes", (4, 18))) ; "literal_at")]
+#[test_case("/cd 日本語 @notes \t", 10, Some(("日本", (4, 20))) ; "unicode_byte_cursor")]
+#[test_case("/cd\u{2003}日本 \u{2003}", 12, Some(("日本", (6, 12))) ; "unicode_separator_and_suffix")]
+#[test_case("", 0, None ; "empty_line")]
+#[test_case("/cd", 3, None ; "missing_separator")]
+#[test_case("/cdir alpha", 11, None ; "different_command")]
+#[test_case("/CD alpha", 9, None ; "case_sensitive_command")]
+#[test_case(" /cd alpha", 10, None ; "leading_space")]
+#[test_case("/cd alpha", 3, None ; "cursor_before_argument")]
+#[test_case("/cd alpha", 10, None ; "cursor_past_line")]
+#[test_case("/cd 日本", 5, None ; "cursor_inside_unicode_argument")]
+#[test_case("/cd\u{2003}alpha", 4, None ; "cursor_inside_unicode_separator")]
+fn cd_completion_argument_range(
+    line: &str,
+    cursor: usize,
+    expected: Option<(&str, (usize, usize))>,
+) {
+    assert_eq!(
+        directory_argument_range(line, cursor),
+        expected.map(|(query, range)| (query.to_owned(), range))
+    );
+}
+
+#[test_case("/cd ", "  " ; "trailing_spaces")]
+#[test_case("/cd \t ", " \t\nkeep @skill:review" ; "whitespace_and_following_line")]
+fn cd_completion_preserves_text_outside_path(prefix: &str, remainder: &str) {
+    let (tmp, mut app, _backend) = completion_app();
+    std::fs::create_dir(tmp.path().join("日本語 notes")).unwrap();
+    let partial = format!("{prefix}./日本");
+    let input = format!("{partial}{remainder}");
+    app.input_box.set_input(input.clone());
+    app.input_box.buffer.set_cursor_byte_offset(partial.len());
+    app.command_palette.sync(&input);
+    app.sync_file_completion();
+    converge_completion(&mut app);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        app.input_box.buffer.value(),
+        format!("{prefix}./日本語 notes/{remainder}")
+    );
+    assert!(!app.file_completion.is_active());
+}
+
+#[test_case(KeyCode::Enter, KeyModifiers::SHIFT ; "shift_enter")]
+#[test_case(KeyCode::Char('j'), KeyModifiers::CONTROL ; "ctrl_j")]
+fn cd_completion_newline_closes_popup_at_new_cursor(code: KeyCode, modifiers: KeyModifiers) {
+    let (tmp, mut app, _backend) = completion_app();
+    std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+    app.update(Msg::Paste("/cd ./al".into()));
+    converge_completion(&mut app);
+    app.update(Msg::Key(KeyEvent::new(code, modifiers)));
+    assert_eq!(app.input_box.buffer.value(), "/cd ./al\n");
+    assert_eq!(app.input_box.buffer.y(), 1);
     assert!(!app.file_completion.is_active());
 }
 

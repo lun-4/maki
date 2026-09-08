@@ -101,6 +101,11 @@ impl CommandRuntime {
         )
     }
 
+    pub(crate) fn is_builtin_cd(&self, command: &ResolvedCommand) -> bool {
+        command.producer_id() == self._standard_commands.builtin_producer().id()
+            && command.spec().name.as_ref() == "/cd"
+    }
+
     pub(crate) fn bind_target(&self) -> TargetHandle {
         let host = Arc::new(UiCommandHost {
             target: std::sync::OnceLock::new(),

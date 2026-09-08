@@ -34,7 +34,8 @@ use crate::components::btw_modal::BtwModal;
 use crate::components::command::ParsedCommand;
 use crate::components::command::{CommandAction, CommandPalette, ConfirmedCommand};
 use crate::components::file_completion::{
-    CompletionAction, CompletionItem, FileCompletionMenu, at_token_query, at_token_range,
+    CompletionAction, CompletionItem, CompletionMode, FileCompletionMenu, at_token_query,
+    at_token_range,
 };
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
@@ -59,6 +60,7 @@ use crate::components::{
 use crate::image;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
+use crate::text_buffer::is_newline_key;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use maki_agent::permissions::PermissionManager;
@@ -1239,18 +1241,37 @@ impl App {
                 return self.run_builtin(BuiltinAction::FilePicker);
             } else if key.code == KeyCode::Char('v') && self.image_paste_rx.is_empty() {
                 self.start_image_paste();
-            } else if let InputAction::PaletteSync(val) = self.input_box.handle_key(key) {
-                self.command_palette.sync(&val);
-                self.sync_command_arguments(&val, self.input_box.buffer.cursor_byte_offset());
-                self.sync_file_completion();
+            } else {
+                let action = self.input_box.handle_key(key);
+                return self.handle_input_action(action);
             }
             return vec![];
         }
 
-        match self
-            .command_palette
-            .handle_key(key, &self.input_box.buffer.value())
+        if self.status == Status::Streaming {
+            self.file_completion.close();
+        }
+        let directory_argument = self.directory_completion_context().is_some();
+        if is_newline_key(&key) && directory_argument {
+            let action = self.input_box.handle_key(key);
+            return self.handle_input_action(action);
+        }
+        if self.file_completion.mode() == Some(CompletionMode::Directory)
+            && self.handle_completion_key(key)
         {
+            return vec![];
+        }
+
+        if directory_argument && key.code == KeyCode::Tab {
+            return vec![];
+        }
+        let command_action = if directory_argument && key.code != KeyCode::Enter {
+            CommandAction::Passthrough
+        } else {
+            self.command_palette
+                .handle_key(key, &self.input_box.buffer.value())
+        };
+        match command_action {
             CommandAction::Consumed => {
                 if key.code == KeyCode::Esc {
                     self.sync_file_completion();
@@ -1293,6 +1314,7 @@ impl App {
                 self.refresh_at_ref_labels(&text);
                 self.input_box.set_input(text.clone());
                 self.input_box.buffer.set_cursor_byte_offset(cursor);
+                self.sync_file_completion();
                 return vec![];
             }
             CommandAction::Complete { text, cursor } => {
@@ -1301,32 +1323,36 @@ impl App {
                 self.input_box.set_input(text.clone());
                 self.input_box.buffer.set_cursor_byte_offset(cursor);
                 self.sync_command_arguments(&text, cursor);
+                self.sync_file_completion();
                 return vec![];
             }
             CommandAction::Passthrough => {}
         }
 
-        if self.file_completion.is_active() {
-            match self.file_completion.handle_key(key) {
-                CompletionAction::Consumed => return vec![],
-                CompletionAction::Close => {
-                    self.file_completion.close();
-                    return vec![];
-                }
-                CompletionAction::Select(item) => {
-                    self.insert_completion(item);
-                    return vec![];
-                }
-                CompletionAction::Advance(item) => {
-                    self.advance_completion(item);
-                    return vec![];
-                }
-                CompletionAction::Passthrough => {}
-            }
+        if self.file_completion.mode() == Some(CompletionMode::Reference)
+            && self.handle_completion_key(key)
+        {
+            return vec![];
         }
 
+        let action = self.input_box.handle_key(key);
+        self.handle_input_action(action)
+    }
+
+    fn handle_completion_key(&mut self, key: KeyEvent) -> bool {
+        match self.file_completion.handle_key(key) {
+            CompletionAction::Consumed => {}
+            CompletionAction::Close => self.file_completion.close(),
+            CompletionAction::Select(item) => self.insert_completion(item),
+            CompletionAction::Advance(item) => self.advance_completion(item),
+            CompletionAction::Passthrough => return false,
+        }
+        true
+    }
+
+    fn handle_input_action(&mut self, action: InputAction) -> Vec<Action> {
         let streaming = self.status == Status::Streaming;
-        match self.input_box.handle_key(key) {
+        match action {
             InputAction::Submit(sub) => {
                 self.file_completion.close();
                 self.handle_submit(sub)
@@ -1337,13 +1363,9 @@ impl App {
                 self.sync_file_completion();
                 vec![]
             }
-            InputAction::CursorMoved => {
+            InputAction::CursorMoved | InputAction::ContinueLine => {
                 let val = self.input_box.buffer.value();
-                self.command_palette.sync_arguments(
-                    &val,
-                    self.input_box.buffer.cursor_byte_offset(),
-                    &self.state.mode.id_key(),
-                );
+                self.sync_command_arguments(&val, self.input_box.buffer.cursor_byte_offset());
                 self.sync_file_completion();
                 vec![]
             }
@@ -1386,7 +1408,7 @@ impl App {
                     _ => vec![],
                 }
             }
-            InputAction::ContinueLine | InputAction::None => vec![],
+            InputAction::None => vec![],
         }
     }
 
@@ -1428,52 +1450,89 @@ impl App {
         self.store_at_ref_labels(&items);
     }
 
-    /// Opens, refreshes, or closes the `@` completion popup to match the token
-    /// under the input cursor. Suppressed while the command palette or an
-    /// overlay owns the screen.
+    fn directory_completion_context(&self) -> Option<(String, (usize, usize))> {
+        if self.input_box.buffer.y() != 0 {
+            return None;
+        }
+        let command = self.command_palette.selected_command()?;
+        if !self.command_runtime.is_builtin_cd(&command) {
+            return None;
+        }
+        directory_argument_range(
+            &self.input_box.buffer.lines()[0],
+            self.input_box.buffer.cursor_byte_offset(),
+        )
+    }
+
     fn sync_file_completion(&mut self) {
         if self.status == Status::Streaming {
             self.file_completion.close();
             return;
         }
-        let range = {
-            let buf = &self.input_box.buffer;
-            at_token_range(&buf.lines()[buf.y()], buf.x())
+        let directory = self.directory_completion_context();
+        let (mode, range, query) = if let Some((query, range)) = directory {
+            (CompletionMode::Directory, range, query)
+        } else {
+            let range = {
+                let buf = &self.input_box.buffer;
+                at_token_range(&buf.lines()[buf.y()], buf.x())
+            };
+            let Some((start, end)) = range else {
+                self.file_completion.close();
+                return;
+            };
+            let query = {
+                let buffer = &self.input_box.buffer;
+                at_token_query(&buffer.lines()[buffer.y()], buffer.x()).unwrap_or_default()
+            };
+            (CompletionMode::Reference, (start, end), query)
         };
-        let Some((start, end)) = range else {
-            self.file_completion.close();
-            return;
-        };
-        if self.command_palette.is_active() || self.any_overlay_open() {
+        if (mode == CompletionMode::Reference && self.command_palette.is_active())
+            || self.any_overlay_open()
+        {
             self.file_completion.close();
             return;
         }
 
         let cwd = self.state.session.cwd.clone();
-        let query = {
-            let buffer = &self.input_box.buffer;
-            at_token_query(&buffer.lines()[buffer.y()], buffer.x()).unwrap_or_default()
-        };
-        self.file_completion.set_token_byte_range((start, end));
-        if self.file_completion.is_active() {
+        self.file_completion.set_token_byte_range(range);
+        if self.file_completion.is_active() && !self.file_completion.needs_reopen(&cwd, mode) {
             self.file_completion.sync_query(&query);
         } else {
-            let items = self
-                .lua_event_handle
-                .collect_completion_items(&self.completion_ctx());
-            self.store_at_ref_labels(&items);
-            self.file_completion.open(&cwd, items, &query, (start, end));
+            let items = if mode == CompletionMode::Reference {
+                let items = self
+                    .lua_event_handle
+                    .collect_completion_items(&self.completion_ctx());
+                self.store_at_ref_labels(&items);
+                items
+            } else {
+                Vec::new()
+            };
+            if mode == CompletionMode::Reference {
+                self.file_completion.open(&cwd, items, &query, range);
+            } else {
+                self.file_completion
+                    .open_with_mode(&cwd, items, &query, range, mode);
+            }
         }
     }
 
     /// Replaces the `@` token with a final completion and closes the popup.
     fn insert_completion(&mut self, item: CompletionItem) {
-        self.apply_completion(item, true);
+        if self.file_completion.mode() == Some(CompletionMode::Directory) {
+            self.apply_completion_replacement(item.insertion, true);
+        } else {
+            self.apply_completion(item, true);
+        }
     }
 
     /// Replaces the `@` token with an explicit directory and refreshes its children.
     fn advance_completion(&mut self, item: CompletionItem) {
-        let replacement = item.advance_replacement();
+        let replacement = if self.file_completion.mode() == Some(CompletionMode::Directory) {
+            item.insertion
+        } else {
+            item.advance_replacement()
+        };
         self.apply_completion_replacement(replacement, false);
         self.sync_file_completion();
     }
@@ -2303,6 +2362,9 @@ impl App {
                     .session_mut()
                     .set_cwd(path.to_string_lossy().into_owned());
                 self.status_bar.set_cwd(path.clone());
+                if self.file_completion.is_active() {
+                    self.sync_file_completion();
+                }
                 self.flash(format!("cd {}", path.display()))
             }
             Err(error) => self.flash(format!("cd: {error}")),
@@ -2839,6 +2901,19 @@ impl App {
         actions.extend(self.start_from_queue(&msg));
         actions
     }
+}
+
+fn directory_argument_range(line: &str, cursor: usize) -> Option<(String, (usize, usize))> {
+    let remainder = line.strip_prefix("/cd")?;
+    let separator = remainder.chars().next().filter(|c| c.is_whitespace())?;
+    let command_end = line.len() - remainder.len() + separator.len_utf8();
+    if cursor < command_end || !line.is_char_boundary(cursor) {
+        return None;
+    }
+    let start = line.len() - remainder.trim_start().len();
+    let end = line.trim_end().len().max(start);
+    let query_end = cursor.clamp(start, end);
+    Some((line[start..query_end].to_owned(), (start, end)))
 }
 
 fn is_streaming_stop_key(key: KeyEvent) -> bool {
