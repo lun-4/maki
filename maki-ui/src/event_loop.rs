@@ -26,6 +26,7 @@ use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
 use maki_config::{ModelPolicy, UiConfig};
+use maki_domain::ThinkingConfig as DomainThinkingConfig;
 use maki_lua::{
     EventHandle, HintReader, KeymapReader, ModelRequest, ProviderUsageAck,
     ProviderUsageInvalidation, ProviderUsageLimit, ProviderUsageReply, ProviderUsageSnapshot,
@@ -33,14 +34,13 @@ use maki_lua::{
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
-use maki_providers::{Message, Model, ThinkingConfig, TokenUsage};
+use maki_providers::{Message, Model, TokenUsage};
 use maki_storage::StateDir;
 use maki_storage::StorageError;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::session_lock;
 use maki_storage::sessions::{
-    Prefs, SESSIONS_DIR, SessionError, StoredThinking, StoredTokenUsage, normalize_title,
-    write_prefs,
+    Prefs, SESSIONS_DIR, SessionError, StoredTokenUsage, normalize_title, write_prefs,
 };
 use serde_json::json;
 use tracing::{info, warn};
@@ -1507,15 +1507,7 @@ impl<'t> EventLoop<'t> {
                     .sessions
                     .iter()
                     .enumerate()
-                    .map(|(i, rt)| {
-                        json!({
-                            "id": rt.id(),
-                            "title": rt.app.state.session.title,
-                            "status": SessionStatus::of(&rt.app).as_str(),
-                            "updated_at": rt.app.state.session.updated_at,
-                            "focused": i == self.focused,
-                        })
-                    })
+                    .map(|(i, rt)| live_session_row(rt.id(), &rt.app, i == self.focused))
                     .collect();
                 let _ = reply_tx.send(Ok(json!(list)));
             }
@@ -1580,9 +1572,11 @@ impl<'t> EventLoop<'t> {
             }
             SessionRequest::GetThinking => {
                 let app = &self.sessions[self.focused].app;
+                let options = maki_domain::THINKING_OPTIONS.to_vec();
                 let reply = Ok(json!({
                     "mode": app.state.thinking.to_string(),
                     "supports_thinking": app.state.model.supports_thinking(),
+                    "options": options,
                 }));
                 let _ = reply_tx.send(reply);
             }
@@ -1595,18 +1589,19 @@ impl<'t> EventLoop<'t> {
                     if !self.sessions[idx].app.state.model.supports_thinking() {
                         return Err("Thinking requires a model that supports it".into());
                     }
-                    let parsed =
-                        StoredThinking::parse_setting(&thinking).map_err(|e| e.to_string())?;
+                    let parsed = thinking
+                        .parse::<DomainThinkingConfig>()
+                        .map_err(|e| e.to_string())?;
                     if set_default {
                         write_prefs(
                             &self.ctx.storage,
                             &Prefs {
-                                default_thinking: Some(parsed),
+                                default_thinking: Some(parsed.into()),
                             },
                         )
                         .map_err(|e| e.to_string())?;
                     }
-                    self.sessions[idx].app.state.thinking = ThinkingConfig::from(parsed);
+                    self.sessions[idx].app.state.thinking = parsed;
                     let mode = self.sessions[idx].app.state.thinking.to_string();
                     self.sessions[idx].app.flash(format!("Thinking: {mode}"));
                     Ok(json!({ "mode": mode }))
@@ -2103,6 +2098,28 @@ impl<'t> EventLoop<'t> {
     }
 }
 
+fn live_session_row(id: MakiId, app: &App, focused: bool) -> serde_json::Value {
+    json!({
+        "id": id,
+        "title": app.state.session.title,
+        "status": SessionStatus::of(app).as_str(),
+        "updated_at": app.state.session.updated_at,
+        "message_count": live_message_count(app),
+        "focused": focused,
+    })
+}
+
+/// The agent publishes its in-flight history to the mirror as it works, so a
+/// turn that has not reached a checkpoint yet is still visible there. The
+/// mirrored history is the main transcript only; subagent messages live
+/// elsewhere.
+fn live_message_count(app: &App) -> usize {
+    app.shared_history
+        .as_ref()
+        .map(|h| h.load().messages.len())
+        .unwrap_or_else(|| app.state.session.messages().len())
+}
+
 fn session_usage(
     total: &TokenUsage,
     cost: Option<f64>,
@@ -2191,6 +2208,36 @@ mod tests {
 
     const OBSERVATION: &str = "failed";
     const SHELL_RESULT: &str = "command finished";
+
+    #[test]
+    fn live_session_response_includes_main_message_count() {
+        let mut app = crate::app::tests::test_app();
+        app.state
+            .session_mut()
+            .push_message(Message::observation("kept".into()));
+        let row = live_session_row(app.state.session.id, &app, true);
+        assert_eq!(
+            row["message_count"], 1,
+            "no mirror falls back to the session"
+        );
+
+        let messages = vec![
+            Message::observation("one".into()),
+            Message::observation("two".into()),
+        ];
+        let mirror: maki_agent::SharedMessages = Arc::new(arc_swap::ArcSwap::from_pointee(
+            maki_agent::HistorySnapshot::new(messages),
+        ));
+        let mut app = crate::app::tests::test_app();
+        app.shared_history = Some(mirror);
+        let row = live_session_row(app.state.session.id, &app, true);
+        assert_eq!(
+            row["message_count"], 2,
+            "the live mirror wins over the checkpoint"
+        );
+        assert_eq!(row["focused"], true);
+        assert_eq!(row["status"], "idle");
+    }
 
     struct FakeHost;
 

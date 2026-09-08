@@ -4,36 +4,76 @@ use std::time::{Duration, Instant};
 use flume::Sender;
 use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use isahc::{HttpClient, Request};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::providers::ResolvedAuth;
+use crate::types::ThinkingConfigExt;
 use crate::{
-    AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse, TokenUsage,
+    AgentError, ContentBlock, EffortDialect, Message, ProviderEvent, Role, StopReason,
+    StreamResponse, ThinkingConfig, TokenUsage,
 };
 
 const RESPONSES_PATH: &str = "/responses";
 
-pub(crate) fn build_body(
-    model: &crate::model::Model,
-    messages: &[Message],
-    system: &str,
-    tools: &Value,
-) -> Value {
-    let input = convert_input(messages);
-    let wire_tools = convert_tools(tools);
+pub(crate) struct ResponsesRequestArgs<'a, 'b> {
+    pub model: &'a crate::model::Model,
+    pub messages: &'a [Message],
+    pub system: &'a str,
+    pub tools: &'a Value,
+    pub thinking: Option<(ThinkingConfig, &'b EffortDialect<'b>)>,
+}
 
-    let mut body = json!({
-        "model": model.id,
-        "instructions": system,
-        "input": input,
-        "stream": true,
-        "store": false,
-    });
-    if wire_tools.as_array().is_some_and(|a| !a.is_empty()) {
-        body["tools"] = wire_tools;
+pub(crate) fn build_body<'a, 'b>(args: ResponsesRequestArgs<'a, 'b>) -> Value {
+    let ResponsesRequestArgs {
+        model,
+        messages,
+        system,
+        tools: tool_definitions,
+        thinking,
+    } = args;
+    let wire_tools = convert_tools(tool_definitions);
+    let tools = match wire_tools {
+        Value::Array(tools) if !tools.is_empty() => Some(Value::Array(tools)),
+        _ => None,
+    };
+    #[derive(Serialize)]
+    struct ReasoningRequest {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        effort: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<&'static str>,
     }
-    body
+
+    #[derive(Serialize)]
+    struct ResponsesRequest {
+        model: String,
+        instructions: String,
+        input: Value,
+        stream: bool,
+        store: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tools: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning: Option<ReasoningRequest>,
+    }
+
+    let reasoning = thinking.and_then(|(thinking, effort_dialect)| {
+        let effort = thinking.effort_str(effort_dialect, model);
+        let summary = thinking.is_enabled().then_some("auto");
+        (effort.is_some() || summary.is_some()).then_some(ReasoningRequest { effort, summary })
+    });
+    serde_json::to_value(ResponsesRequest {
+        model: model.id.clone(),
+        instructions: system.into(),
+        input: convert_input(messages),
+        stream: true,
+        store: false,
+        tools,
+        reasoning,
+    })
+    .expect("Responses request is serializable")
 }
 
 pub(crate) fn convert_input(messages: &[Message]) -> Value {
@@ -540,10 +580,34 @@ fn parse_usage(u: &Value) -> TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Effort, dialect, model::Model};
     use futures_lite::io::Cursor;
     use serde_json::json;
+    use test_case::test_case;
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+
+    #[test_case(None, &dialect::STANDARD, None; "no_thinking_config")]
+    #[test_case(Some(ThinkingConfig::Off), &dialect::STANDARD, None; "off_omitted")]
+    #[test_case(Some(ThinkingConfig::Off), &dialect::TENSORX, Some(json!({"effort": "none"})); "off_explicit")]
+    #[test_case(Some(ThinkingConfig::Adaptive), &dialect::ANTHROPIC_ADAPTIVE, Some(json!({"summary": "auto"})); "native_adaptive")]
+    #[test_case(Some(ThinkingConfig::Adaptive), &dialect::STANDARD, Some(json!({"effort": "medium", "summary": "auto"})); "adaptive_effort")]
+    #[test_case(Some(ThinkingConfig::Effort(Effort::High)), &dialect::STANDARD, Some(json!({"effort": "high", "summary": "auto"})); "explicit_effort")]
+    fn build_body_reasoning(
+        thinking: Option<ThinkingConfig>,
+        dialect: &EffortDialect<'_>,
+        expected: Option<Value>,
+    ) {
+        let model = Model::from_spec("copilot/gpt-5.4").unwrap();
+        let body = build_body(ResponsesRequestArgs {
+            model: &model,
+            messages: &[],
+            system: "",
+            tools: &json!([]),
+            thinking: thinking.map(|thinking| (thinking, dialect)),
+        });
+        assert_eq!(body.get("reasoning"), expected.as_ref());
+    }
 
     async fn run_sse(sse: &str) -> (Result<StreamResponse, AgentError>, Vec<ProviderEvent>) {
         let (tx, rx) = flume::unbounded();

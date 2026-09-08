@@ -27,9 +27,10 @@ async fn roundtrip(
 
 /// Lists sessions stored for the current project. Answered from a
 /// background scan, so a slow disk never blocks the UI. `open_elsewhere` is
-/// true while another makima instance has the session open.
+/// true while another makima instance has the session open. `message_count`
+/// counts main transcript messages only and excludes subagent histories.
 ///
-/// @return (table|nil, string|nil) Array of `{id, title, updated_at, cwd, open_elsewhere}`, or nil and an error.
+/// @return (table|nil, string|nil) Array of `{id, title, updated_at, cwd, message_count, open_elsewhere}`, or nil and an error.
 /// @example
 /// local stored, err = maki.session.list()
 #[lua_fn]
@@ -40,9 +41,10 @@ async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
 /// Lists stored sessions across every project directory, most recently
 /// updated first. Answered from a background scan, so a slow disk never
 /// blocks the UI. `open_elsewhere` is true while another makima instance has
-/// the session open.
+/// the session open. `message_count` counts main transcript messages only
+/// and excludes subagent histories.
 ///
-/// @return (table|nil, string|nil) Array of `{id, title, updated_at, cwd, open_elsewhere}`, or nil and an error.
+/// @return (table|nil, string|nil) Array of `{id, title, updated_at, cwd, message_count, open_elsewhere}`, or nil and an error.
 /// @example
 /// local stored, err = maki.session.list_all()
 #[lua_fn]
@@ -54,7 +56,9 @@ async fn list_all(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaRe
 /// "needs_input", or "idle". A mailbox follow-up stays "working" without an
 /// intermediate "idle" status.
 ///
-/// @return (table|nil, string|nil) Array of `{id, title, status, updated_at, focused}`, or nil and an error.
+/// `message_count` counts main transcript messages only and excludes subagent histories.
+///
+/// @return (table|nil, string|nil) Array of `{id, title, status, updated_at, message_count, focused}`, or nil and an error.
 /// @example
 /// local live, err = maki.session.live()
 #[lua_fn]
@@ -219,7 +223,7 @@ async fn set_title(
 /// Returns the current thinking mode of the focused session and whether its
 /// model supports thinking at all (for hiding/graving the selector).
 ///
-/// @return (table|nil, string|nil) `{mode, supports_thinking}`, or nil and an error.
+/// @return (table|nil, string|nil) `{mode, supports_thinking, options}`, or nil and an error.
 /// @example
 /// local info = maki.session.thinking()
 #[lua_fn]
@@ -228,7 +232,7 @@ async fn thinking(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaRe
 }
 
 /// Sets the focused session's thinking mode. `mode` accepts any value
-/// `StoredThinking::parse_setting` understands: `off`, `adaptive`, an effort
+/// `ThinkingConfig::parse_setting` understands: `off`, `adaptive`, an effort
 /// level (`minimal` .. `max`), or a token budget. When `set_default` is true,
 /// the choice is also persisted as the global default for new sessions.
 ///
@@ -474,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_roundtrips_mode_and_support_flag() {
+    fn thinking_roundtrips_mode_support_flag_and_options() {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_session(Some(tx));
         let checker = std::thread::spawn(move || {
@@ -486,7 +490,11 @@ mod tests {
                 panic!("expected get_thinking request");
             };
             reply_tx
-                .send(Ok(json!({ "mode": "high", "supports_thinking": true })))
+                .send(Ok(json!({
+                    "mode": "high",
+                    "supports_thinking": true,
+                    "options": ["off", "adaptive", "low", "high"],
+                })))
                 .unwrap();
         });
         let (val, err): (Table, Option<String>) =
@@ -494,6 +502,8 @@ mod tests {
         assert_eq!(err, None);
         assert_eq!(val.get::<String>("mode").unwrap(), "high");
         assert!(val.get::<bool>("supports_thinking").unwrap());
+        let options: Vec<String> = val.get("options").unwrap();
+        assert_eq!(options, ["off", "adaptive", "low", "high"]);
         checker.join().unwrap();
     }
 }
