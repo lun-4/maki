@@ -2816,6 +2816,7 @@ dependencies = [
 name = "maki-docgen"
 version = "0.4.11-makima"
 dependencies = [
+ "color-eyre",
  "maki-agent",
  "maki-commands",
  "maki-config",
@@ -2825,7 +2826,10 @@ dependencies = [
  "regex",
  "serde_json",
  "strum 0.27.2",
+ "tempfile",
  "test-case",
+ "tree-sitter",
+ "tree-sitter-lua",
 ]
 
 [[package]]
