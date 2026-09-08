@@ -8,6 +8,10 @@ Zed is the tested ACP client. Protocol statements below describe the portable AC
 
 The predecessor plan is `.agents/makima-plans/50-command-registry-acp-unification.md`. That plan implemented shared command discovery and dispatch, but its assumption that every selected builtin could be projected faithfully through ACP is no longer valid. It also contains two literal truncation-marker corruptions. The investigation and decisions needed for continuation are restated below, so the damaged clauses are not required. Issue #75 tracks the read-output corruption mechanism.
 
+## Option ownership and projection follow-up
+
+The coordinator owns session option values and validation. Slash commands, ACP config requests, SDK model changes, model discovery, and dependent option updates enter the same serialized coordinator path. The ACP projection applies committed snapshots to runtime state and emits full option notifications without duplicate command-side writes.
+
 ## Goal
 
 Make ACP command execution preserve the meaning of each command and project all client-visible state that ACP can represent. Do not report a local command as complete when the client still displays stale state or when the command used different semantics from the TUI.
@@ -338,7 +342,7 @@ Potential IDs include `model`, `yolo`, `fast`, `workflow`, and `bash.auto_mode`.
 
 ### ACP update ordering
 
-For a slash command that changes an option, choose and test an ordering between `ConfigOptionUpdate` and the final `PromptResponse`. The client should observe the new value by prompt completion.
+For a slash command or SDK request that changes an option, the coordinator commits the state and emits one full `ConfigOptionUpdate` before the final `PromptResponse`. The client should observe the new value by prompt completion. Concurrent option changes must serialize through the same coordinator.
 
 For `/cd`, choose whether confirmation uses an agent-message chunk or another visible ACP representation. For `/compact`, define stable tool-call IDs and the exact sequence for start, success, failure, and prompt completion.
 
@@ -377,7 +381,8 @@ The option-registry design should be reviewed before steps 4 through 6 become a 
 ### Session options
 
 - New-session and load-session responses contain the full ordered option set with correct categories and current values.
-- Direct `session/set_config_option` and slash commands call the same setter for Model, YOLO, Fast, Workflow, and Bash auto mode.
+- Direct `session/set_config_option`, SDK `set_model`, and slash commands call the same coordinator and setter for Model, YOLO, Fast, Workflow, and Bash auto mode.
+- The coordinator serializes option application and emits one full `ConfigOptionUpdate` after each successful committed change, before the final `PromptResponse`.
 - `/model <spec>` emits a full config-option update with the selected model before prompt completion.
 - A model change that disables Fast publishes both resulting values in one coherent snapshot.
 - Invalid option IDs, invalid values, policy-rejected models, and unsupported Fast requests leave state unchanged and return useful errors.
