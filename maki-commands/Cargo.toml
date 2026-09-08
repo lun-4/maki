@@ -9,7 +9,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+maki-domain = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 futures-lite = { workspace = true }
+test-case = { workspace = true }

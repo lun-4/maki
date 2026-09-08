@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crossterm::event::{KeyCode, KeyEvent};
 use maki_commands::{
     CommandId, CommandRegistry, CompletionCandidate, CompletionItem, CompletionResult,
-    CompletionSession, RegistrySnapshot, ResolvedCommand, TargetHandle,
+    CompletionSession, RegistrySnapshot, ResolvedCommand, SlashClass, TargetHandle, classify_input,
 };
 use maki_match::{CompletionMatchOptions, completion_match};
 use nucleo::pattern::{CaseMatching, Normalization};
@@ -593,13 +593,14 @@ impl CommandPalette {
             self.snapshot = snapshot;
             self.nucleo = Self::build_nucleo(&self.snapshot);
         }
-        let Some(stripped) = input.strip_prefix('/') else {
+        let SlashClass::Command(trimmed) = classify_input(input) else {
             self.filtered.clear();
             self.current_arg_count = 0;
             self.pending_command = None;
             self.command_publication.clear();
             return;
         };
+        let stripped = &trimmed[1..]; // trimmed starts with exactly one '/'
 
         let parts: Vec<&str> = stripped.split_whitespace().collect();
         let cmd_word = parts.first().copied().unwrap_or(stripped);
@@ -850,14 +851,9 @@ impl CommandPalette {
             return None;
         }
         let command = self.filtered.get(self.command_selected)?.command.clone();
-        let args = input
-            .strip_prefix('/')
-            .and_then(|s| s.split_once(char::is_whitespace))
-            .map(|(_, a)| a.trim())
-            .unwrap_or("");
         Some(ConfirmedCommand {
             command,
-            args: args.to_string(),
+            args: command_args(input).trim().to_string(),
         })
     }
 
@@ -1086,7 +1082,10 @@ fn argument_visible_rows(
 }
 
 fn command_args(input: &str) -> &str {
-    let input = input.strip_prefix('/').unwrap_or("");
+    let SlashClass::Command(input) = classify_input(input) else {
+        return "";
+    };
+    let input = &input[1..];
     input
         .char_indices()
         .find(|(_, ch)| ch.is_whitespace())
@@ -1094,26 +1093,31 @@ fn command_args(input: &str) -> &str {
 }
 
 fn argument_at_cursor(input: &str, cursor: usize) -> Option<(usize, usize, String, usize)> {
-    let slash = input.strip_prefix('/')?;
+    let SlashClass::Command(command_input) = classify_input(input) else {
+        return None;
+    };
+    let offset = input.len() - command_input.len();
+    let cursor = cursor.checked_sub(offset)?;
+    let slash = &command_input[1..];
     let command_end = slash
         .char_indices()
         .find(|(_, ch)| ch.is_whitespace())
         .map(|(index, ch)| 1 + index + ch.len_utf8())?;
-    if cursor < command_end || !input.is_char_boundary(cursor) {
+    if cursor < command_end || !command_input.is_char_boundary(cursor) {
         return None;
     }
-    let start = input[..cursor]
+    let start = command_input[..cursor]
         .char_indices()
         .rev()
         .find(|(_, ch)| ch.is_whitespace())
         .map_or(command_end, |(index, ch)| index + ch.len_utf8());
-    let end = input[cursor..]
+    let end = command_input[cursor..]
         .char_indices()
         .find(|(_, ch)| ch.is_whitespace())
-        .map_or(input.len(), |(index, _)| cursor + index);
-    let arg = input[start..end].to_string();
-    let index = input[command_end..start].split_whitespace().count();
-    Some((start, end, arg, index))
+        .map_or(command_input.len(), |(index, _)| cursor + index);
+    let arg = command_input[start..end].to_string();
+    let index = command_input[command_end..start].split_whitespace().count();
+    Some((offset + start, offset + end, arg, index))
 }
 
 #[cfg(test)]
@@ -1203,6 +1207,25 @@ mod tests {
     }
 
     #[test]
+    fn escaped_input_never_matches_commands() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        producer
+            .replace(vec![registration("/model", "Switch model")])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
+        let mut palette = CommandPalette::new(registry, target);
+
+        palette.sync("/model");
+        settle(&mut palette);
+        assert!(palette.is_active());
+
+        palette.sync("//model");
+        assert!(!palette.is_active());
+        assert!(palette.filtered.is_empty());
+    }
+
+    #[test]
     fn confirmation_owns_selected_resolution_across_registry_refresh() {
         let registry = CommandRegistry::new();
         let producer = registry.create_producer(ProducerPrecedence::Plugin);
@@ -1211,9 +1234,9 @@ mod tests {
             .unwrap();
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
         let mut palette = CommandPalette::new(registry, target);
-        palette.sync("/dynamic arg");
+        palette.sync("  /dynamic arg");
         settle(&mut palette);
-        let confirmed = palette.confirm("/dynamic arg").unwrap();
+        let confirmed = palette.confirm("  /dynamic arg").unwrap();
 
         producer
             .replace(vec![registration("/dynamic", "Second")])
@@ -1393,6 +1416,17 @@ mod tests {
         assert_eq!(command_args(input), "alpha\u{3000}beta");
         assert_eq!(
             argument_at_cursor(input, input.find("alpha").unwrap() + "alpha".len()),
+            Some((8, 13, "alpha".into(), 0))
+        );
+    }
+
+    #[test]
+    fn argument_parser_uses_trimmed_command_slice() {
+        let input = "  /test alpha";
+
+        assert_eq!(command_args(input), "alpha");
+        assert_eq!(
+            argument_at_cursor(input, input.len()),
             Some((8, 13, "alpha".into(), 0))
         );
     }

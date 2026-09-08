@@ -7,7 +7,7 @@ group = "Reference"
 
 # Commands
 
-Type `/` in the TUI input box to open the command palette. A leading slash command is also recognized in `--print`, SDK stream mode, and ACP. Command names use exact ASCII-insensitive matching. Unknown and unavailable slash-prefixed text remains a model prompt. A known available command with invalid arguments returns an error instead of becoming a prompt.
+Type `/` in the TUI input box to open the command palette. A leading slash command is also recognized in `--print`, SDK stream mode, and ACP. Command names use exact ASCII-insensitive matching. Unknown and unavailable slash-prefixed text is rejected with an error instead of becoming a prompt. Prefix a literal message that starts with `/` with another slash to send it as text: `//lmao` sends `/lmao`. Text sent programmatically (`maki.session.prompt`, subagent chat) is not parsed as a command. A known available command with invalid arguments returns an error instead of becoming a prompt.
 
 The active registry combines built-ins, custom Markdown commands, MCP prompts, and Lua commands. Lua commands have the highest collision priority, followed by MCP prompts, custom commands, and built-ins. Each frontend advertises its capabilities, and the registry omits commands that require unavailable capabilities. The Lua `tui_only` field maps to the interactive-TUI capability. Registrations can change when plugins reload or MCP servers reconnect. The palette and protocol command lists show the current target-scoped winners. Root CLI subcommands such as `maki auth` are separate from slash commands.
 
@@ -28,13 +28,12 @@ The active registry combines built-ins, custom Markdown commands, MCP prompts, a
 | `/cd` | Change working directory | <path> | no |
 | `/btw` | Ask a quick question (no tools, no history pollution) | <question> | no |
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) |  | no |
-| `/thinking` | Toggle extended thinking (off, adaptive, effort level, or budget) | <mode> | yes |
 | `/fast` | Toggle Anthropic fast mode (Opus only) |  | no |
 | `/workflow` | Toggle workflow mode (task callable inside code_execution) |  | no |
 | `/exit` | Exit the application |  | no |
 | `/reload` | Reload plugins and config |  | no |
 
-The portable built-ins are `/compact`, `/new` (and `/clear`), `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises these built-ins plus custom, MCP, and portable Lua commands. Commands that require TUI capabilities are omitted from ACP. Invoking an unavailable command sends the complete input as ordinary model text.
+The portable built-ins are `/compact`, `/new` (and `/clear`), `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises these built-ins plus custom, MCP, and portable Lua commands. Commands that require TUI capabilities are omitted from ACP. Invoking an unavailable command returns an error; to send it as a literal prompt, escape the leading slash (`//help` sends `/help`).
 
 ## Bundled plugin commands
 
@@ -67,7 +66,7 @@ Sessions run concurrently. `/new` starts a fresh session while the old one keeps
 ## Modes and toggles
 
 - **`/yolo`**: skip permission prompts for this session (deny rules still apply). Config: `always_yolo = true`.
-- **`/thinking`**: extended thinking. Optional arg: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. Config: `always_thinking`.
+- **`/thinking`**: bare opens the selector; an optional setting applies and persists the default. Completion lists the finite options supplied by the host. Positive numeric token budgets are accepted as arguments but are not suggested. Config: `always_thinking`.
 - **`/fast`**: Anthropic fast mode (Opus only; ignored on other models). Config: `always_fast = true`.
 - **`/workflow`**: let `code_execution` call the `task` tool (and other workflow-only tools) from inside the Python sandbox. Config: `always_workflow = true`.
 - **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only).

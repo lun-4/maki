@@ -20,7 +20,7 @@ use maki_agent::{
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{BuiltinAction, CommandArgumentItem, HintReader, KeymapReader};
-use maki_providers::{ContentBlock, Effort, Message, Role, TokenUsage};
+use maki_providers::{ContentBlock, Message, Role, TokenUsage};
 use maki_storage::sessions::{StoredMode, StoredSubagent, StoredThinking};
 use ratatui::layout::Rect;
 use std::env;
@@ -974,6 +974,18 @@ fn enter_executes_new_command() {
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(matches!(&actions[0], Action::NewSession));
     assert!(!app.command_palette.is_active());
+}
+
+#[test]
+fn leading_whitespace_palette_command_preserves_arguments() {
+    let mut app = test_app();
+
+    let actions = type_and_submit(&mut app, "  /btw describe this");
+
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::Btw(question, images)] if question == "describe this" && images.is_empty()
+    ));
 }
 
 #[test]
@@ -4043,11 +4055,29 @@ fn startup_session_picker_emits_plugin_request() {
 }
 
 #[test]
-fn slash_noncommand_sends_as_prompt() {
+fn slash_noncommand_is_rejected_and_flashes() {
     let mut app = test_app();
     let actions = type_and_submit(&mut app, "/nonexistent");
-    assert!(app.status_bar.flash_text().is_none());
-    assert!(actions.iter().any(|a| matches!(a, Action::SendMessage(..))));
+    assert!(actions.is_empty());
+    app.execute_pending_commands();
+    assert!(
+        app.status_bar
+            .flash_text()
+            .is_some_and(|text| text.contains("unknown command"))
+    );
+    assert!(!actions.iter().any(|a| matches!(a, Action::SendMessage(..))));
+}
+
+#[test_case("//lmao", "/lmao" ; "escaped literal strips one slash")]
+#[test_case("///lmao", "//lmao" ; "triple slash strips one slash")]
+fn slash_escape_sends_literal_input(text: &str, expected: &str) {
+    let mut app = test_app();
+    let actions = type_and_submit(&mut app, text);
+    assert_eq!(actions.len(), 1);
+    assert!(matches!(
+        &actions[0],
+        Action::SendMessage(input) if input.message.as_str() == expected
+    ));
 }
 
 fn build_rewind_app() -> App {
@@ -5263,51 +5293,6 @@ fn bash_prefix_overrides_mode() {
 }
 
 #[test]
-fn thinking_toggle_cycles_off_adaptive() {
-    let mut app = test_app();
-    assert_eq!(app.state.thinking, ThinkingConfig::Off);
-
-    app.execute_command(cmd("/thinking"), 0);
-    assert_eq!(app.state.thinking, ThinkingConfig::Adaptive);
-
-    app.execute_command(cmd("/thinking"), 0);
-    assert_eq!(app.state.thinking, ThinkingConfig::Off);
-}
-
-#[test]
-fn thinking_explicit_args() {
-    let mut app = test_app();
-
-    app.execute_command(
-        ParsedCommand {
-            name: "/thinking".into(),
-            args: "8192".into(),
-        },
-        0,
-    );
-    assert_eq!(app.state.thinking, ThinkingConfig::Budget(8192));
-
-    app.execute_command(
-        ParsedCommand {
-            name: "/thinking".into(),
-            args: "high".into(),
-        },
-        0,
-    );
-    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::High));
-}
-
-#[test]
-fn thinking_unsupported_model_flashes_error() {
-    let mut app = test_app();
-    app.state.model.thinking_override = Some(maki_providers::ThinkingSupport::No);
-
-    app.execute_command(cmd("/thinking"), 0);
-    assert_eq!(app.state.thinking, ThinkingConfig::Off);
-    assert!(app.status_bar.flash_text().is_some());
-}
-
-#[test]
 fn thinking_restored_from_session_meta() {
     let tmp = TempDir::new().unwrap();
     let storage = StateDir::from_path(tmp.path().to_path_buf());
@@ -6442,6 +6427,9 @@ fn at_completion_insertion_synchronizes_argument_completion() {
     );
     app.input_box.set_input("/deploy @rev".into());
     app.command_palette.sync("/deploy @rev");
+    settle_command_palette(&mut app);
+    let value = app.input_box.buffer.value();
+    app.sync_command_arguments(&value, app.input_box.buffer.cursor_byte_offset());
     app.file_completion
         .open(&app.state.session.cwd, Vec::new(), "rev", (8, 12));
     let generation = app.command_palette.argument_generation();
@@ -6638,16 +6626,16 @@ fn popup_closes_when_token_removed() {
 #[test]
 fn command_palette_takes_precedence() {
     let (_tmp, mut app, _backend) = completion_app();
-    // `/thinking ` takes an argument, so the palette stays matched while an
+    // `/model ` takes an argument, so the palette stays matched while an
     // `@` token is added to that argument space.
-    for c in "/thinking ".chars() {
+    for c in "/model ".chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
     }
     assert!(app.command_palette.is_active());
     app.update(Msg::Key(key(KeyCode::Char('@'))));
     assert!(
         app.command_palette.is_active(),
-        "palette stays matched on /thinking"
+        "palette stays matched on /model"
     );
     assert!(
         !app.file_completion.is_active(),
@@ -6662,7 +6650,7 @@ fn completion_match_items(app: &App) -> Vec<CompletionItem> {
 }
 
 fn subagent_match_names(app: &App) -> Vec<String> {
-    completion_match_items(app)
+    let mut names: Vec<_> = completion_match_items(app)
         .into_iter()
         .filter(|i| i.kind == "subagent")
         .map(|i| {
@@ -6671,7 +6659,9 @@ fn subagent_match_names(app: &App) -> Vec<String> {
                 .map(|s| s.to_string())
                 .unwrap_or(i.label)
         })
-        .collect()
+        .collect();
+    names.sort();
+    names
 }
 
 /// Seed the `subagent` source with the types valid for `mode` (the task
@@ -6714,7 +6704,7 @@ fn at_a_prefix_lists_subagents() {
     converge_completion(&mut app);
     assert_eq!(
         subagent_match_names(&app),
-        vec!["research".to_string(), "general".to_string()]
+        vec!["general".to_string(), "research".to_string()]
     );
 }
 
@@ -6728,7 +6718,7 @@ fn at_subagent_prefix_lists_subagents() {
     converge_completion(&mut app);
     assert_eq!(
         subagent_match_names(&app),
-        vec!["research".to_string(), "general".to_string()]
+        vec!["general".to_string(), "research".to_string()]
     );
 }
 
