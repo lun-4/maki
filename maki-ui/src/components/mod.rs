@@ -210,6 +210,10 @@ pub enum Action {
     NewSession,
     LoadSession(Box<LoadedSession>),
     ChangeModel(String),
+    ImplementPlan {
+        clear_context: bool,
+        model: Option<String>,
+    },
     RefreshProvider {
         slug: String,
     },
