@@ -42,7 +42,7 @@ gen-docs-check:
     cargo run -p maki-docgen -- --check
 
 machete:
-    cargo machete
+    cargo-machete
 
 # Criterion benches (maki-lua: luau_perf, splash_perf). Pass a filter to pick
 # one, e.g. `just bench -- pull_roundtrip`; slow meters are sample_size 10.
