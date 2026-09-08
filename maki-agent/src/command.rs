@@ -122,6 +122,7 @@ impl SessionCommandState {
 pub struct SessionCommandHost {
     control_tx: flume::Sender<InteractiveControl>,
     state: Arc<SessionCommandState>,
+    reset_session_guidance: Option<Arc<str>>,
     coordinator: Option<crate::session_coordinator::SessionCoordinatorHandle>,
 }
 
@@ -133,8 +134,14 @@ impl SessionCommandHost {
         Self {
             control_tx,
             state,
+            reset_session_guidance: None,
             coordinator: None,
         }
+    }
+
+    pub fn with_reset_session_guidance(mut self, guidance: impl Into<Arc<str>>) -> Self {
+        self.reset_session_guidance = Some(guidance.into());
+        self
     }
 
     pub fn with_coordinator(
@@ -257,7 +264,15 @@ impl maki_commands::CommandHost for SessionCommandHost {
                 Box::pin(async { Ok(HostResponse::ManualCompaction) })
             }
             maki_commands::BuiltinOperation::ResetSession => {
-                self.control(InteractiveControl::Reset)
+                if let Some(guidance) = self.reset_session_guidance.clone() {
+                    Box::pin(async move {
+                        Ok(HostResponse::FrontendFeedback(
+                            maki_commands::FrontendFeedback::Text(guidance),
+                        ))
+                    })
+                } else {
+                    self.control(InteractiveControl::Reset)
+                }
             }
             maki_commands::BuiltinOperation::ToggleYolo => {
                 self.toggle_option_response(crate::session_options::YOLO_OPTION_ID)

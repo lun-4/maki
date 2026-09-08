@@ -55,6 +55,7 @@ pub(super) struct RegistryState {
 
 pub(super) struct TargetRecord {
     pub(super) capabilities: TargetCapabilities,
+    pub(super) presentation_capabilities: TargetCapabilities,
     pub(super) host: Arc<dyn CommandHost>,
 }
 
@@ -174,15 +175,29 @@ impl CommandRegistry {
         capabilities: TargetCapabilities,
         host: Arc<dyn CommandHost>,
     ) -> TargetHandle {
+        self.bind_target_with_presentation(capabilities, capabilities, host)
+    }
+
+    pub fn bind_target_with_presentation(
+        &self,
+        capabilities: TargetCapabilities,
+        presentation_capabilities: TargetCapabilities,
+        host: Arc<dyn CommandHost>,
+    ) -> TargetHandle {
         let mut state = self
             .0
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let id = InvocationTargetId::new(self.0.id, state.take_id());
-        state
-            .targets
-            .insert(id, TargetRecord { capabilities, host });
+        state.targets.insert(
+            id,
+            TargetRecord {
+                capabilities,
+                presentation_capabilities,
+                host,
+            },
+        );
         TargetHandle(Arc::new(TargetCore {
             id,
             registry: Arc::downgrade(&self.0),
@@ -296,12 +311,18 @@ impl CommandRegistry {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let capabilities =
-            target_capabilities(&state, self.0.id, target).ok_or(CommandError::StaleTarget)?;
+        let record = target_record(&state, self.0.id, target).ok_or(CommandError::StaleTarget)?;
         let commands = state
             .projection
             .iter()
-            .filter(|command| capabilities.contains_all(command.spec().required_capabilities))
+            .filter(|command| {
+                record
+                    .capabilities
+                    .contains_all(command.spec().required_capabilities)
+                    && record
+                        .presentation_capabilities
+                        .contains_all(command.spec().required_capabilities)
+            })
             .cloned()
             .collect();
         Ok(RegistrySnapshot {

@@ -2291,6 +2291,7 @@ impl App {
             maki_commands::FrontendFeedback::WorkingDirectory(path) => {
                 self.flash(format!("Working directory: {}", path.display()));
             }
+            maki_commands::FrontendFeedback::Text(text) => self.flash(text.to_string()),
         }
     }
 

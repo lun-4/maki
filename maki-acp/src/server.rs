@@ -43,6 +43,7 @@ use tracing::{debug, warn};
 use crate::{AcpParams, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
+const NEW_SESSION_GUIDANCE: &str = "Start a new conversation using the client’s new-session action. This conversation has not been changed.";
 
 /// Ids come from here and are never reused, so a late answer for a closed
 /// session cannot match a request of the session that replaced it.
@@ -789,13 +790,18 @@ fn install_session(
         fast,
         workflow,
     ));
-    let command_target = command_registry.bind_target(
-        maki_agent::command::portable_capabilities(),
+    let portable_capabilities = maki_agent::command::portable_capabilities();
+    let command_target = command_registry.bind_target_with_presentation(
+        portable_capabilities.union(maki_commands::TargetCapabilities::from_capability(
+            maki_commands::TargetCapability::SessionReplacement,
+        )),
+        portable_capabilities,
         Arc::new(
             maki_agent::command::SessionCommandHost::new(
                 handle.control_tx.clone(),
                 Arc::clone(&command_state),
             )
+            .with_reset_session_guidance(NEW_SESSION_GUIDANCE)
             .with_coordinator(coordinator.clone()),
         ),
     );
@@ -1065,6 +1071,7 @@ async fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<
                 maki_commands::FrontendFeedback::WorkingDirectory(path) => {
                     format!("Working directory: {}", path.display())
                 }
+                maki_commands::FrontendFeedback::Text(text) => text.to_string(),
             };
             let sid = SessionId::from(session.handle.session_id.to_string());
             session_update(&srv.out_tx, &sid, translate::text_delta(&text));
@@ -1879,13 +1886,19 @@ mod tests {
         control_tx: Sender<maki_agent::headless::InteractiveControl>,
         command_state: Arc<maki_agent::command::SessionCommandState>,
     ) -> TargetHandle {
-        registry.bind_target(
-            maki_agent::command::portable_capabilities(),
-            Arc::new(maki_agent::command::SessionCommandHost::new(
-                control_tx,
-                command_state,
-            )),
-        )
+        {
+            let portable_capabilities = maki_agent::command::portable_capabilities();
+            registry.bind_target_with_presentation(
+                portable_capabilities.union(maki_commands::TargetCapabilities::from_capability(
+                    maki_commands::TargetCapability::SessionReplacement,
+                )),
+                portable_capabilities,
+                Arc::new(
+                    maki_agent::command::SessionCommandHost::new(control_tx, command_state)
+                        .with_reset_session_guidance(NEW_SESSION_GUIDANCE),
+                ),
+            )
+        }
     }
 
     fn test_coordinator(
@@ -2000,13 +2013,18 @@ mod tests {
             false,
             false,
         ));
-        let command_target = command_registry.bind_target(
-            maki_agent::command::portable_capabilities(),
+        let portable_capabilities = maki_agent::command::portable_capabilities();
+        let command_target = command_registry.bind_target_with_presentation(
+            portable_capabilities.union(maki_commands::TargetCapabilities::from_capability(
+                maki_commands::TargetCapability::SessionReplacement,
+            )),
+            portable_capabilities,
             Arc::new(
                 maki_agent::command::SessionCommandHost::new(
                     handle.control_tx.clone(),
                     Arc::clone(&command_state),
                 )
+                .with_reset_session_guidance(NEW_SESSION_GUIDANCE)
                 .with_coordinator(coordinator.clone()),
             ),
         );
@@ -2128,6 +2146,55 @@ mod tests {
     }
 
     #[test]
+    fn slash_update_precedes_prompt_response() {
+        smol::block_on(async {
+            let (mut srv, _, out_rx, _) = server_awaiting_answer();
+            let session = srv.session.as_mut().unwrap();
+            let coordinator = session.coordinator.as_ref().unwrap().clone();
+            coordinator
+                .set_option(maki_agent::session_options::MODEL_OPTION_ID, FAST_SPEC)
+                .await
+                .unwrap();
+            session
+                .command_state
+                .set_model(&Model::from_spec(FAST_SPEC).unwrap());
+            session.option_projection = Some(Arc::new(OptionProjection {
+                out_tx: srv.out_tx.clone(),
+                session_id: SessionId::from(session.handle.session_id.to_string()),
+                read: coordinator.read(),
+                command_state: Arc::clone(&session.command_state),
+                permissions: Arc::clone(&session.handle.permissions),
+                emitted_version: Mutex::new(coordinator.read().options().version),
+            }));
+            let request_id = RequestId::Number(42);
+            handle_prompt(
+                &mut srv,
+                &serde_json::json!({
+                    "params": {
+                        "sessionId": coordinator.read().session_id().to_string(),
+                        "prompt": [{ "type": "text", "text": "/fast" }]
+                    }
+                }),
+                &request_id,
+            )
+            .await
+            .unwrap();
+
+            let update = out_rx.recv_async().await.unwrap();
+            assert_eq!(update["method"], "session/update");
+            assert_eq!(
+                update["params"]["update"]["configOptions"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(5)
+            );
+            let response = out_rx.recv_async().await.unwrap();
+            assert_eq!(response["id"], 42);
+            coordinator.close().await.unwrap();
+        });
+    }
+
+    #[test]
     fn set_config_projection_applies_host_state_before_response() {
         let (mut srv, _, out_rx, _) = server_awaiting_answer();
         let coordinator = srv
@@ -2175,55 +2242,6 @@ mod tests {
             maki_agent::session_options::ENABLED_VALUE
         );
         smol::block_on(coordinator.close()).unwrap();
-    }
-
-    #[test]
-    fn slash_update_precedes_prompt_response() {
-        smol::block_on(async {
-            let (mut srv, _, out_rx, _) = server_awaiting_answer();
-            let session = srv.session.as_mut().unwrap();
-            let coordinator = session.coordinator.as_ref().unwrap().clone();
-            coordinator
-                .set_option(maki_agent::session_options::MODEL_OPTION_ID, FAST_SPEC)
-                .await
-                .unwrap();
-            session
-                .command_state
-                .set_model(&Model::from_spec(FAST_SPEC).unwrap());
-            session.option_projection = Some(Arc::new(OptionProjection {
-                out_tx: srv.out_tx.clone(),
-                session_id: SessionId::from(session.handle.session_id.to_string()),
-                read: coordinator.read(),
-                command_state: Arc::clone(&session.command_state),
-                permissions: Arc::clone(&session.handle.permissions),
-                emitted_version: Mutex::new(coordinator.read().options().version),
-            }));
-            let request_id = RequestId::Number(42);
-            handle_prompt(
-                &mut srv,
-                &serde_json::json!({
-                    "params": {
-                        "sessionId": coordinator.read().session_id().to_string(),
-                        "prompt": [{ "type": "text", "text": "/fast" }]
-                    }
-                }),
-                &request_id,
-            )
-            .await
-            .unwrap();
-
-            let update = out_rx.recv_async().await.unwrap();
-            assert_eq!(update["method"], "session/update");
-            assert_eq!(
-                update["params"]["update"]["configOptions"]
-                    .as_array()
-                    .map(Vec::len),
-                Some(5)
-            );
-            let response = out_rx.recv_async().await.unwrap();
-            assert_eq!(response["id"], 42);
-            coordinator.close().await.unwrap();
-        });
     }
 
     #[test]
@@ -2803,6 +2821,54 @@ mod tests {
             input_rx.try_recv().unwrap().message,
             "/does-not-exist value"
         );
+    }
+
+    #[test]
+    fn new_and_clear_are_hidden_but_return_local_guidance() {
+        smol::block_on(async {
+            let (mut srv, _, out_rx, input_rx) = server_awaiting_answer();
+            let (control_tx, control_rx) = flume::unbounded();
+            srv.session.as_mut().unwrap().handle.control_tx = control_tx;
+            install_registry(&mut srv, test_registry(&[]));
+            let target = &srv.session.as_ref().unwrap().command_target;
+            let presented = srv
+                .session
+                .as_ref()
+                .unwrap()
+                .command_registry
+                .presented_commands(target)
+                .unwrap();
+            let names: Vec<_> = presented
+                .iter()
+                .map(|command| command.name.as_ref())
+                .collect();
+            assert!(!names.contains(&"/new"));
+            assert!(!names.contains(&"/clear"));
+
+            for (index, input) in ["/new", "/clear"].into_iter().enumerate() {
+                dispatch_prompt(
+                    &mut srv,
+                    input,
+                    false,
+                    &RequestId::Number(index as i64 + 10),
+                )
+                .await
+                .unwrap();
+                let message = out_rx.recv_async().await.unwrap();
+                assert_eq!(
+                    message["params"]["update"]["sessionUpdate"],
+                    "agent_message_chunk"
+                );
+                assert_eq!(
+                    message["params"]["update"]["content"]["text"],
+                    NEW_SESSION_GUIDANCE
+                );
+                let response = out_rx.recv_async().await.unwrap();
+                assert_eq!(response["result"]["stopReason"], "end_turn");
+                assert!(input_rx.is_empty());
+                assert!(control_rx.is_empty());
+            }
+        });
     }
 
     #[test]

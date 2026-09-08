@@ -271,6 +271,7 @@ pub struct IsolatedTurn {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrontendFeedback {
     WorkingDirectory(PathBuf),
+    Text(Arc<str>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

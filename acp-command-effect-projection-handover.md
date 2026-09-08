@@ -2,9 +2,21 @@
 
 ## Status
 
-No implementation has started for the work described here. The investigation only read the current implementation and the ACP 0.13.8 schema. The next session should start from the merged default branch, `mistress`, rather than continue from `command-registry-v2`.
+The review follow-ups are implemented. Local verification passed with `just ci`: formatting, lint, Python checks, 4,870 workspace tests, generated documentation checks, and unused-dependency checks. The changes are prepared for separate commits; ACP client verification remains outstanding.
 
-Zed is the tested ACP client. Protocol statements below describe the portable ACP v1 surface used by Maki. Client presentation details must still be verified against Zed.
+The investigation below is retained as historical context. It records the prior implementation state and observed failures. Zed is the intended client for follow-up verification. No current Zed verification is claimed here. Protocol statements below describe the portable ACP v1 surface used by Maki. Client presentation details still require Zed verification.
+
+## Review follow-up status and acceptance
+
+The follow-ups below have regression coverage and pass local repository checks. Zed presentation and end-to-end client behavior still require verification.
+
+| Follow-up | Required result |
+|---|---|
+| Serialized ACP option state | The coordinator owns option values. One per-session ACP projection serializes runtime state application and full option notifications; command handlers do not duplicate those writes. |
+| Headless wake | Model state refresh completes before controls are constructed or served. |
+| SDK model setter | SDK `set_model` uses the coordinator's validation, persistence, dependent-state, and error paths. |
+| Fixed generated prompt | Mutable model identity is removed from the fixed generated prompt. No extra prompt-rebuild state is added. |
+| `/new` and `/clear` | ACP client `session/new` owns creation. Hidden registry entries return local guidance and `end_turn` without inference, history mutation, or session mutation. TUI behavior remains unchanged. |
 
 The predecessor plan is `.agents/makima-plans/50-command-registry-acp-unification.md`. That plan implemented shared command discovery and dispatch, but its assumption that every selected builtin could be projected faithfully through ACP is no longer valid. It also contains two literal truncation-marker corruptions. The investigation and decisions needed for continuation are restated below, so the damaged clauses are not required. Issue #75 tracks the read-output corruption mechanism.
 
@@ -20,12 +32,12 @@ The correction is broader than adding notifications in `maki-acp`. The current c
 
 ## Observed failures
 
-Manual testing through Zed found these failures:
+The earlier investigation recorded these failures from manual Zed testing:
 
 | Command | Observed behavior | Required behavior |
 |---|---|---|
 | `/cd` | The backend changes directory, but the client UI keeps the original directory. | Change the live backend directory, use it for later tool locations, and show the canonical directory in the transcript. Document that ACP cannot change Zed's session directory field. |
-| `/new` and `/clear` | Model history is emptied without clearing the visible transcript or creating a new ACP session. | Do not advertise or execute these aliases through ACP. Session creation remains client-initiated. |
+| `/new` and `/clear` | Model history is emptied without clearing the visible transcript or creating a new ACP session. | Keep these commands hidden from ACP advertisement. The ACP client owns creation through `session/new`. A typed command resolves through the standard command registry to local guidance and `end_turn`, without inference or state mutation. |
 | `/model` | The model changes in the backend, but the ACP current-model control remains stale. Slash-command arguments have no searchable model completion. | Route slash selection and the ACP model selector through one setter. Publish the resulting full config-option snapshot. Use the ACP model config option for search and selection. |
 | `/btw` | The command does not behave like the TUI side-question feature. | Run one isolated provider request over copied history, without tools or primary-history mutation, and stream the answer through the active ACP prompt. |
 | `/yolo` | Permission behavior changes without a client indicator. | Expose and update a session option in ACP's `mode` category. |
@@ -61,11 +73,13 @@ This loss should not be fixed by adding a large generic `CommandEffect` union to
 
 `maki-acp/src/methods.rs::model_config_option` builds a select option with ID `model` and category `SessionConfigOptionCategory::Model`.
 
-`maki-acp/src/server.rs` includes that option in new-session and load-session responses. Model discovery also emits `ConfigOptionUpdate`. Direct `session/set_config_option` requests update the model and return a refreshed model option.
+`maki-acp/src/server.rs` includes that option in new-session and load-session responses. Model discovery also emits `ConfigOptionUpdate`. `session/set_config_option`, `/model`, and SDK `set_model` must use the same coordinator and return a refreshed model option.
 
 The missing confirmed behavior is the opposite direction: `/model` calls `SessionCommandHost::SetModel`, mutates `SessionCommandState`, and returns `Completed`. The ACP server does not emit a `ConfigOptionUpdate` for that path.
 
-The model options are therefore not wholly absent from the wire. If Zed still shows no model selector during the next test, capture the initial response and discovery updates before changing the schema. Slash-command metadata supports an unstructured argument hint, not a searchable list of argument values. Search belongs in the ACP model config option.
+The coordinator must validate and persist model changes, apply dependent changes such as Fast, return persistence or validation errors, and publish only after a successful state transition. A failed transition must not publish a misleading snapshot.
+
+When a headless session wakes, model and dependent capability state must refresh before controls are constructed or served. The model options are therefore not wholly absent from the wire. If Zed still shows no model selector during follow-up verification, capture the initial response and discovery updates before changing the schema. Slash-command metadata supports an unstructured argument hint, not a searchable list of argument values. Search belongs in the ACP model config option.
 
 ### `/new` resets history inside the existing ACP session
 
@@ -130,15 +144,15 @@ Several config options can share the `mode` category. Client layout is client-de
 
 ## Confirmed decisions
 
-### Do not expose `/new` or `/clear` through ACP
+### Keep ACP session replacement client-initiated
 
-ACP session creation is client-initiated. A command running inside `session/prompt` cannot faithfully create and switch to a replacement client session.
+ACP client `session/new` owns session creation. A command running inside `session/prompt` cannot faithfully create and switch to a replacement client session.
 
-Remove `/new` and `/clear` from ACP advertisement and ACP command dispatch. A manually typed unavailable command must not reset model history. It should follow the established unavailable-command policy, which currently forwards unknown or unavailable slash-prefixed text literally.
+Keep `/new` and `/clear` hidden from ACP advertisement. Resolve hidden entries through the standard command registry to local guidance that directs the client to `session/new`, then return `end_turn`. This path must not invoke provider inference or mutate model history, session options, session state, or the active session ID.
 
-Do not add a Zed-specific transcript-clearing extension. Do not continue resetting hidden model context while leaving the transcript intact.
+Do not add a Zed-specific transcript-clearing extension. Do not reset hidden model context while leaving the transcript intact.
 
-The capability model should distinguish session compaction from session replacement. The current broad `SessionControl` capability groups `/compact` and `/new` even though ACP can represent only the former. Prefer a capability or availability policy that expresses the semantic distinction instead of filtering command names in `maki-acp`.
+The capability model should distinguish session compaction from session replacement. The current broad `SessionControl` capability groups `/compact` and `/new` even though ACP can represent only the former. Express the semantic distinction through capability or availability policy and standard registry resolution rather than an ACP-only command-name filter.
 
 ### Keep slash commands and selectors over the same state
 
@@ -254,6 +268,8 @@ SessionOptionSnapshot
   ordered full set of definitions and current values
 ```
 
+Use a per-session coordinator as the serialized state-application and notification boundary. Slash commands, ACP config requests, SDK `set_model`, headless wake refresh, and plugin changes enter that coordinator. It applies durable state and dependent values before publishing one ordered full snapshot.
+
 The registry needs these operations:
 
 - Register or replace an option by stable ID.
@@ -262,9 +278,9 @@ The registry needs these operations:
 - Set a value explicitly and return a domain error.
 - Notify watchers after a successful state or definition change.
 
-The registry should publish only committed state. If a plugin callback fails, keep the old value and do not publish a misleading snapshot.
+The registry should publish only committed state. If a plugin callback or persistence operation fails, keep or restore the old value and do not publish a misleading snapshot.
 
-ACP adapts each snapshot to `SessionConfigOption`. New-session and load-session responses include the initial snapshot. A watcher emits `ConfigOptionUpdate` after slash-command changes, direct selector changes, model discovery, plugin registration, plugin removal, and dependent changes such as Fast being cleared by a model change.
+ACP adapts each snapshot to `SessionConfigOption`. New-session and load-session responses include the initial snapshot. A watcher emits `ConfigOptionUpdate` after slash-command changes, direct selector changes, SDK `set_model`, model discovery, plugin registration, plugin removal, and dependent changes such as Fast being cleared by a model change.
 
 The TUI does not need to copy ACP presentation. It must use the same underlying setters for slash commands and existing controls so frontend state cannot diverge.
 
@@ -359,10 +375,10 @@ The underlying setters must be shared. A new generic TUI option selector is opti
 ## Implementation sequence
 
 1. Start a new branch from current `mistress`. Confirm that the command-registry work is present and that no projection implementation from this investigation exists.
-2. Add regression tests that capture the current failures before changing architecture. Include `/new` not being ACP-dispatchable, `/model` updating the selector, and state options sharing setters.
-3. Split command capabilities or availability so `/compact` remains portable while `/new` and `/clear` are omitted. Verify a manually typed `/new` cannot clear history.
-4. Design and implement the per-session option registry with explicit setters for Model, YOLO, Fast, and Workflow. Make model-dependent Fast changes transactional and observable.
-5. Adapt ACP session creation, loading, direct config setting, SDK `set_model`, model discovery, and option watching to full ordered snapshots. Refresh model state after headless wake and before controls are constructed or served. Remove the model-only direct mutation path.
+2. Add regression tests that capture the current failures before changing architecture. Include hidden `/new` and `/clear` registry resolution, `/model` updating the selector, and state options sharing setters.
+3. Keep `/compact` portable while `/new` and `/clear` remain hidden from ACP advertisement. Resolve typed hidden commands to local guidance and `end_turn` without inference, history mutation, or session mutation. Preserve TUI behavior.
+4. Design and implement the per-session option registry and serialized coordinator with explicit setters for Model, YOLO, Fast, and Workflow. Make model-dependent Fast changes transactional and observable.
+5. Adapt ACP session creation, loading, direct config setting, SDK `set_model`, model discovery, and option watching to full ordered snapshots. Refresh model state after headless wake and before controls are constructed or served. Remove model-only direct mutation paths.
 6. Add the Lua session-option registration primitive. Migrate Bash auto mode and `/automode` to it. Cover plugin registration, replacement, removal, callback failure, and reload.
 7. Change `/cd` to return its canonical path. Share the live path with ACP translation and emit visible confirmation.
 8. Add compaction progress translation and immediate session-store persistence. Verify failure and cancellation behavior.
@@ -377,7 +393,8 @@ The option-registry design should be reviewed before steps 4 through 6 become a 
 ### Command availability
 
 - ACP initial and dynamic command projections omit `/new` and `/clear` while retaining `/compact`.
-- A literal `/new` sent through ACP does not mutate primary history or replace the session ID.
+- A literal `/new` or `/clear` sent through ACP resolves through the standard command registry to local guidance and `end_turn` without provider inference, history mutation, or session mutation.
+- Session creation remains owned by the ACP client through `session/new`.
 - TUI availability and behavior for `/new` and `/clear` remain unchanged.
 
 ### Session options
@@ -387,7 +404,7 @@ The option-registry design should be reviewed before steps 4 through 6 become a 
 - The coordinator serializes option application and emits one full `ConfigOptionUpdate` after each successful committed change, before the final `PromptResponse`.
 - `/model <spec>` emits a full config-option update with the selected model before prompt completion.
 - A model change that disables Fast publishes both resulting values in one coherent snapshot.
-- Invalid option IDs, invalid values, policy-rejected models, and unsupported Fast requests leave state unchanged and return useful errors.
+- Invalid option IDs, invalid values, policy-rejected models, persistence failures, and unsupported Fast requests leave state unchanged and return useful errors.
 - SDK `set_model` persists through the coordinator, applies dependent state, and returns coordinator errors without a partial notification.
 - After headless wake, model state and dependent capabilities refresh before controls are constructed or served.
 - Model discovery preserves the current model and all non-model options while expanding the model values.

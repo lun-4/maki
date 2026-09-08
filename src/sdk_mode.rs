@@ -981,6 +981,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                                 maki_commands::FrontendFeedback::WorkingDirectory(path) => {
                                     format!("Working directory: {}", path.display())
                                 }
+                                maki_commands::FrontendFeedback::Text(text) => text.to_string(),
                             };
                             emit_command_result(&writer, &shared, false, result)?
                         }
