@@ -362,6 +362,38 @@ async fn persist_history(session_id: MakiId, history: &[Message]) -> Result<(), 
         .map_err(|error| error.to_string())
 }
 
+enum InteractiveWake {
+    Input(AgentInput),
+    Control(InteractiveControl),
+}
+
+async fn receive_wake_and_refresh(
+    input_rx: &Receiver<AgentInput>,
+    control_rx: &Receiver<InteractiveControl>,
+    shared_model: &crate::SharedModel,
+    provider: &mut Arc<dyn Provider>,
+    model: &mut Model,
+) -> Option<InteractiveWake> {
+    let wake = if let Ok(control) = control_rx.try_recv() {
+        Some(InteractiveWake::Control(control))
+    } else {
+        future::or(
+            async { input_rx.recv_async().await.map(InteractiveWake::Input) },
+            async { control_rx.recv_async().await.map(InteractiveWake::Control) },
+        )
+        .await
+        .ok()
+    };
+    use crate::ModelSource;
+    if let Some((current_provider, current_model)) = shared_model.current()
+        && current_model.spec() != model.spec()
+    {
+        *provider = current_provider;
+        *model = current_model;
+    }
+    wake
+}
+
 async fn apply_interactive_control(
     control: InteractiveControl,
     context: InteractiveControlContext<'_>,
@@ -519,40 +551,21 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
             let agent_id = AgentId::generate();
             let mut run_id: u64 = 0;
 
-            enum Wake {
-                Input(AgentInput),
-                Control(InteractiveControl),
-            }
-
             loop {
-                // The shared source is the authority. A coordinator model
-                // change installs there without passing through this loop, so
-                // the locals have to be refreshed from it or everything built
-                // here -- the tool schema, the system prompt, compaction, an
-                // isolated turn -- keeps using the model the session started
-                // on.
-                {
-                    use crate::ModelSource;
-                    if let Some((current_provider, current_model)) = shared_model.current()
-                        && current_model.spec() != model.spec()
-                    {
-                        provider = current_provider;
-                        model = current_model;
-                    }
-                }
-                let wake = if let Ok(control) = control_rx.try_recv() {
-                    Some(Wake::Control(control))
-                } else {
-                    future::or(
-                        async { input_rx.recv_async().await.map(Wake::Input) },
-                        async { control_rx.recv_async().await.map(Wake::Control) },
-                    )
-                    .await
-                    .ok()
-                };
+                let wake = receive_wake_and_refresh(
+                    &input_rx,
+                    &control_rx,
+                    &shared_model,
+                    &mut provider,
+                    &mut model,
+                )
+                .await;
                 let input = match wake {
-                    Some(Wake::Input(input)) => input,
-                    Some(Wake::Control(InteractiveControl::ChangeDirectory { path, reply })) => {
+                    Some(InteractiveWake::Input(input)) => input,
+                    Some(InteractiveWake::Control(InteractiveControl::ChangeDirectory {
+                        path,
+                        reply,
+                    })) => {
                         let result = path
                             .canonicalize()
                             .and_then(|canonical| {
@@ -573,7 +586,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         let _ = reply.send(result);
                         continue;
                     }
-                    Some(Wake::Control(InteractiveControl::ManualCompaction {
+                    Some(InteractiveWake::Control(InteractiveControl::ManualCompaction {
                         output,
                         cancel,
                         lease_committer,
@@ -615,7 +628,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         let _ = output.send(terminal);
                         continue;
                     }
-                    Some(Wake::Control(InteractiveControl::IsolatedTurn {
+                    Some(InteractiveWake::Control(InteractiveControl::IsolatedTurn {
                         question,
                         images,
                         output,
@@ -654,7 +667,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         .await;
                         continue;
                     }
-                    Some(Wake::Control(control)) => {
+                    Some(InteractiveWake::Control(control)) => {
                         apply_interactive_control(
                             control,
                             InteractiveControlContext {
@@ -944,6 +957,70 @@ mod tests {
 
         drop(handle.task);
         let _ = futures_lite::future::block_on(coordinator.close());
+    }
+
+    struct TestProvider;
+
+    impl maki_providers::provider::Provider for TestProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<maki_providers::ProviderEvent>,
+            _: maki_providers::RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<
+            'a,
+            Result<maki_providers::StreamResponse, crate::AgentError>,
+        > {
+            Box::pin(std::future::pending())
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, crate::AgentError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[test]
+    fn wake_refreshes_model_after_idle_wait() {
+        smol::block_on(async {
+            let (_input_tx, input_rx) = flume::unbounded();
+            let (control_tx, control_rx) = flume::unbounded();
+            let initial_model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+            let adopted_model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+            let adopted_provider: Arc<dyn Provider> = Arc::new(TestProvider);
+            let mut provider: Arc<dyn Provider> = Arc::new(TestProvider);
+            let mut model = initial_model;
+            let shared_model = crate::SharedModel::default();
+            let mut wake = Box::pin(receive_wake_and_refresh(
+                &input_rx,
+                &control_rx,
+                &shared_model,
+                &mut provider,
+                &mut model,
+            ));
+            assert!(futures_lite::future::poll_once(&mut wake).await.is_none());
+            shared_model.install(Arc::clone(&adopted_provider), adopted_model.clone());
+            control_tx
+                .send(InteractiveControl::Reset(flume::bounded(1).0))
+                .unwrap();
+            let got_control = matches!(
+                wake.as_mut().await,
+                Some(InteractiveWake::Control(InteractiveControl::Reset(_)))
+            );
+            drop(wake);
+
+            assert!(got_control);
+            assert_eq!(model.spec(), adopted_model.spec());
+            assert!(Arc::ptr_eq(&provider, &adopted_provider));
+        });
     }
 
     #[test]
