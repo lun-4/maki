@@ -141,7 +141,6 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
             &mode,
             &instructions.text,
             &params.prompt_slots,
-            &params.model,
         )
     });
     if let Some(append) = &params.append_system_prompt {
@@ -644,7 +643,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                                     &AgentMode::Build,
                                     &instructions.text,
                                     &params.prompt_slots,
-                                    &model,
                                 )
                             });
                         if let Some(append) = &params.append_system_prompt {
@@ -778,7 +776,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         &input.mode,
                         &turn_instructions.text,
                         &params.prompt_slots,
-                        &model,
                     )
                 });
                 if let Some(append) = &params.append_system_prompt {

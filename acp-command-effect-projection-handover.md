@@ -350,6 +350,8 @@ For `/cd`, choose whether confirmation uses an agent-message chunk or another vi
 
 The TUI builds a Build-mode system prompt from live prompt slots and publishes it through `btw_system`. The headless ACP runtime does not currently expose the same prepared value. The isolated-turn service needs a frontend-neutral way to obtain equivalent system text without coupling ACP to TUI state.
 
+The fixed generated prompt must not contain mutable model identity. Remove model identity from that prompt instead of adding mutable identity or a prompt-rebuild flag. The isolated-turn request still receives the current provider and model as execution inputs.
+
 ### TUI adoption scope
 
 The underlying setters must be shared. A new generic TUI option selector is optional unless needed by the implementation. Do not delay ACP correctness by redesigning the TUI settings interface.
@@ -364,7 +366,7 @@ The underlying setters must be shared. A new generic TUI option selector is opti
 6. Add the Lua session-option registration primitive. Migrate Bash auto mode and `/automode` to it. Cover plugin registration, replacement, removal, callback failure, and reload.
 7. Change `/cd` to return its canonical path. Share the live path with ACP translation and emit visible confirmation.
 8. Add compaction progress translation and immediate session-store persistence. Verify failure and cancellation behavior.
-9. Extract frontend-neutral isolated-turn execution from the TUI `/btw` path. Route ACP `/btw` through it and preserve images, cancellation, streaming, and history isolation.
+9. Extract frontend-neutral isolated-turn execution from the TUI `/btw` path. Route ACP `/btw` through it and preserve images, cancellation, streaming, history isolation, and fixed-prompt model-identity rules.
 10. Update ACP, command, Lua API, and headless documentation. State the client limitations for transcript clearing and displayed working-directory changes.
 11. Run targeted crate tests during each step, then run the repository-wide checks from `AGENTS.md`.
 
@@ -414,6 +416,7 @@ The option-registry design should be reviewed before steps 4 through 6 become a 
 - `/btw` supplies copied primary history and closes dangling tool calls only in the copy.
 - The provider request has an empty tool list.
 - The current provider, model, system text, and image attachments are used.
+- The fixed generated prompt contains no mutable model identity, and no extra prompt-rebuild state is added.
 - Text streams through the active ACP prompt and the prompt completes on provider completion.
 - Provider failure and cancellation terminate the ACP prompt cleanly.
 - Primary history is byte-for-byte unchanged after success, failure, and cancellation.
@@ -423,7 +426,7 @@ The option-registry design should be reviewed before steps 4 through 6 become a 
 
 - Existing registry precedence, custom commands, MCP prompts, image preservation, unknown slash forwarding, and stale-target protections continue to pass.
 - Existing TUI behavior for model changes, toggles, `/cd`, `/compact`, `/new`, and `/btw` continues to pass.
-- A recorded Zed test verifies option visibility, option updates after slash commands, compaction progress, `/cd` confirmation, and isolated `/btw` output.
+- A follow-up Zed test records option visibility, option updates after slash commands, compaction progress, `/cd` confirmation, and isolated `/btw` output. No Zed result is claimed until that test runs.
 
 ## Likely code paths
 

@@ -151,7 +151,6 @@ impl TuiActorBackend {
         &self,
         mode: &maki_agent::AgentMode,
         prompt_slots: &maki_agent::prompt::ResolvedSlots,
-        model: &Model,
     ) -> String {
         let mut system = self.system_prompt.override_text.clone().unwrap_or_else(|| {
             maki_agent::agent::build_system_prompt(
@@ -160,7 +159,6 @@ impl TuiActorBackend {
                 mode,
                 &self.instructions.text,
                 prompt_slots,
-                model,
             )
         });
         if let Some(append) = &self.system_prompt.append_text {
@@ -243,7 +241,7 @@ impl TuiActorBackend {
         }
 
         let prompt_slots = self.lua_handle.collect_prompt_slots_async().await;
-        let system = self.build_system_with(&input.mode, &prompt_slots, &slot.model);
+        let system = self.build_system_with(&input.mode, &prompt_slots);
         self.publish_btw_system(&prompt_slots);
         self.tools = self.build_tools(&slot.model, input.workflow);
         let tools = self.tools.clone();
@@ -420,9 +418,7 @@ impl TuiActorBackend {
     /// Always pins `Build` mode: btw runs no tools, so Plan-mode constraints
     /// would only confuse the model. Everything else matches the live prompt.
     fn publish_btw_system(&mut self, prompt_slots: &maki_agent::prompt::ResolvedSlots) {
-        let slot = self.model_slot.load();
-        let system =
-            self.build_system_with(&maki_agent::AgentMode::Build, prompt_slots, &slot.model);
+        let system = self.build_system_with(&maki_agent::AgentMode::Build, prompt_slots);
         self.btw_system.store(Arc::new(system));
     }
 
