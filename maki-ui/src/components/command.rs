@@ -695,6 +695,8 @@ impl CommandPalette {
         self.command_query = request.query.clone();
         if let Some((input, cursor, mode)) = self.latest_argument_context.clone() {
             let _ = self.sync_arguments(&input, cursor, &mode);
+        } else {
+            self.cancel_arguments();
         }
         Dirty::YES
     }
@@ -1352,6 +1354,45 @@ mod tests {
                 .as_ref(),
             "Second"
         );
+    }
+
+    #[test]
+    fn settled_command_without_argument_context_clears_stale_rows() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        producer
+            .replace(vec![
+                registration("/deploy", "Deploy"),
+                registration("/plain", "Plain"),
+            ])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
+        let mut palette = CommandPalette::new(registry, target);
+
+        palette.sync("/deploy a");
+        settle(&mut palette);
+        palette.set_argument_completion(
+            (8, 9),
+            maki_lua::CommandArgumentItem {
+                label: "old-result".into(),
+                insertion: "old-result".into(),
+                description: None,
+            },
+        );
+        assert!(!palette.argument_items.is_empty());
+
+        palette.sync("/plain value");
+        settle(&mut palette);
+
+        assert!(palette.argument_items.is_empty());
+        assert!(palette.argument_range.is_none());
+        assert!(matches!(
+            palette.handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                "/plain value"
+            ),
+            CommandAction::Execute(confirmed) if confirmed.command.invoked_name() == "/plain"
+        ));
     }
 
     #[test]
