@@ -281,7 +281,8 @@ impl CommandPalette {
 
     pub fn is_active(&self) -> bool {
         self.accepted_argument_input.is_none()
-            && (!self.filtered.is_empty()
+            && (self.command_publication.is_pending()
+                || !self.filtered.is_empty()
                 || !self.argument_items.is_empty()
                 || self.completion_session.is_some())
     }
@@ -665,7 +666,10 @@ impl CommandPalette {
         let status = self.nucleo.tick(0);
         self.command_matching = status.running;
         let Some((generation, request)) = self.pending_command.clone() else {
-            if status.changed && !self.command_query.is_empty() {
+            if status.changed
+                && self.command_publication.can_accept()
+                && !self.command_query.is_empty()
+            {
                 let query = self.command_query.clone();
                 self.refresh_matches(&query);
                 return Dirty::YES;
@@ -1134,10 +1138,12 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
+    use test_case::test_case;
 
     use super::{
-        ArgumentMatch, CaseMatching, CommandPalette, CompletionMatchOptions, Normalization,
-        argument_at_cursor, argument_visible_rows, command_args, completion_match,
+        ArgumentMatch, CaseMatching, CommandAction, CommandPalette, CommandRequest,
+        CompletionMatchOptions, Normalization, argument_at_cursor, argument_visible_rows,
+        command_args, completion_match,
     };
 
     struct Noop;
@@ -1221,6 +1227,68 @@ mod tests {
         assert!(palette.is_active());
 
         palette.sync("//model");
+        assert!(!palette.is_active());
+        assert!(palette.filtered.is_empty());
+    }
+
+    #[test_case(KeyCode::Enter ; "enter")]
+    #[test_case(KeyCode::Tab ; "tab")]
+    fn pending_command_without_published_rows_consumes_submission(key_code: KeyCode) {
+        let registry = CommandRegistry::new();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
+        let mut palette = CommandPalette::new(registry, target);
+        let request = CommandRequest {
+            query: "model".into(),
+            registry_generation: palette.snapshot.generation(),
+            argument_count: 0,
+        };
+        let generation = palette.command_publication.begin(request.clone());
+        palette.pending_command = Some((generation, request));
+
+        assert!(matches!(
+            palette.handle_key(KeyEvent::new(key_code, KeyModifiers::NONE), "/model"),
+            CommandAction::Consumed
+        ));
+    }
+
+    #[test_case(true ; "dismissed")]
+    #[test_case(false ; "leading_slash_removed")]
+    fn late_matcher_refresh_does_not_reopen_cleared_palette(close: bool) {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        producer
+            .replace(vec![registration("/model", "Switch model")])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
+        let mut palette = CommandPalette::new(registry, target);
+
+        palette.sync("/model");
+        settle(&mut palette);
+        assert!(palette.is_active());
+        palette
+            .nucleo
+            .pattern
+            .reparse(0, "mod", CaseMatching::Ignore, Normalization::Smart, false);
+        palette.command_matching = true;
+        if close {
+            palette.close();
+        } else {
+            palette.sync("model");
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while palette.command_matching
+            || palette.nucleo.snapshot().pattern().column_pattern(0).atoms
+                != palette.nucleo.pattern.column_pattern(0).atoms
+        {
+            let _ = palette.tick();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "command matcher did not settle"
+            );
+            std::thread::yield_now();
+        }
+
         assert!(!palette.is_active());
         assert!(palette.filtered.is_empty());
     }
