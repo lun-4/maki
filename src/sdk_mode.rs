@@ -531,6 +531,19 @@ enum CommandRoute {
     },
 }
 
+async fn route_model(
+    tx: &Sender<CommandRoute>,
+    argument: String,
+) -> Result<HostResponse, CommandError> {
+    let (response, response_rx) = flume::bounded(1);
+    tx.send(CommandRoute::Model { argument, response })
+        .map_err(|_| CommandError::StaleTarget)?;
+    response_rx
+        .recv_async()
+        .await
+        .map_err(|_| CommandError::StaleTarget)?
+}
+
 struct SdkCommandHost {
     tx: Sender<CommandRoute>,
     model_specs: Arc<[Arc<str>]>,
@@ -549,16 +562,7 @@ impl CommandHost for SdkCommandHost {
                     maki_commands::HostContextResponse::Unavailable,
                 )),
                 HostRequest::Builtin(BuiltinOperation::SetModel { spec }) => {
-                    let (response, response_rx) = flume::bounded(1);
-                    tx.send(CommandRoute::Model {
-                        argument: spec.to_string(),
-                        response,
-                    })
-                    .map_err(|_| CommandError::StaleTarget)?;
-                    response_rx
-                        .recv_async()
-                        .await
-                        .map_err(|_| CommandError::StaleTarget)?
+                    route_model(&tx, spec.to_string()).await
                 }
                 HostRequest::Builtin(BuiltinOperation::QuickQuestion {
                     question,
@@ -588,6 +592,7 @@ fn sdk_capabilities() -> TargetCapabilities {
 struct SdkCommands {
     registry: CommandRegistry,
     target: TargetHandle,
+    route_tx: Sender<CommandRoute>,
     route_rx: Receiver<CommandRoute>,
     _standard_commands: StandardCommands,
 }
@@ -611,6 +616,7 @@ impl SdkCommands {
         Ok(Self {
             target,
             registry,
+            route_tx,
             route_rx,
             _standard_commands: standard_commands,
         })
@@ -1381,9 +1387,21 @@ fn handle_control_request(
         InboundControlRequestType::SetModel => {
             match resolve_set_model(cr.request.extra.get("model"), startup_model, model_policy) {
                 Some(model) => {
-                    let _ = handle.model_tx.send(model.clone());
-                    shared.lock().unwrap().model = model;
-                    writer.emit_control_response(&cr.request_id, ok, None)
+                    match smol::block_on(route_model(&commands.route_tx, model.spec())) {
+                        Ok(HostResponse::Completed) => {
+                            writer.emit_control_response(&cr.request_id, ok, None)
+                        }
+                        Ok(_) => writer.emit_control_response(
+                            &cr.request_id,
+                            None,
+                            Some("model change returned an unexpected response".into()),
+                        ),
+                        Err(error) => writer.emit_control_response(
+                            &cr.request_id,
+                            None,
+                            Some(error.to_string()),
+                        ),
+                    }
                 }
                 None => writer.emit_control_response(
                     &cr.request_id,
@@ -1711,6 +1729,8 @@ mod tests {
     use test_case::test_case;
 
     const REJECTED_ATTACHMENT: &str = "command rejected attachment";
+    const STARTUP_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+    const TARGET_MODEL: &str = "openai/gpt-5";
 
     struct OutcomeBehavior(CommandOutcome);
 
@@ -1927,6 +1947,96 @@ mod tests {
             smol::block_on(dispatch),
             InputDispatch::Dispatched(CommandOutcome::Completed)
         ));
+    }
+
+    #[test]
+    fn sdk_model_route_updates_coordinator_state_and_checkpoint() {
+        use std::sync::Mutex as StdMutex;
+
+        let checkpointed = Arc::new(StdMutex::new(Vec::new()));
+        let checkpointed_clone = Arc::clone(&checkpointed);
+        let id = MakiId::generate();
+        let checkpoint: Arc<
+            dyn maki_storage::checkpoint::CheckpointWriter<
+                    maki_agent::session_coordinator::SessionCheckpoint,
+                >,
+        > = Arc::new(
+            move |request: maki_storage::checkpoint::CheckpointRequest<
+                maki_agent::session_coordinator::SessionCheckpoint,
+            >| {
+                let checkpointed = Arc::clone(&checkpointed_clone);
+                Box::pin(async move {
+                    checkpointed.lock().unwrap().push(request.snapshot);
+                    Ok(maki_storage::checkpoint::CheckpointAck {
+                        session_id: request.session_id,
+                        version: request.version,
+                    })
+                }) as maki_storage::checkpoint::CheckpointFuture
+            },
+        );
+        let coordinator = maki_agent::session_coordinator::SessionCoordinatorHandle::register(
+            maki_agent::session_coordinator::SessionCoordinatorParams {
+                session_id: id,
+                catalog: Default::default(),
+                definitions: maki_agent::session_coordinator::builtin_option_definitions(
+                    STARTUP_MODEL,
+                    [Arc::from(STARTUP_MODEL), Arc::from(TARGET_MODEL)],
+                    false,
+                    true,
+                    false,
+                    maki_agent::ThinkingConfig::Off,
+                ),
+                persisted_options: Default::default(),
+                history: Vec::new(),
+                model: Arc::from(STARTUP_MODEL),
+                cwd: PathBuf::from("/project"),
+                model_policy: Arc::new(ModelPolicy::default()),
+                model_adopter: Arc::new(|_: Model| {
+                    Box::pin(async { Ok(()) })
+                        as maki_agent::session_coordinator::ModelAdoptionFuture
+                }),
+                directory_adopter: Arc::new(|path: PathBuf| {
+                    Box::pin(async move { Ok(path) })
+                        as maki_agent::session_coordinator::DirectoryAdoptionFuture
+                }),
+                checkpoint,
+                mailbox: maki_agent::SessionMailbox::new(id),
+            },
+        )
+        .unwrap();
+        let shared = Arc::new(Mutex::new(Shared {
+            model: Model::from_spec(STARTUP_MODEL).unwrap(),
+            permission_mode: PermissionMode::Default,
+            turn_start: Instant::now(),
+            pending: HashSet::new(),
+        }));
+        let (route_tx, route_rx) = flume::unbounded();
+        let driver = spawn_command_driver(CommandDriverParams {
+            route_rx,
+            coordinator: coordinator.clone(),
+            shared: Arc::clone(&shared),
+        });
+
+        let result = smol::block_on(route_model(&route_tx, "not-a-model".into()));
+        assert!(matches!(result, Err(CommandError::Producer(_))));
+        assert_eq!(coordinator.read().model().as_ref(), STARTUP_MODEL);
+        assert_eq!(shared.lock().unwrap().model.spec(), STARTUP_MODEL);
+        assert!(checkpointed.lock().unwrap().is_empty());
+
+        let result = smol::block_on(route_model(&route_tx, TARGET_MODEL.into()));
+        assert!(matches!(result, Ok(HostResponse::Completed)));
+        assert_eq!(coordinator.read().model().as_ref(), TARGET_MODEL);
+        assert_eq!(
+            coordinator.read().options().options[0]
+                .current_value
+                .as_ref(),
+            TARGET_MODEL
+        );
+        assert_eq!(shared.lock().unwrap().model.spec(), TARGET_MODEL);
+        assert_eq!(checkpointed.lock().unwrap()[0].model.as_ref(), TARGET_MODEL);
+
+        smol::block_on(driver.cancel());
+        smol::block_on(coordinator.close()).unwrap();
     }
 
     #[test]

@@ -360,7 +360,7 @@ The underlying setters must be shared. A new generic TUI option selector is opti
 2. Add regression tests that capture the current failures before changing architecture. Include `/new` not being ACP-dispatchable, `/model` updating the selector, and state options sharing setters.
 3. Split command capabilities or availability so `/compact` remains portable while `/new` and `/clear` are omitted. Verify a manually typed `/new` cannot clear history.
 4. Design and implement the per-session option registry with explicit setters for Model, YOLO, Fast, and Workflow. Make model-dependent Fast changes transactional and observable.
-5. Adapt ACP session creation, loading, direct config setting, model discovery, and option watching to full ordered snapshots. Refresh model state after headless wake and before controls are constructed or served. Remove the model-only direct mutation path.
+5. Adapt ACP session creation, loading, direct config setting, SDK `set_model`, model discovery, and option watching to full ordered snapshots. Refresh model state after headless wake and before controls are constructed or served. Remove the model-only direct mutation path.
 6. Add the Lua session-option registration primitive. Migrate Bash auto mode and `/automode` to it. Cover plugin registration, replacement, removal, callback failure, and reload.
 7. Change `/cd` to return its canonical path. Share the live path with ACP translation and emit visible confirmation.
 8. Add compaction progress translation and immediate session-store persistence. Verify failure and cancellation behavior.
@@ -386,6 +386,7 @@ The option-registry design should be reviewed before steps 4 through 6 become a 
 - `/model <spec>` emits a full config-option update with the selected model before prompt completion.
 - A model change that disables Fast publishes both resulting values in one coherent snapshot.
 - Invalid option IDs, invalid values, policy-rejected models, and unsupported Fast requests leave state unchanged and return useful errors.
+- SDK `set_model` persists through the coordinator, applies dependent state, and returns coordinator errors without a partial notification.
 - After headless wake, model state and dependent capabilities refresh before controls are constructed or served.
 - Model discovery preserves the current model and all non-model options while expanding the model values.
 - Plugin option registration, replacement, removal, and failed callbacks publish only valid full snapshots.
