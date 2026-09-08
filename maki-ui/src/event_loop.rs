@@ -1750,7 +1750,7 @@ impl<'t> EventLoop<'t> {
     /// elsewhere, is rejected.
     fn focus_session(&mut self, id: MakiId) -> Result<(), String> {
         if let Some(i) = self.position(id) {
-            self.focused = i;
+            self.set_focused(i);
             return Ok(());
         }
         let session = AppSession::load(id, &self.ctx.storage)
