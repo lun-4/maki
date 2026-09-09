@@ -353,6 +353,39 @@ struct InteractiveControlContext<'a> {
     config: &'a AgentConfig,
 }
 
+/// Finish a manual compaction: persist the compacted history, and only then
+/// report success. A compaction that reported `Completed` before the write
+/// landed would promise durability it does not have, so persistence failure --
+/// like compaction failure -- rolls the in-memory history back to `previous`
+/// and reports the error instead. A failed compaction is never persisted.
+async fn settle_manual_compaction<P, F>(
+    compacted: Result<(), String>,
+    history: &mut History,
+    previous: Vec<Message>,
+    cancel: &CancelToken,
+    persist: P,
+) -> ManualCompactionEvent
+where
+    P: FnOnce(Vec<Message>) -> F,
+    F: Future<Output = Result<(), String>>,
+{
+    let result = match compacted {
+        Ok(()) => persist(history.as_slice().to_vec()).await,
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(()) => ManualCompactionEvent::Completed,
+        Err(_) if cancel.is_cancelled() => {
+            history.replace(previous);
+            ManualCompactionEvent::Cancelled
+        }
+        Err(error) => {
+            history.replace(previous);
+            ManualCompactionEvent::Failed(error)
+        }
+    }
+}
+
 async fn persist_history(session_id: MakiId, history: &[Message]) -> Result<(), String> {
     crate::session_coordinator::SessionCoordinatorHandle::resolve(session_id)
         .map_err(|error| error.to_string())?
@@ -603,27 +636,22 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         )
                         .await
                         .map_err(|error| error.to_string());
-                        let result = match result {
-                            Ok(()) => match lease_committer {
-                                Some(committer) => committer
-                                    .commit_history(history.as_slice().to_vec())
-                                    .await
-                                    .map_err(|error| error.to_string()),
-                                None => persist_history(session_id, history.as_slice()).await,
+                        let terminal = settle_manual_compaction(
+                            result,
+                            &mut history,
+                            previous,
+                            &cancel,
+                            |compacted| async move {
+                                match lease_committer {
+                                    Some(committer) => committer
+                                        .commit_history(compacted)
+                                        .await
+                                        .map_err(|error| error.to_string()),
+                                    None => persist_history(session_id, &compacted).await,
+                                }
                             },
-                            Err(error) => Err(error),
-                        };
-                        let terminal = match result {
-                            Ok(()) => ManualCompactionEvent::Completed,
-                            Err(_) if cancel.is_cancelled() => {
-                                history.replace(previous);
-                                ManualCompactionEvent::Cancelled
-                            }
-                            Err(error) => {
-                                history.replace(previous);
-                                ManualCompactionEvent::Failed(error)
-                            }
-                        };
+                        )
+                        .await;
                         let _ = output.send(terminal);
                         continue;
                     }
@@ -954,6 +982,153 @@ mod tests {
 
         drop(handle.task);
         let _ = futures_lite::future::block_on(coordinator.close());
+    }
+
+    /// `/compact` reports success only when the compacted history is durable.
+    /// These pin the order: nothing reports `Completed` unless the persist step
+    /// ran first and returned `Ok`, and every other path rolls the in-memory
+    /// history back to what it was before the compaction.
+    fn as_json(messages: &[Message]) -> Value {
+        serde_json::to_value(messages).unwrap()
+    }
+
+    type PersistLog = Arc<std::sync::Mutex<Vec<Vec<Message>>>>;
+
+    struct CompactionFixture {
+        history: History,
+        previous: Vec<Message>,
+        persisted: PersistLog,
+    }
+
+    fn compaction_fixture() -> CompactionFixture {
+        CompactionFixture {
+            history: History::new(vec![Message::user("compacted".into())]),
+            previous: vec![Message::user("original".into())],
+            persisted: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    #[test]
+    fn manual_compaction_persists_before_reporting_success() {
+        smol::block_on(async {
+            let CompactionFixture {
+                mut history,
+                previous,
+                persisted,
+            } = compaction_fixture();
+            let terminal = settle_manual_compaction(
+                Ok(()),
+                &mut history,
+                previous,
+                &CancelToken::none(),
+                |compacted| {
+                    let persisted = Arc::clone(&persisted);
+                    async move {
+                        persisted.lock().unwrap().push(compacted);
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+
+            assert_eq!(terminal, ManualCompactionEvent::Completed);
+            let persisted = persisted.lock().unwrap();
+            assert_eq!(persisted.len(), 1, "persistence must run exactly once");
+            assert_eq!(
+                as_json(&persisted[0]),
+                as_json(&[Message::user("compacted".into())]),
+                "the compacted history is what must reach persistence"
+            );
+            assert_eq!(
+                as_json(history.as_slice()),
+                as_json(&[Message::user("compacted".into())])
+            );
+        });
+    }
+
+    #[test]
+    fn failed_persistence_reports_failure_and_rolls_history_back() {
+        smol::block_on(async {
+            let CompactionFixture {
+                mut history,
+                previous,
+                ..
+            } = compaction_fixture();
+            let terminal = settle_manual_compaction(
+                Ok(()),
+                &mut history,
+                previous.clone(),
+                &CancelToken::none(),
+                |_| async { Err("save failed".to_owned()) },
+            )
+            .await;
+
+            assert_eq!(
+                terminal,
+                ManualCompactionEvent::Failed("save failed".to_owned()),
+                "a compaction nobody saved must not report success"
+            );
+            assert_eq!(as_json(history.as_slice()), as_json(&previous));
+        });
+    }
+
+    #[test]
+    fn a_failed_compaction_is_never_persisted() {
+        smol::block_on(async {
+            let CompactionFixture {
+                mut history,
+                previous,
+                persisted,
+            } = compaction_fixture();
+            let terminal = settle_manual_compaction(
+                Err("provider failed".to_owned()),
+                &mut history,
+                previous.clone(),
+                &CancelToken::none(),
+                |compacted| {
+                    let persisted = Arc::clone(&persisted);
+                    async move {
+                        persisted.lock().unwrap().push(compacted);
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+
+            assert_eq!(
+                terminal,
+                ManualCompactionEvent::Failed("provider failed".to_owned())
+            );
+            assert!(
+                persisted.lock().unwrap().is_empty(),
+                "a compaction that failed must not overwrite the saved history"
+            );
+            assert_eq!(as_json(history.as_slice()), as_json(&previous));
+        });
+    }
+
+    #[test]
+    fn cancelled_persistence_reports_cancellation_not_failure() {
+        smol::block_on(async {
+            let CompactionFixture {
+                mut history,
+                previous,
+                ..
+            } = compaction_fixture();
+            let (trigger, cancel) = CancelToken::new();
+            trigger.cancel();
+            let terminal = settle_manual_compaction(
+                Ok(()),
+                &mut history,
+                previous.clone(),
+                &cancel,
+                |_| async { Err("interrupted".to_owned()) },
+            )
+            .await;
+
+            assert_eq!(terminal, ManualCompactionEvent::Cancelled);
+            assert_eq!(as_json(history.as_slice()), as_json(&previous));
+        });
     }
 
     struct TestProvider;
