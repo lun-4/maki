@@ -32,7 +32,7 @@ Confirmed product decisions:
 ## Phase 1: Correct command availability and execution contracts
 
 1. Split `TargetCapability::SessionControl` in `maki-commands/src/spec.rs` into semantic capabilities that distinguish history compaction from session replacement. Assign `/compact` to the portable compaction capability and `/new` plus `/clear` to session replacement. Update `TargetCapabilities::ALL`, tests, and all target capability declarations.
-2. Give the TUI target both capabilities but give `maki_agent::command::portable_capabilities()` only compaction. Preserve the registry invariant that projection and dispatch use the same capability filter: ACP initial/dynamic projections omit both `/new` and `/clear`, and manually typed unavailable forms become literal input under the existing policy.
+2. Give the TUI target both capabilities but give `maki_agent::command::portable_capabilities()` only compaction. Preserve the registry invariant that projection and dispatch use the same capability filter: ACP initial/dynamic projections omit both `/new` and `/clear`, and manually typed unavailable forms follow the registry's unknown-command policy. (That policy changed under this branch: see [Merge with the slash-command parsing change](#merge-with-the-slash-command-parsing-change).)
 3. Extend `CommandOutcome`/`HostResponse` only with narrow execution distinctions required by frontends: retain local completion, retain the primary `AgentTurn`, add an explicit isolated-turn request for `/btw`, and add a typed frontend-feedback result for successful cwd changes. Do not add a generic vector or union of arbitrary command effects.
 4. Keep command metadata and dispatch in `maki-commands`; put provider-, permission-, storage-, and session-specific behavior in `maki-agent`.
 
@@ -146,7 +146,7 @@ Confirmed product decisions:
 1. Update handwritten ACP and command documentation (`site/docs/content/acp/_index.md`, `site/docs/content/commands/_index.md`) with representable effects, `/new`/`/clear` exclusion, full session-option behavior, `/cd` and transcript limitations, compaction progress, and isolated `/btw` semantics.
 2. Document the Lua registration/handle API, persistence and reload rules, explicit session targeting, collision rules, and the bundled `/options` plugin in generated Lua API/plugin documentation inputs. Regenerate docs and keep one canonical explanation per topic.
 3. Remove obsolete model-only ACP helpers, state mirrors, old Bash global state, `RESTORED_FAST`, and dead duplicated BTW provider code.
-4. Perform a recorded Zed scenario after automated tests: capture initial/load config options, slash and direct selector updates, Fast clearing on model change, `/options` TUI behavior separately, `/cd` confirmation and subsequent tool locations, compaction progress, `/new` non-advertisement/literal behavior, and isolated `/btw` output. Record that Zed’s displayed cwd and old transcript remain unchanged by protocol limitation.
+4. Perform a recorded Zed scenario after automated tests: capture initial/load config options, slash and direct selector updates, Fast clearing on model change, `/options` TUI behavior separately, `/cd` confirmation and subsequent tool locations, compaction progress, `/new` non-advertisement and its local guidance response, and isolated `/btw` output. Record that Zed’s displayed cwd and old transcript remain unchanged by protocol limitation.
 
 # Acceptance Criteria
 
@@ -162,7 +162,7 @@ Confirmed product decisions:
 - **AC.10:** Successful `/cd` canonicalizes once, updates command context, the headless agent, permission rules, persistence, and later ACP relative tool locations to the same path, and emits visible non-history feedback; failure changes none of them.
 - **AC.11:** ACP `/compact` emits attributable in-progress and completed/failed tool updates, terminates its prompt exactly once, and persists compacted history before success; reloading without a later turn uses the compacted history.
 - **AC.12:** `/btw` uses copied history, closes dangling calls only in the copy, sends current provider/model/common Build system text/images with no tools, streams through the active frontend, handles failure/cancellation, and leaves primary history byte-for-byte unchanged.
-- **AC.13:** Existing command precedence, custom Lua commands, MCP prompts, image preservation, unknown/unavailable slash forwarding, stale-target protections, TUI model/toggle/new/compact/cd/btw behavior, and session pricing/history persistence continue to pass.
+- **AC.13:** Existing command precedence, custom Lua commands, MCP prompts, image preservation, unknown/unavailable slash handling, stale-target protections, TUI model/toggle/new/compact/cd/btw behavior, and session pricing/history persistence continue to pass.
 - **AC.14:** A deterministic ACP server/session harness can inject provider/runtime events and cancellation, collect ordered wire messages, and prove terminal-response counts without real providers, stdio processes, clocks, or sleeps; generated documentation is current, and a recorded Zed verification demonstrates client-visible option snapshots/updates, compaction progress, cwd confirmation/tool locations, `/new` exclusion, and isolated `/btw`, while explicitly recording unsupported transcript and displayed-cwd changes.
 
 # Test Strategy
@@ -183,7 +183,7 @@ Every named test below must be added or updated so it fails when the correspondi
 | AC.10 | `maki-agent`: `change_directory_returns_and_commits_canonical_path`, `failed_change_directory_is_atomic`; `maki-acp`: `cd_feedback_is_visible_not_history`, `tool_locations_follow_live_cwd`; persistence reload test `canonical_cwd_round_trips` |
 | AC.11 | `maki-agent`: `manual_compaction_checkpoints_before_completion`, `manual_compaction_failure_and_cancel_are_terminal`; `maki-acp`: `compact_tool_progress_success_sequence`, `compact_tool_progress_failure_sequence`, `compact_prompt_completes_once`; reload test `compacted_history_loads_without_followup_turn` |
 | AC.12 | new `maki-agent::agent::isolated_turn` tests: `isolated_turn_closes_copy_and_uses_empty_tools`, `isolated_turn_preserves_images_and_build_system`, `isolated_turn_preserves_primary_history_on_success`, `..._on_failure`, `..._on_cancel`; `maki-acp`: `btw_streams_and_completes_active_prompt`; `maki-ui`: `btw_modal_uses_shared_isolated_service` |
-| AC.13 | Retain or add individually named regressions: `command_precedence_prefers_expected_producer`, `registry_generation_invalidates_stale_target`, `custom_lua_command_dispatches_on_portable_target`, `mcp_prompt_preserves_reference_and_arguments`, `normal_command_preserves_image_attachments`, `unknown_slash_prompt_is_sent_to_agent_literal`, `unavailable_slash_prompt_is_sent_to_agent_literal`, `stale_session_option_handle_is_rejected`, `tui_model_selector_uses_coordinator`, `tui_toggle_controls_use_coordinator`, `tui_new_and_clear_reset_session`, `tui_compact_preserves_expected_presentation`, `tui_cd_uses_canonical_feedback`, `tui_btw_uses_shared_isolated_service`, `session_restore_preserves_pricing_and_history` |
+| AC.13 | Retain or add individually named regressions: `command_precedence_prefers_expected_producer`, `registry_generation_invalidates_stale_target`, `custom_lua_command_dispatches_on_portable_target`, `mcp_prompt_preserves_reference_and_arguments`, `normal_command_preserves_image_attachments`, `unknown_slash_prompt_is_rejected`, `unavailable_interactive_command_is_rejected`, `escaped_slash_prompt_is_sent_literal`, `stale_session_option_handle_is_rejected`, `tui_model_selector_uses_coordinator`, `tui_toggle_controls_use_coordinator`, `tui_new_and_clear_reset_session`, `tui_compact_preserves_expected_presentation`, `tui_cd_uses_canonical_feedback`, `tui_btw_uses_shared_isolated_service`, `session_restore_preserves_pricing_and_history` |
 | AC.14 | `maki-acp`: harness self-tests `collector_preserves_wire_order`, `operation_terminal_is_compare_and_set`, `fake_provider_drives_stream_without_stdio`, plus end-to-end scenarios `server_session_harness_drives_new_load_prompt_compact_and_btw_with_ordered_terminals` and `server_session_harness_close_cancel_races_complete_once`; `just gen-docs-check`; manual record `zed-acp-command-effects` containing the requested message/order and visible-behavior checks |
 
 Run cheapest checks while iterating:
@@ -488,3 +488,46 @@ sender going away. Nothing that merely holds a wake clone can delay exit.
 ## Known ordering wart
 
 `settle_turn` resolves a turn's ticket inside `finalize_turn`, which runs before the actor flips to idle. A plugin that calls `sess:prompt()` and then `sess:status()` can see `running`, with no error, for a turn that has already returned. The test that caught this waits for the status to settle; the ordering is unchanged. Correcting it means resolving the ticket after the idle flip rather than inside `finalize_turn`, which has eight call sites, and setting idle first is wrong because `status` reads the retained outcome and would then see a stale one. This is upstream of the plan and left for a separate change.
+
+# Merge with the slash-command parsing change
+
+`mistress` merged #133 (`lua-command-parsing`), which changed what the registry
+does with a leading slash it cannot resolve. `classify_input` now splits input
+into a command, an escaped literal, and plain text: an unresolvable
+`SlashClass::Command` returns `CommandOutcome::Failed(UnknownCommand)` instead
+of falling through as model text, and a doubled slash is the escape that sends
+the text literally (`//help` sends `/help`). This plan was written against the
+old forwarding policy, so the statements above that described unavailable
+commands becoming literal input have been corrected in place.
+
+The behaviour this plan owns is unaffected. `/new` and `/clear` are hidden from
+ACP through `bind_target_with_presentation`, which narrows presentation without
+narrowing resolution, so they still resolve and still return
+`NEW_SESSION_GUIDANCE`. Only genuinely unresolvable input changed.
+
+## Merge resolution
+
+| Area | Resolution |
+|---|---|
+| `maki-commands/src/lib.rs` | Both sides added exports. Kept both. |
+| `maki-acp/src/server.rs` | Took `mistress`'s rejection semantics and its two tests, re-seated onto this branch's `dispatch_prompt` helper: `prompt_request` now needs the live session id, because prompts validate against the coordinator binding. |
+| `maki-ui/src/event_loop.rs` | Kept this plan's push-then-remove restore path, with `mistress`'s `set_focused(idx)` in place of the bare `self.focused = idx`. |
+| `maki-ui/src/components/file_completion.rs` | Both sides replaced the same fixed-iteration poll with `wait_for_matcher`. Kept this branch's predicate, which does not `unwrap` the session. |
+| `maki-lua/tests/real_plugins_restore.rs` | Both sides added imports. Kept both. |
+| `site/docs/content/acp/_index.md`, `commands/_index.md`, `maki-docgen/src/gen_commands.rs` | Combined: this branch's hidden-`/new` paragraph plus `mistress`'s error-and-escape sentence. `maki-docgen --check` confirms the handwritten and generated halves agree. |
+
+## Defects found and corrected
+
+Two semantic conflicts that merged cleanly and failed afterwards:
+
+- `src/print.rs` constructed an `AgentInput` for `InputDispatch::LiteralInput` without `lease_committer`. Print mode's literal path arrived on this branch; the field arrived on the other side of it.
+- `maki-agent`: `portable_target_separates_compaction_from_session_replacement` asserted `/new` on a portable target falls through as literal input. Under the new policy an unresolvable command fails, so the assertion now expects `CommandOutcome::Failed(UnknownCommand)`. The ACP guidance path is unchanged and its test still passes.
+
+## Verification
+
+`just ci` passes: `fmt-check`, `lint`, `test` (5017 tests), `gen-docs-check`, `machete`.
+
+`maki-docgen`'s `generation_failure_prevents_output` fails intermittently under
+`cargo test --workspace`: it shares the `CHECK_CALLS`/`WRITE_CALLS` atomics with
+the other tests in its binary. It came in with `db1a54f9` and nextest does not
+hit it, since each test gets its own process. Upstream of this plan.
