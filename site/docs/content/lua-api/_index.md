@@ -395,6 +395,7 @@ browsing memory files or toggling settings.
 maki.api.register_command({
   name = "/hello",
   description = "Say hello",
+  tui_only = false,
   nargs = 1,
   completion = {
     get_items = function(ctx)
@@ -607,6 +608,7 @@ block your handler.
 maki.api.register_command({
   name = "/resume",
   description = "Alias for /sessions",
+  tui_only = false,
   handler = function()
     local ok, err = maki.api.run_command("/sessions")
     if not ok then
