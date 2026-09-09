@@ -574,7 +574,10 @@ end
 maki.api.run_command({cmdline})
 ```
 
-Runs a slash command by name, exactly as typing it in the input would.
+Runs a slash command by name, as the explicit name-based executor: the
+leading slash is optional, extra leading slashes are stripped, and the
+name must resolve to a registered command (unknown names error, and the
+`//` input escape does not apply to this API).
 Works for built-ins, custom `/project:` and `/user:` commands, MCP
 prompts, and commands other plugins registered.
 
@@ -3592,7 +3595,7 @@ maki.session.thinking()
 Returns the current thinking mode of the focused session and whether its
 model supports thinking at all (for hiding/graving the selector).
 
-**Returns:** (`table|nil`, `string|nil`) `{mode, supports_thinking}`, or nil and an error.
+**Returns:** (`table|nil`, `string|nil`) `{mode, supports_thinking, options}`, or nil and an error.
 
 **Example:**
 
@@ -3609,7 +3612,7 @@ maki.session.set_thinking({opts})
 ```
 
 Sets the focused session's thinking mode. `mode` accepts any value
-`StoredThinking::parse_setting` understands: `off`, `adaptive`, an effort
+`ThinkingConfig::parse_setting` understands: `off`, `adaptive`, an effort
 level (`minimal` .. `max`), or a token budget. When `set_default` is true,
 the choice is also persisted as the global default for new sessions.
 
@@ -6116,8 +6119,11 @@ function M.lerp(from, to, t)
 end
 
 function M.dim(color, factor)
-  local bg = maki.ui.theme_color("background") or "#000000"
-  return M.lerp(color, bg, factor)
+  local background = maki.ui.theme_color("background")
+  if not background then
+    return color
+  end
+  return M.lerp(color, background, factor)
 end
 
 return M

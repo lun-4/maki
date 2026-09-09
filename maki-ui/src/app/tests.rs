@@ -20,7 +20,7 @@ use maki_agent::{
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{BuiltinAction, CommandArgumentItem, HintReader, KeymapReader};
-use maki_providers::{ContentBlock, Effort, Message, Role, TokenUsage};
+use maki_providers::{ContentBlock, Message, Role, TokenUsage};
 use maki_storage::sessions::{StoredMode, StoredSubagent, StoredThinking};
 use ratatui::layout::Rect;
 use std::env;
@@ -762,6 +762,7 @@ fn ordinary_paste_synchronizes_argument_completion() {
     let generation = app.command_palette.argument_generation();
 
     app.update(Msg::Paste("/deploy staging".into()));
+    settle_command_palette(&mut app);
 
     assert!(app.command_palette.argument_generation() > generation);
 }
@@ -913,6 +914,9 @@ fn type_and_submit(app: &mut App, text: &str) -> Vec<Action> {
     for c in text.chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
     }
+    if text.starts_with('/') {
+        settle_command_palette(app);
+    }
     app.update(Msg::Key(key(KeyCode::Enter)))
 }
 
@@ -934,8 +938,18 @@ fn cmd(name: &str) -> ParsedCommand {
     }
 }
 
+fn settle_command_palette(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while app.command_palette.cadence() == Cadence::PENDING {
+        let _ = app.tick();
+        assert!(Instant::now() < deadline, "command palette did not settle");
+        std::thread::yield_now();
+    }
+}
+
 fn type_slash(app: &mut App) {
     app.update(Msg::Key(key(KeyCode::Char('/'))));
+    settle_command_palette(app);
 }
 
 #[test]
@@ -943,9 +957,11 @@ fn typing_filters_palette() {
     let mut app = test_app();
     type_slash(&mut app);
     app.update(Msg::Key(key(KeyCode::Char('n'))));
+    settle_command_palette(&mut app);
     assert!(app.command_palette.is_active());
 
     app.update(Msg::Key(key(KeyCode::Char('z'))));
+    settle_command_palette(&mut app);
     assert!(!app.command_palette.is_active());
 }
 
@@ -954,9 +970,22 @@ fn enter_executes_new_command() {
     let mut app = test_app();
     type_slash(&mut app);
     app.update(Msg::Key(key(KeyCode::Char('n'))));
+    settle_command_palette(&mut app);
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(matches!(&actions[0], Action::NewSession));
     assert!(!app.command_palette.is_active());
+}
+
+#[test]
+fn leading_whitespace_palette_command_preserves_arguments() {
+    let mut app = test_app();
+
+    let actions = type_and_submit(&mut app, "  /btw describe this");
+
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::Btw(question, images)] if question == "describe this" && images.is_empty()
+    ));
 }
 
 #[test]
@@ -1022,6 +1051,7 @@ fn lifecycle_app() -> (
     );
     app.input_box.set_input("/deploy a".into());
     app.command_palette.sync("/deploy a");
+    settle_command_palette(&mut app);
     app.command_palette
         .sync_arguments("/deploy a", 9, &app.state.mode.id_key());
     let items = vec![CommandArgumentItem {
@@ -1029,19 +1059,25 @@ fn lifecycle_app() -> (
         insertion: "alpha".into(),
         description: None,
     }];
-    for _ in 0..1000 {
-        if probe.try_finish_command_arguments(items.clone()).is_some() {
-            break;
-        }
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while probe.try_finish_command_arguments(items.clone()).is_none() {
+        assert!(Instant::now() < deadline, "completion request was not sent");
         std::thread::yield_now();
     }
-    let _ = app.command_palette.poll_arguments();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while app.command_palette.poll_arguments() != Dirty::YES {
+        assert!(
+            Instant::now() < deadline,
+            "completion result was not applied"
+        );
+        std::thread::yield_now();
+    }
     let _ = probe.try_finish_command_argument_lifecycle();
     (app, probe, producer)
 }
 
 #[test]
-fn argument_completion_clears_old_rows_while_request_pending() {
+fn argument_completion_retains_old_rows_while_request_pending() {
     let dir = StateDir::from_path(env::temp_dir());
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     let (registry, _producer) = lua_registry(TestLuaCommand {
@@ -1074,7 +1110,7 @@ fn argument_completion_clears_old_rows_while_request_pending() {
     app.command_palette
         .sync_arguments("/deploy b", 9, &app.state.mode.id_key());
     assert!(app.command_palette.completion_session_id().is_some());
-    assert!(!rendered(&mut app).contains("old-result"));
+    assert!(rendered(&mut app).contains("old-result"));
     let deadline = Instant::now() + Duration::from_secs(1);
     while probe.try_finish_command_arguments(Vec::new()).is_none() {
         assert!(
@@ -1109,6 +1145,7 @@ fn unmatched_completion_items_cancel_the_argument_session() {
     );
     app.input_box.set_input("/deploy z".into());
     app.command_palette.sync("/deploy z");
+    settle_command_palette(&mut app);
     app.command_palette
         .sync_arguments("/deploy z", 9, &app.state.mode.id_key());
 
@@ -1427,6 +1464,7 @@ fn scrolled_argument_completion_accepts_offscreen_candidate() {
     );
     app.input_box.set_input("/de a".into());
     app.command_palette.sync("/de a");
+    settle_command_palette(&mut app);
     app.command_palette.move_down();
     assert_eq!(
         app.command_palette
@@ -1501,6 +1539,7 @@ fn argument_completion_tab_preserves_command_for_next_request() {
     );
     app.input_box.set_input("/de a".into());
     app.command_palette.sync("/de a");
+    settle_command_palette(&mut app);
     app.command_palette.move_down();
     app.command_palette.set_argument_completions(
         (4, 5),
@@ -1961,6 +2000,7 @@ fn open_tasks_picker(app: &mut App) {
     for c in "/tasks".chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
     }
+    settle_command_palette(app);
     app.update(Msg::Key(key(KeyCode::Enter)));
 }
 
@@ -2998,6 +3038,394 @@ fn status_hints_published_by_a_plugin_reach_the_screen() {
     assert!(!rendered(&mut app).contains(HINT_TEXT));
 }
 
+const MIDDLE_ORIGIN: u16 = 10;
+const MIDDLE_COLUMN: u16 = 4;
+const MIDDLE_TEST_AREA: Rect = Rect::new(0, 0, 80, 24);
+
+fn activate_middle_scroll(app: &mut App) {
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Middle),
+        MIDDLE_COLUMN,
+        MIDDLE_ORIGIN,
+    ));
+}
+
+fn middle_scroll_transcript() -> App {
+    let mut app = app_without_splash();
+    for i in 0..100 {
+        app.active_chat().push(DisplayMessage::new(
+            DisplayRole::User,
+            format!("transcript row {i}"),
+        ));
+    }
+    rendered(&mut app);
+    app
+}
+
+#[test_case(SelectionZone::Messages, true; "messages")]
+#[test_case(SelectionZone::Input, false; "input")]
+#[test_case(SelectionZone::Overlay, false; "overlay")]
+fn middle_scroll_activation_targets(zone: SelectionZone, expected: bool) {
+    let mut app = app_without_splash();
+    set_zone(&mut app, zone, MIDDLE_TEST_AREA);
+    activate_middle_scroll(&mut app);
+    assert_eq!(app.middle_scroll.is_some(), expected);
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Middle),
+        MIDDLE_COLUMN,
+        MIDDLE_ORIGIN,
+    ));
+    assert_eq!(app.middle_scroll.is_some(), expected);
+    activate_middle_scroll(&mut app);
+    assert!(app.middle_scroll.is_none());
+}
+
+#[test_case(-10, 100, 5; "up")]
+#[test_case(10, 100, -5; "down")]
+#[test_case(5, 100, -1; "moderate_speed")]
+#[test_case(17, 100, -12; "cap_threshold")]
+#[test_case(-1, 100, 0; "upper_dead_zone")]
+#[test_case(1, 100, 0; "lower_dead_zone")]
+#[test_case(0, 100, 0; "anchor")]
+#[test_case(31, 100, -12; "speed_cap")]
+#[test_case(100, 10000, -12; "stall_clamp")]
+#[test_case(6, 25, 0; "fractional_step")]
+fn middle_scroll_motion_rates(displacement: i32, millis: u64, expected: i32) {
+    let mut app = app_without_splash();
+    set_zone(&mut app, SelectionZone::Messages, MIDDLE_TEST_AREA);
+    activate_middle_scroll(&mut app);
+    let now = Instant::now();
+    let state = app.middle_scroll.as_mut().unwrap();
+    state.move_to((i32::from(MIDDLE_ORIGIN) + displacement) as u16, now);
+    assert_eq!(state.delta(now + Duration::from_millis(millis)), expected);
+}
+
+#[test_case(2, -2; "fine_control")]
+#[test_case(5, -16; "moderate_speed")]
+#[test_case(10, -54; "fast_travel")]
+#[test_case(17, -120; "capped_speed")]
+fn middle_scroll_power_curve(displacement: u16, expected: i32) {
+    const TICK_COUNT: u32 = 10;
+    const TICK_INTERVAL: Duration = Duration::from_millis(100);
+    let mut app = middle_scroll_transcript();
+    activate_middle_scroll(&mut app);
+    let now = Instant::now();
+    let state = app.middle_scroll.as_mut().unwrap();
+    state.move_to(MIDDLE_ORIGIN + displacement, now);
+    let delta: i32 = (1..=TICK_COUNT)
+        .map(|step| state.delta(now + TICK_INTERVAL * step))
+        .sum();
+    assert_eq!(delta, expected);
+}
+
+#[test]
+fn middle_scroll_fractional_direction_and_horizontal_motion() {
+    let mut app = middle_scroll_transcript();
+    activate_middle_scroll(&mut app);
+    let now = Instant::now();
+    let state = app.middle_scroll.as_mut().unwrap();
+    state.move_to(MIDDLE_ORIGIN + 6, now);
+    assert_eq!(state.delta(now + Duration::from_millis(25)), 0);
+    assert_eq!(state.delta(now + Duration::from_millis(50)), -1);
+    state.move_to(MIDDLE_ORIGIN - 6, now + Duration::from_millis(50));
+    assert_eq!(state.delta(now + Duration::from_millis(75)), 0);
+    state.move_to(MIDDLE_ORIGIN, now + Duration::from_millis(75));
+    state.move_to(MIDDLE_ORIGIN - 6, now + Duration::from_millis(100));
+    assert_eq!(state.delta(now + Duration::from_millis(125)), 0);
+    app.update(mouse_event(MouseEventKind::Moved, u16::MAX, MIDDLE_ORIGIN));
+    let state = app.middle_scroll.as_mut().unwrap();
+    assert_eq!(state.origin.x, MIDDLE_COLUMN);
+    assert_eq!(state.delta(now + Duration::from_secs(1)), 0);
+}
+
+#[test_case(0; "outside")]
+#[test_case(1; "modal")]
+#[test_case(2; "dragging")]
+#[test_case(3; "pending_copy")]
+fn middle_scroll_activation_rejected(cause: u8) {
+    let mut app = middle_scroll_transcript();
+    match cause {
+        0 => app.zones = ZoneRegistry::new(),
+        1 => open_help(&mut app),
+        2 => {
+            app.update(mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                MIDDLE_COLUMN,
+                MIDDLE_ORIGIN,
+            ));
+        }
+        _ => make_pending_copy(&mut app),
+    }
+    activate_middle_scroll(&mut app);
+    assert!(app.middle_scroll.is_none());
+}
+
+#[test]
+fn middle_scroll_stationary_ticks_render() {
+    let mut app = middle_scroll_transcript();
+    activate_middle_scroll(&mut app);
+    let now = Instant::now();
+    app.middle_scroll.as_mut().unwrap().move_to(0, now);
+    let before = rendered(&mut app);
+    for step in 1..=4 {
+        assert_eq!(
+            app.tick_middle_scroll_at(now + Duration::from_millis(step * 100)),
+            Dirty::YES
+        );
+    }
+    assert_ne!(rendered(&mut app), before);
+}
+
+#[test]
+fn middle_scroll_anchor_render() {
+    let mut app = middle_scroll_transcript();
+    activate_middle_scroll(&mut app);
+    let rows = rendered_rows(&mut app, 80, 24);
+    assert_eq!(
+        rows[usize::from(MIDDLE_ORIGIN)]
+            .chars()
+            .nth(usize::from(MIDDLE_COLUMN)),
+        Some('+')
+    );
+    activate_middle_scroll(&mut app);
+    let rows = rendered_rows(&mut app, 80, 24);
+    assert_ne!(
+        rows[usize::from(MIDDLE_ORIGIN)]
+            .chars()
+            .nth(usize::from(MIDDLE_COLUMN)),
+        Some('+')
+    );
+}
+
+#[test_case(0; "escape")]
+#[test_case(1; "ordinary_key")]
+#[test_case(2; "release")]
+#[test_case(3; "paste")]
+#[test_case(4; "wheel")]
+#[test_case(5; "left_button")]
+#[test_case(6; "right_button")]
+fn middle_scroll_input_cancellation(input: u8) {
+    let mut app = middle_scroll_transcript();
+    activate_middle_scroll(&mut app);
+    let msg = match input {
+        0 => Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        1 => Msg::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+        2 => Msg::Key(KeyEvent::new_with_kind(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        )),
+        3 => Msg::Paste("paste".into()),
+        4 => Msg::Scroll {
+            column: MIDDLE_COLUMN,
+            row: MIDDLE_ORIGIN,
+            delta: 1,
+        },
+        5 => mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            MIDDLE_COLUMN,
+            MIDDLE_ORIGIN,
+        ),
+        _ => mouse_event(
+            MouseEventKind::Down(MouseButton::Right),
+            MIDDLE_COLUMN,
+            MIDDLE_ORIGIN,
+        ),
+    };
+    let actions = app.update(msg);
+    assert_eq!(app.middle_scroll.is_some(), input == 2);
+    if input == 0 {
+        assert!(actions.is_empty());
+        assert!(app.last_esc.is_none());
+    }
+    if input == 1 {
+        assert_eq!(app.input_box.buffer.value(), "x");
+    }
+    if input == 3 {
+        assert_eq!(app.input_box.buffer.value(), "paste");
+    }
+    if input == 5 {
+        assert!(app.selection_state.is_some());
+    }
+}
+
+#[test_case(0; "overlay")]
+#[test_case(1; "geometry")]
+#[test_case(2; "chat_identity")]
+#[test_case(3; "reset")]
+#[test_case(4; "preview")]
+fn middle_scroll_target_invalidation(cause: u8) {
+    let mut app = middle_scroll_transcript();
+    activate_middle_scroll(&mut app);
+    match cause {
+        0 => open_help(&mut app),
+        1 => {
+            app.zones = ZoneRegistry::new();
+            set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 40, 10));
+        }
+        2 => app.chats[0].subagent_id = Some(TASK_ID.into()),
+        3 => app.reset_ui_chrome(),
+        _ => app.task_picker.open(vec![], TASK_ID),
+    }
+    let _ = app.tick_middle_scroll_at(Instant::now());
+    assert!(app.middle_scroll.is_none());
+    app.close_all_overlays();
+    assert_eq!(
+        app.tick_middle_scroll_at(Instant::now() + Duration::from_secs(1)),
+        Dirty::NO
+    );
+}
+
+#[test]
+fn middle_scroll_boundaries_and_reversal() {
+    let mut app = middle_scroll_transcript();
+    let bottom = app.chats[0].scroll_top();
+    activate_middle_scroll(&mut app);
+    let now = Instant::now();
+    app.middle_scroll.as_mut().unwrap().move_to(100, now);
+    assert_eq!(
+        app.tick_middle_scroll_at(now + Duration::from_millis(100)),
+        Dirty::NO
+    );
+    app.middle_scroll
+        .as_mut()
+        .unwrap()
+        .move_to(0, now + Duration::from_millis(100));
+    assert_eq!(
+        app.tick_middle_scroll_at(now + Duration::from_millis(200)),
+        Dirty::YES
+    );
+    assert_eq!(app.chats[0].scroll_top(), bottom - 5);
+    app.chats[0].scroll_to_top();
+    assert_eq!(
+        app.tick_middle_scroll_at(now + Duration::from_millis(300)),
+        Dirty::NO
+    );
+    app.middle_scroll
+        .as_mut()
+        .unwrap()
+        .move_to(20, now + Duration::from_millis(300));
+    assert_eq!(
+        app.tick_middle_scroll_at(now + Duration::from_millis(400)),
+        Dirty::YES
+    );
+    assert_eq!(app.chats[0].scroll_top(), 5);
+}
+
+#[test_case(false; "above_bottom")]
+#[test_case(true; "at_bottom")]
+fn middle_scroll_streaming_follow_render(at_bottom: bool) {
+    let mut app = middle_scroll_transcript();
+    if !at_bottom {
+        app.chats[0].scroll(10);
+    }
+    activate_middle_scroll(&mut app);
+    let before = app.chats[0].scroll_top();
+    app.chats[0].push(DisplayMessage::new(DisplayRole::User, "new output".into()));
+    rendered(&mut app);
+    assert_eq!(app.chats[0].scroll_top(), before);
+    let _ = app.cancel_middle_scroll();
+    rendered(&mut app);
+    assert_eq!(app.chats[0].scroll_top(), before);
+    app.chats[0].scroll(-i32::from(u16::MAX));
+    rendered(&mut app);
+    assert!(app.chats[0].auto_scroll());
+    let bottom = app.chats[0].scroll_top();
+    app.chats[0].push(DisplayMessage::new(
+        DisplayRole::User,
+        "later output".into(),
+    ));
+    rendered(&mut app);
+    assert!(app.chats[0].scroll_top() > bottom);
+}
+
+#[test]
+fn middle_scroll_async_overlay_prevents_final_motion() {
+    let mut app = middle_scroll_transcript();
+    activate_middle_scroll(&mut app);
+    let now = Instant::now();
+    app.middle_scroll.as_mut().unwrap().move_to(0, now);
+    let before = app.chats[0].scroll_top();
+    app.last_input = Some(now);
+    assert!(app.begin_input_demand(bash_perm_demand(PERM_SCOPE)));
+    app.last_input = Some(now - IDLE_AGE);
+    let _ = app.tick_at(now + Duration::from_millis(100));
+    assert!(app.permission_active());
+    assert!(app.middle_scroll.is_none());
+    assert_eq!(app.chats[0].scroll_top(), before);
+}
+
+#[test]
+fn middle_scroll_chat_switch_and_render_resize() {
+    let mut app = middle_scroll_transcript();
+    activate_middle_scroll(&mut app);
+    app.update(subagent_msg(
+        AgentEvent::TextDelta {
+            text: TASK_ID.into(),
+        },
+        TASK_ID,
+        Some(TASK_ID),
+    ));
+    app.active_chat = 1;
+    let _ = app.tick_middle_scroll_at(Instant::now());
+    assert!(app.middle_scroll.is_none());
+    app.active_chat = 0;
+    assert_eq!(app.tick_middle_scroll_at(Instant::now()), Dirty::NO);
+    activate_middle_scroll(&mut app);
+    rendered_rows(&mut app, 60, 20);
+    assert!(app.middle_scroll.is_none());
+}
+
+#[test]
+fn middle_scroll_selection_copy_render() {
+    let mut app = middle_scroll_transcript();
+    activate_middle_scroll(&mut app);
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        MIDDLE_COLUMN,
+        MIDDLE_ORIGIN,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Drag(MouseButton::Left),
+        MIDDLE_COLUMN + 8,
+        MIDDLE_ORIGIN,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        MIDDLE_COLUMN + 8,
+        MIDDLE_ORIGIN,
+    ));
+    assert!(
+        app.selection_state
+            .as_ref()
+            .is_some_and(SelectionState::is_pending_copy)
+    );
+    activate_middle_scroll(&mut app);
+    assert!(app.middle_scroll.is_none());
+    let rows = rendered_rows(&mut app, 80, 24);
+    assert_ne!(
+        rows[usize::from(MIDDLE_ORIGIN)]
+            .chars()
+            .nth(usize::from(MIDDLE_COLUMN)),
+        Some('+')
+    );
+}
+
+#[test]
+fn middle_scroll_cadence_restores_baseline() {
+    let mut app = app_without_splash();
+    set_zone(&mut app, SelectionZone::Messages, MIDDLE_TEST_AREA);
+    let baseline = app.cadence();
+    activate_middle_scroll(&mut app);
+    assert_eq!(
+        app.cadence(),
+        Cadence::any([baseline, Cadence::after(mouse::MIDDLE_SCROLL_INTERVAL)])
+    );
+    assert_eq!(app.cancel_middle_scroll(), Dirty::YES);
+    assert_eq!(app.cancel_middle_scroll(), Dirty::NO);
+    assert_eq!(app.cadence(), baseline);
+}
+
 fn rendered(app: &mut App) -> String {
     let backend = ratatui::backend::TestBackend::new(80, 24);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -4015,11 +4443,29 @@ fn startup_session_picker_emits_plugin_request() {
 }
 
 #[test]
-fn slash_noncommand_sends_as_prompt() {
+fn slash_noncommand_is_rejected_and_flashes() {
     let mut app = test_app();
     let actions = type_and_submit(&mut app, "/nonexistent");
-    assert!(app.status_bar.flash_text().is_none());
-    assert!(actions.iter().any(|a| matches!(a, Action::SendMessage(..))));
+    assert!(actions.is_empty());
+    app.execute_pending_commands();
+    assert!(
+        app.status_bar
+            .flash_text()
+            .is_some_and(|text| text.contains("unknown command"))
+    );
+    assert!(!actions.iter().any(|a| matches!(a, Action::SendMessage(..))));
+}
+
+#[test_case("//lmao", "/lmao" ; "escaped literal strips one slash")]
+#[test_case("///lmao", "//lmao" ; "triple slash strips one slash")]
+fn slash_escape_sends_literal_input(text: &str, expected: &str) {
+    let mut app = test_app();
+    let actions = type_and_submit(&mut app, text);
+    assert_eq!(actions.len(), 1);
+    assert!(matches!(
+        &actions[0],
+        Action::SendMessage(input) if input.message.as_str() == expected
+    ));
 }
 
 fn build_rewind_app() -> App {
@@ -5235,51 +5681,6 @@ fn bash_prefix_overrides_mode() {
 }
 
 #[test]
-fn thinking_toggle_cycles_off_adaptive() {
-    let mut app = test_app();
-    assert_eq!(app.state.thinking, ThinkingConfig::Off);
-
-    app.execute_command(cmd("/thinking"), 0);
-    assert_eq!(app.state.thinking, ThinkingConfig::Adaptive);
-
-    app.execute_command(cmd("/thinking"), 0);
-    assert_eq!(app.state.thinking, ThinkingConfig::Off);
-}
-
-#[test]
-fn thinking_explicit_args() {
-    let mut app = test_app();
-
-    app.execute_command(
-        ParsedCommand {
-            name: "/thinking".into(),
-            args: "8192".into(),
-        },
-        0,
-    );
-    assert_eq!(app.state.thinking, ThinkingConfig::Budget(8192));
-
-    app.execute_command(
-        ParsedCommand {
-            name: "/thinking".into(),
-            args: "high".into(),
-        },
-        0,
-    );
-    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::High));
-}
-
-#[test]
-fn thinking_unsupported_model_flashes_error() {
-    let mut app = test_app();
-    app.state.model.thinking_override = Some(maki_providers::ThinkingSupport::No);
-
-    app.execute_command(cmd("/thinking"), 0);
-    assert_eq!(app.state.thinking, ThinkingConfig::Off);
-    assert!(app.status_bar.flash_text().is_some());
-}
-
-#[test]
 fn thinking_restored_from_session_meta() {
     let tmp = TempDir::new().unwrap();
     let storage = StateDir::from_path(tmp.path().to_path_buf());
@@ -6414,6 +6815,9 @@ fn at_completion_insertion_synchronizes_argument_completion() {
     );
     app.input_box.set_input("/deploy @rev".into());
     app.command_palette.sync("/deploy @rev");
+    settle_command_palette(&mut app);
+    let value = app.input_box.buffer.value();
+    app.sync_command_arguments(&value, app.input_box.buffer.cursor_byte_offset());
     app.file_completion
         .open(&app.state.session.cwd, Vec::new(), "rev", (8, 12));
     let generation = app.command_palette.argument_generation();
@@ -6610,16 +7014,16 @@ fn popup_closes_when_token_removed() {
 #[test]
 fn command_palette_takes_precedence() {
     let (_tmp, mut app, _backend) = completion_app();
-    // `/thinking ` takes an argument, so the palette stays matched while an
+    // `/model ` takes an argument, so the palette stays matched while an
     // `@` token is added to that argument space.
-    for c in "/thinking ".chars() {
+    for c in "/model ".chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
     }
     assert!(app.command_palette.is_active());
     app.update(Msg::Key(key(KeyCode::Char('@'))));
     assert!(
         app.command_palette.is_active(),
-        "palette stays matched on /thinking"
+        "palette stays matched on /model"
     );
     assert!(
         !app.file_completion.is_active(),
@@ -6634,7 +7038,7 @@ fn completion_match_items(app: &App) -> Vec<CompletionItem> {
 }
 
 fn subagent_match_names(app: &App) -> Vec<String> {
-    completion_match_items(app)
+    let mut names: Vec<_> = completion_match_items(app)
         .into_iter()
         .filter(|i| i.kind == "subagent")
         .map(|i| {
@@ -6643,7 +7047,9 @@ fn subagent_match_names(app: &App) -> Vec<String> {
                 .map(|s| s.to_string())
                 .unwrap_or(i.label)
         })
-        .collect()
+        .collect();
+    names.sort();
+    names
 }
 
 /// Seed the `subagent` source with the types valid for `mode` (the task
@@ -6686,7 +7092,7 @@ fn at_a_prefix_lists_subagents() {
     converge_completion(&mut app);
     assert_eq!(
         subagent_match_names(&app),
-        vec!["research".to_string(), "general".to_string()]
+        vec!["general".to_string(), "research".to_string()]
     );
 }
 
@@ -6700,7 +7106,7 @@ fn at_subagent_prefix_lists_subagents() {
     converge_completion(&mut app);
     assert_eq!(
         subagent_match_names(&app),
-        vec!["research".to_string(), "general".to_string()]
+        vec!["general".to_string(), "research".to_string()]
     );
 }
 
@@ -6797,8 +7203,26 @@ fn mixed_list_includes_skills_subagents_and_models() {
         .store(Some(Arc::new(vec!["zai/glm-5".into()])));
     seed_models(&backend, &["zai/glm-5"]);
     app.update(Msg::Key(key(KeyCode::Char('@'))));
-    converge_completion(&mut app);
-    let items = completion_match_items(&app);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let items = loop {
+        let _ = app.file_completion.tick();
+        let items = completion_match_items(&app);
+        if ["skill", "subagent", "model"]
+            .into_iter()
+            .all(|kind| items.iter().any(|item| item.kind == kind))
+        {
+            break items;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mixed completion sources did not settle: {:?}",
+            items
+                .iter()
+                .map(|item| (&item.kind, &item.label))
+                .collect::<Vec<_>>()
+        );
+        std::thread::yield_now();
+    };
     assert!(items.iter().any(|i| i.kind == "skill"));
     assert!(items.iter().any(|i| i.kind == "subagent"));
     assert!(items.iter().any(|i| i.kind == "model"));
