@@ -2,7 +2,6 @@ use maki_providers::ThinkingConfigExt;
 use std::sync::atomic::Ordering;
 
 use crate::components::Overlay;
-use crate::components::file_completion::CompletionMode;
 use crate::components::input::Placeholder;
 #[cfg(test)]
 use crate::components::keybindings::KeybindContext;
@@ -311,16 +310,10 @@ impl App {
                 panel_hint,
                 &self.state.session.cwd,
             );
-            if !streaming
-                && (!self.command_palette.is_active()
-                    || self.file_completion.mode() == Some(CompletionMode::Directory))
-                && !self.any_overlay_open()
-            {
+            if !streaming && !self.command_palette.is_active() && !self.any_overlay_open() {
                 self.file_completion.view(frame, layout.input_area);
             }
-            if self.file_completion.mode() != Some(CompletionMode::Directory)
-                && self.directory_completion_context().is_none()
-            {
+            if !self.any_overlay_open() {
                 self.command_palette.view(
                     frame,
                     layout.input_area,

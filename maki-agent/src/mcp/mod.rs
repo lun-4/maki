@@ -1183,7 +1183,7 @@ fn prompt_registration(
         spec: CommandSpec {
             name: Arc::from(format!("/{}", info.display_name)),
             aliases: Arc::from([]),
-            arguments: ArgumentArity::unbounded(0),
+            arguments: maki_commands::CommandArguments::Legacy(ArgumentArity::unbounded(0)),
             docs: CommandDocs {
                 summary: Arc::from(info.description.as_str()),
                 argument_hint: prompt_argument_hint(&info.arguments),
@@ -1198,6 +1198,7 @@ fn prompt_registration(
             published: Arc::clone(&context.published),
         }),
         completion: None,
+        argument_completions: Vec::new(),
     }
 }
 

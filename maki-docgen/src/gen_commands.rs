@@ -82,7 +82,7 @@ pub fn generate() -> String {
             &mut out,
             cmd.name,
             cmd.description,
-            spec.docs.argument_hint.as_deref(),
+            spec.argument_hint().as_deref(),
             cmd.required_capabilities
                 .contains(maki_commands::TargetCapability::InteractiveUi),
         );
@@ -91,7 +91,7 @@ pub fn generate() -> String {
                 &mut out,
                 alias,
                 &format!("Alias for `{}`", cmd.name),
-                spec.docs.argument_hint.as_deref(),
+                spec.argument_hint().as_deref(),
                 cmd.required_capabilities
                     .contains(maki_commands::TargetCapability::InteractiveUi),
             );
@@ -128,6 +128,24 @@ pub fn generate() -> String {
 
     writeln!(out).unwrap();
     writeln!(out, "## Command arguments").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "Lua commands can declare typed positional arguments with `arguments`, or use the legacy whitespace-word count in `nargs`. Typed declarations cannot be combined with `nargs`; each argument has a name and one of `string`, `integer`, `enum`, `file`, or `directory` types. Set `optional = true` only after required arguments, and set `variadic = true` only on the final argument."
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "Typed command input uses shell-like single or double quotes to keep spaces in one value. Quotes are removed before validation; double-quoted values only escape `\\\"` and `\\\\`. Integers are signed decimal values from `-9007199254740991` through `9007199254740991`. Handlers receive the original text in `opts.args`, decoded tokens in `opts.fargs`, and typed values in `opts.values` keyed by argument name."
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "Completion callbacks receive the typed argument name as `ctx.argument`, its type as `ctx.type`, and successfully parsed preceding values as `ctx.values`; these fields are absent or empty for legacy commands."
+    )
+    .unwrap();
     writeln!(out).unwrap();
     writeln!(
         out,

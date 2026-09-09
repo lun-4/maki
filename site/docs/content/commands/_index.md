@@ -25,7 +25,7 @@ The active registry combines built-ins, custom Markdown commands, MCP prompts, a
 | `/theme` | Switch color theme | <theme> | yes |
 | `/mcp` | Configure MCP servers |  | yes |
 | `/login` | Authenticate with an LLM provider |  | yes |
-| `/cd` | Change working directory. Paths may contain spaces. | <path> | no |
+| `/cd` | Change working directory. Quote paths containing spaces. | [path] | no |
 | `/btw` | Ask a quick question (no tools, no history pollution) | <question> | no |
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) |  | no |
 | `/fast` | Toggle Anthropic fast mode (Opus only) |  | no |
@@ -53,6 +53,12 @@ Bundled Lua plugins register these commands at startup. Plugin commands have hig
 | `/usage` | Show provider quota and focused-session token usage |  | yes |
 
 ## Command arguments
+
+Lua commands can declare typed positional arguments with `arguments`, or use the legacy whitespace-word count in `nargs`. Typed declarations cannot be combined with `nargs`; each argument has a name and one of `string`, `integer`, `enum`, `file`, or `directory` types. Set `optional = true` only after required arguments, and set `variadic = true` only on the final argument.
+
+Typed command input uses shell-like single or double quotes to keep spaces in one value. Quotes are removed before validation; double-quoted values only escape `\"` and `\\`. Integers are signed decimal values from `-9007199254740991` through `9007199254740991`. Handlers receive the original text in `opts.args`, decoded tokens in `opts.fargs`, and typed values in `opts.values` keyed by argument name.
+
+Completion callbacks receive the typed argument name as `ctx.argument`, its type as `ctx.type`, and successfully parsed preceding values as `ctx.values`; these fields are absent or empty for legacy commands.
 
 `/model` and `/theme` also accept an argument. While you type it, the palette lists the possible values (model specs, theme names), and submitting resolves the argument without opening the picker:
 

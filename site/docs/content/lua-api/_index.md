@@ -342,7 +342,7 @@ maki.api.register_command({spec})
 Register a slash-command that appears in the user input bar.
 
 Slash commands let the user trigger plugin actions by typing `/name` in the
-input. Use them for interactive workflows that do not need the model, like
+input. Use them for interactive workflows that do not need the model, such as
 browsing memory files or toggling settings.
 
 **Parameters:**
@@ -353,58 +353,128 @@ browsing memory files or toggling settings.
   - `description` (`string`) Optional. Short description shown in the command palette.
   - `tui_only` (`boolean`) Required. If true, the command is available only in the interactive TUI.
   - `argument_hint` (`string`) Optional. Short hint describing the command arguments.
-  - `nargs` (`integer|string`) Optional. How many arguments the command
-    takes, spelled like nvim's nargs: 0 (default),
-    1, "?" (zero or one), "*" (any number), or "+"
-    (one or more). An argument is a whitespace
-    separated word. Type more than allowed and the
-    command quietly stops matching: the input goes
-    to the model as a normal message. Only the upper
-    bound is checked, so with "+" you still need to
-    handle an empty `opts.args` yourself.
-  - `handler` (`function`) Required. Called when the user runs the command,
-    with one opts table: `opts.args` is the raw
-    argument string (whitespace kept, may be empty)
-    and `opts.fargs` is the same split into words.
-  - `completion` (`table`) Optional. Argument completion specification. Use
-    `items = {...}` for a static list or `get_items =
-    function(ctx) -> {...}` for dynamic candidates.
-    Each candidate has `label` (match/display text),
-    `insertion` (replacement text), and optional
-    `description`. The callback context has `command`
-    (registered slash name), `args` (raw argument string,
-    never the full slash input), `arg` (argument under
-    the cursor), `index` (zero-based argument index),
-    `mode` (active mode id), `session` (stable for one
-    popup session), and `generation` (increases for
-    each request in that session). Optional lifecycle
-    callbacks `on_highlight(ctx, item)`,
-    `on_accept(ctx, item)`, and `on_cancel(ctx)` run in
-    request order. The first result highlights its
-    selected candidate. A later highlight cancels a
-    running highlight callback. Accept runs after its
-    highlight and ends the session without on_cancel.
-    Dismissal, an empty result, or a new completion
-    session calls on_cancel once. `Tab` accepts and
-    keeps editing. `Enter` accepts; press `Enter` again
-    to execute the command.
+  - `arguments` (`array`) Optional. A dense typed positional schema. Each
+    descriptor has a unique non-empty `name` and a
+    `type` of `string`, `integer`, `enum`, `file`, or
+    `directory`. Enum descriptors also require a
+    non-empty `choices` array of distinct strings.
+    `optional` and `variadic` are false by default.
+    A required scalar consumes exactly one value. An
+    optional scalar consumes zero or one value. A
+    required variadic consumes one or more values.
+    An optional variadic consumes zero or more values.
+    Optional descriptors follow required descriptors.
+    A variadic descriptor is last and consumes the
+    remaining values. Typed arguments cannot be used
+    with `nargs` or command-wide `completion`.
+    Typed input uses one quote-aware grammar. Unicode
+    whitespace separates tokens outside quotes. Single
+    and double quotes group text, adjacent quoted and
+    unquoted fragments concatenate, and empty quotes
+    produce an empty value. Backslashes are literal
+    outside quotes and inside single quotes. Inside
+    double quotes, only `\\"` and `\\\\` decode to a
+    quote or backslash. Other backslashes stay literal.
+    Shell expansion and operators are not supported.
+    The command parser outer-trims the argument
+    remainder before this grammar runs. Inner spaces,
+    quotes, newlines inside quotes, and decoded values
+    remain significant. Newlines separate tokens only
+    outside quotes.
+  - `nargs` (`integer|string`) Optional. How many untyped arguments the
+    command takes, spelled like nvim's nargs: 0 (default),
+    1, "?" (zero or one), "*" (zero or more), or "+"
+    (one or more). Legacy arguments use whitespace-
+    separated words and retain legacy handler fields.
+    Invalid legacy counts leave the input as ordinary
+    model text.
+  - `handler` (`function`) Required. Called with one opts table after the
+    command arguments pass validation. `opts.args` is
+    the outer-trimmed original argument remainder. It
+    keeps inner whitespace and source quotes. For typed
+    commands, `opts.fargs` is the decoded token array
+    and `opts.values` is a name-keyed table. String,
+    enum, file, and directory values are strings.
+    Integer values are Lua integers. A missing optional
+    scalar is `nil`. A missing optional variadic is an
+    empty array. A variadic value is always an array.
+    File and directory values retain their decoded,
+    non-empty, NUL-free spelling and are not expanded
+    or checked for existence by type validation. For
+    legacy commands, `opts.fargs` remains the existing
+    whitespace-split list and `opts.values` is absent.
+    Typed integers are signed decimal values with no
+    separators or alternate bases. The inclusive exact
+    range is `-9007199254740991` to
+    `9007199254740991`.
+  - `completion` (`table`) Optional for legacy commands. Use `items = {...}`
+    for a static list or `get_items = function(ctx) ->
+    {...}` for dynamic candidates. Typed commands use
+    per-argument providers instead.
+    A typed descriptor omits `completion` for the
+    `default` policy. Defaults are enum choices in
+    the core and file or directory discovery in the
+    TUI. String and integer defaults are empty.
+    Set `completion = false` or
+    `completion = "disabled"` to disable completion.
+    Set `completion = "replace"` or provide a table
+    with `mode = "replace"` to use only the custom
+    provider. Set `completion = "extend"` or
+    `mode = "extend"` to combine defaults and custom
+    candidates. Custom candidates replace duplicate
+    default insertions. A provider table contains
+    exactly one of `items` and `get_items`.
+    Each candidate has `label`, decoded `insertion`,
+    optional `description`, and optional
+    `navigation = "directory"`. Providers return
+    values without command-line quotes. The command
+    UI encodes values with balanced quotes when it
+    inserts them. The compatibility
+    `argument_completion` array may provide the
+    per-argument tables.
+    The callback context retains `command`, `args`,
+    `arg`, `index`, `mode`, `session`, and
+    `generation`. `args` is the argument remainder,
+    not the full slash input. Typed contexts add
+    `argument`, `type`, and `values`. `index` is
+    zero-based. `values` contains successfully parsed
+    preceding values, with variadic values as arrays.
+    `on_highlight(ctx, item)`,
+    `on_accept(ctx, item)`, and `on_cancel(ctx)` are
+    lifecycle callbacks for the provider that owns
+    the candidate. Highlight and accept callbacks
+    never run for another provider's candidate.
+    Session cancellation calls `on_cancel` once for
+    each participating provider that has not
+    terminated. Accept calls `on_accept` for the
+    winning provider and cancels non-winning providers
+    that have not terminated. A final result does not
+    release lifecycle state. Callbacks stay bound to
+    the command registration generation that created
+    the session. A replacement or unload cannot route
+    an old candidate to a new registration. The
+    registration owns callback cleanup after old
+    sessions terminate.
 
 **Example:**
 
 ```lua
+-- Documentation and test example. It is not bundled and never copies files.
+local recorded
 maki.api.register_command({
-  name = "/hello",
-  description = "Say hello",
-  nargs = 1,
-  completion = {
-    get_items = function(ctx)
-      return { { label = "world", insertion = "world", description = ctx.mode } }
-    end,
+  name = "/copy",
+  description = "Record typed path arguments",
+  tui_only = false,
+  arguments = {
+    { name = "source", type = "file" },
+    { name = "destination", type = "directory" },
+    { name = "policy", type = "enum", choices = { "skip", "overwrite" }, optional = true },
   },
   handler = function(opts)
-    maki.ui.flash("Hello " .. opts.args)
+    recorded = opts.values
   end,
 })
+-- `/copy "input file.txt" "build output" overwrite` records decoded values.
 ```
 
 ---

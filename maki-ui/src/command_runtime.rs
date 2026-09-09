@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::components::arg_completion::{ModelArgSource, ThemeArgSource};
+use crate::components::arg_completion::{ModelArgSource, PathArgSource, ThemeArgSource};
 use maki_agent::command::{self, StandardCommands, StandardCompletions};
 use maki_commands::{
     CommandContent, CommandError, CommandFuture, CommandHost, CommandOutcome, CommandRegistry,
@@ -52,6 +52,7 @@ pub(crate) struct CommandRuntime {
     #[cfg(test)]
     event_rx: flume::Receiver<CommandEvent>,
     theme_completion: Arc<ThemeArgSource>,
+    pub(crate) path_completion: Arc<PathArgSource>,
     _standard_commands: StandardCommands,
 }
 
@@ -94,16 +95,12 @@ impl CommandRuntime {
                 event_tx,
                 #[cfg(test)]
                 event_rx: event_rx.clone(),
+                path_completion: Arc::new(PathArgSource::new(maki_storage::paths::home())),
                 theme_completion,
                 _standard_commands: standard_commands,
             },
             event_rx,
         )
-    }
-
-    pub(crate) fn is_builtin_cd(&self, command: &ResolvedCommand) -> bool {
-        command.producer_id() == self._standard_commands.builtin_producer().id()
-            && command.spec().name.as_ref() == "/cd"
     }
 
     pub(crate) fn bind_target(&self) -> TargetHandle {

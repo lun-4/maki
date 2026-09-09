@@ -1,14 +1,27 @@
 //! Frontend-neutral contracts for slash commands.
 
+mod arguments;
 mod completion;
+mod completion_providers;
 mod dispatch;
 mod registry;
 mod spec;
 
+pub use arguments::{
+    ArgumentKind, ArgumentParseError, ArgumentValue, CommandArguments, CompletionEdit,
+    CompletionPolicy, LexError, MAX_EXACT_INTEGER, ParsedArgument, ParsedArguments, ParsedToken,
+    PathResolutionError, PositionalArgument, QuoteStyle, StaticArgumentKind,
+    StaticCommandArguments, StaticPositionalArgument, encode_completion_value, lex_strict,
+    lex_tolerant, parse_completion_prefix_arguments, parse_positional, resolve_path,
+};
+
 pub use completion::{
     CancellationToken, CommandCompletion, CompletionCandidate, CompletionContext, CompletionError,
-    CompletionItem, CompletionLifecycleEvent, CompletionResult, CompletionSession,
+    CompletionInput, CompletionItem, CompletionItemNavigation, CompletionLifecycleEvent,
+    CompletionNavigation, CompletionPublisher, CompletionResult, CompletionSession,
+    CompletionSnapshot, CompletionSnapshotSink,
 };
+pub use completion_providers::{CompletionKind, CompletionProviders};
 pub use dispatch::{
     AgentTurn, CommandAttachment, CommandBehavior, CommandContent, CommandError, CommandHost,
     CommandInvocation, CommandOutcome, HostRequest, HostResponse, InputDispatch, PromptReference,

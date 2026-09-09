@@ -1634,7 +1634,9 @@ mod tests {
             spec: maki_commands::CommandSpec {
                 name: Arc::from(name),
                 aliases: Arc::from([]),
-                arguments: maki_commands::ArgumentArity::ANY,
+                arguments: maki_commands::CommandArguments::Legacy(
+                    maki_commands::ArgumentArity::ANY,
+                ),
                 docs: maki_commands::CommandDocs {
                     summary: Arc::from(format!("{name} description")),
                     argument_hint: Some(Arc::from("<arg>")),
@@ -1643,6 +1645,7 @@ mod tests {
             },
             behavior: Arc::new(OutcomeBehavior(outcome)),
             completion: None,
+            argument_completions: Vec::new(),
         }
     }
 

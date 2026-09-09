@@ -112,6 +112,12 @@ impl CompletionItem {
         item
     }
 
+    fn raw_file(path: String) -> Self {
+        let mut item = Self::path(path, false);
+        item.insertion = item.label.clone();
+        item
+    }
+
     fn path(mut path: String, directory: bool) -> Self {
         if directory && !path.ends_with(['/', '\\']) {
             path.push(DIRECTORY_SUFFIX);
@@ -173,9 +179,9 @@ fn normalize_completion_insertion(insertion: &str, file: bool) -> String {
 }
 
 #[derive(Debug, Clone)]
-struct FileCandidate {
-    path: String,
-    is_directory: bool,
+pub(crate) struct FileCandidate {
+    pub(crate) path: String,
+    pub(crate) is_directory: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -197,13 +203,14 @@ struct QueryIntent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionMode {
     Reference,
+    File,
     Directory,
 }
 
 impl CompletionMode {
     fn uses_explicit_discovery(self, query: &str) -> bool {
         query.starts_with(['~', '/', '.'])
-            || (self == Self::Directory && query.contains(['/', '\\']))
+            || (matches!(self, Self::File | Self::Directory) && query.contains(['/', '\\']))
     }
 }
 
@@ -269,7 +276,7 @@ impl Drop for Session {
     }
 }
 
-trait FileResolver: Send + Sync {
+pub(crate) trait FileResolver: Send + Sync {
     fn read_dir(&self, path: &Path) -> io::Result<Vec<FileCandidate>>;
 }
 
@@ -282,43 +289,149 @@ impl FileResolver for RealFileResolver {
     }
 }
 
-fn resolve_file_path(cwd: &Path, home: Option<&Path>, value: &str) -> PathBuf {
-    let path = if value == "~" {
-        home.map_or_else(|| PathBuf::from(value), Path::to_path_buf)
-    } else if let Some(rest) = value.strip_prefix("~/") {
-        home.map(|home| home.join(rest))
-            .unwrap_or_else(|| PathBuf::from(value))
-    } else {
-        PathBuf::from(value)
-    };
-    if path.is_relative() {
-        cwd.join(path)
-    } else {
-        path
-    }
+#[derive(Clone)]
+pub(crate) struct PathDiscovery {
+    resolver: Arc<dyn FileResolver>,
+    home: Option<PathBuf>,
 }
 
-fn discovery_path(cwd: &Path, home: Option<&Path>, value: &str) -> (PathBuf, String, String) {
-    let path = resolve_file_path(cwd, home, value);
-    let lists_path = value.ends_with(['/', '\\']) || matches!(value, "~" | "." | "..");
-    if lists_path {
-        let display_prefix = if value.ends_with(['/', '\\']) {
-            value.to_string()
-        } else {
-            format!("{value}{DIRECTORY_SUFFIX}")
-        };
-        return (path, String::new(), display_prefix);
+impl PathDiscovery {
+    pub(crate) fn new(home: Option<PathBuf>) -> Self {
+        Self {
+            resolver: Arc::new(RealFileResolver),
+            home,
+        }
     }
-    let leaf = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let display_prefix = value.strip_suffix(&leaf).unwrap_or(value).to_string();
-    (
-        path.parent().unwrap_or(cwd).to_path_buf(),
-        leaf,
-        display_prefix,
-    )
+
+    #[cfg(test)]
+    pub(crate) fn with_resolver(resolver: Arc<dyn FileResolver>, home: Option<PathBuf>) -> Self {
+        Self { resolver, home }
+    }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<FileCandidate>> {
+        self.resolver.read_dir(path)
+    }
+
+    fn reference_query(&self, cwd: &Path, value: &str) -> (PathBuf, String, String) {
+        let path = if value == "~" {
+            self.home
+                .as_deref()
+                .map_or_else(|| PathBuf::from(value), Path::to_path_buf)
+        } else if let Some(rest) = value.strip_prefix("~/") {
+            self.home
+                .as_deref()
+                .map(|home| home.join(rest))
+                .unwrap_or_else(|| PathBuf::from(value))
+        } else {
+            PathBuf::from(value)
+        };
+        let path = if path.is_relative() {
+            cwd.join(path)
+        } else {
+            path
+        };
+        let lists_path = value.ends_with(['/', '\\']) || matches!(value, "~" | "." | "..");
+        if lists_path {
+            let display_prefix = if value.ends_with(['/', '\\']) {
+                value.to_string()
+            } else {
+                format!("{value}{DIRECTORY_SUFFIX}")
+            };
+            return (path, String::new(), display_prefix);
+        }
+        let leaf = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let display_prefix = value.strip_suffix(&leaf).unwrap_or(value).to_string();
+        (
+            path.parent().unwrap_or(cwd).to_path_buf(),
+            leaf,
+            display_prefix,
+        )
+    }
+
+    fn explicit_candidates(&self, cwd: &Path, value: &str) -> Vec<FileCandidate> {
+        if value.starts_with('~') && self.home.is_none() {
+            return Vec::new();
+        }
+        let (parent, leaf, display_prefix) = self.reference_query(cwd, value);
+        self.read_dir(&parent)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|candidate| {
+                leaf.is_empty()
+                    || completion_match(
+                        &leaf,
+                        &candidate.path,
+                        CompletionMatchOptions {
+                            case_matching: CaseMatching::Smart,
+                            normalization: Normalization::Smart,
+                        },
+                    )
+                    .is_some()
+            })
+            .map(|candidate| FileCandidate {
+                path: format!("{display_prefix}{}", candidate.path),
+                is_directory: candidate.is_directory,
+            })
+            .collect()
+    }
+
+    pub(crate) fn typed_candidates(
+        &self,
+        cwd: &Path,
+        value: &str,
+        directory_only: bool,
+    ) -> io::Result<Vec<(String, bool)>> {
+        let (parent, prefix, display_prefix) = self
+            .typed_query(cwd, value)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        Ok(self
+            .read_dir(&parent)?
+            .into_iter()
+            .filter(|candidate| {
+                (!directory_only || candidate.is_directory)
+                    && (prefix.is_empty() || candidate.path.starts_with(&prefix))
+            })
+            .map(|candidate| {
+                (
+                    format!("{display_prefix}{}", candidate.path),
+                    candidate.is_directory,
+                )
+            })
+            .collect())
+    }
+
+    fn typed_query(
+        &self,
+        cwd: &Path,
+        value: &str,
+    ) -> Result<(PathBuf, String, String), maki_commands::PathResolutionError> {
+        if value.is_empty() {
+            return Ok((cwd.to_path_buf(), String::new(), String::new()));
+        }
+        let path = maki_commands::resolve_path(cwd, self.home.as_deref(), value)?;
+        let lists_path = value.ends_with(['/', '\\']) || matches!(value, "~" | "." | "..");
+        if lists_path {
+            let display_prefix = if value.ends_with(['/', '\\']) {
+                value.to_string()
+            } else {
+                format!("{value}{DIRECTORY_SUFFIX}")
+            };
+            return Ok((path, String::new(), display_prefix));
+        }
+        let prefix = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let display_prefix = value.strip_suffix(&prefix).unwrap_or(value).to_owned();
+        Ok((
+            path.parent().unwrap_or(cwd).to_path_buf(),
+            prefix,
+            display_prefix,
+        ))
+    }
 }
 
 fn discover_one_level(path: &Path) -> io::Result<Vec<FileCandidate>> {
@@ -346,77 +459,36 @@ fn discover_one_level(path: &Path) -> io::Result<Vec<FileCandidate>> {
     Ok(entries)
 }
 
-fn explicit_candidates(
-    resolver: &dyn FileResolver,
-    cwd: &Path,
-    home: Option<&Path>,
-    value: &str,
-) -> Vec<FileCandidate> {
-    if value.starts_with('~') && home.is_none() {
-        return Vec::new();
-    }
-    let (parent, leaf, display_prefix) = discovery_path(cwd, home, value);
-    resolver
-        .read_dir(&parent)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|candidate| {
-            leaf.is_empty()
-                || completion_match(
-                    &leaf,
-                    &candidate.path,
-                    CompletionMatchOptions {
-                        case_matching: CaseMatching::Smart,
-                        normalization: Normalization::Smart,
-                    },
-                )
-                .is_some()
-        })
-        .map(|candidate| FileCandidate {
-            path: format!("{display_prefix}{}", candidate.path),
-            is_directory: candidate.is_directory,
-        })
-        .collect()
-}
-
 type Walker = (Nucleo<()>, flume::Receiver<()>, Arc<AtomicBool>);
 type WalkerSpawner = Arc<dyn Fn(&str) -> Option<Walker> + Send + Sync>;
 
 pub struct FileCompletionMenu {
     session: Option<Session>,
-    resolver: Arc<dyn FileResolver>,
+    discovery: PathDiscovery,
     walker_spawner: WalkerSpawner,
-    home: Option<PathBuf>,
 }
 
 impl FileCompletionMenu {
     pub fn new() -> Self {
         Self::with_dependencies(
-            Arc::new(RealFileResolver),
+            PathDiscovery::new(maki_storage::paths::home()),
             Arc::new(super::file_picker::spawn_file_walker),
-            maki_storage::paths::home(),
         )
     }
 
     #[cfg(test)]
     fn with_resolver(resolver: Arc<dyn FileResolver>, home: Option<PathBuf>) -> Self {
         Self::with_dependencies(
-            resolver,
+            PathDiscovery::with_resolver(resolver, home),
             Arc::new(super::file_picker::spawn_file_walker),
-            home,
         )
     }
 
-    fn with_dependencies(
-        resolver: Arc<dyn FileResolver>,
-        walker_spawner: WalkerSpawner,
-        home: Option<PathBuf>,
-    ) -> Self {
+    fn with_dependencies(discovery: PathDiscovery, walker_spawner: WalkerSpawner) -> Self {
         Self {
             session: None,
-            resolver,
+            discovery,
             walker_spawner,
-            home,
         }
     }
 
@@ -452,12 +524,7 @@ impl FileCompletionMenu {
         let (discovery, walking) = if explicit {
             (
                 Discovery::Explicit {
-                    candidates: explicit_candidates(
-                        self.resolver.as_ref(),
-                        &root,
-                        self.home.as_deref(),
-                        query,
-                    ),
+                    candidates: self.discovery.explicit_candidates(&root, query),
                 },
                 false,
             )
@@ -573,7 +640,10 @@ impl FileCompletionMenu {
             return;
         };
         let explicit = session.mode.uses_explicit_discovery(query);
-        session.intent = if session.mode == CompletionMode::Directory {
+        session.intent = if matches!(
+            session.mode,
+            CompletionMode::File | CompletionMode::Directory
+        ) {
             QueryIntent {
                 payload: query.to_string(),
                 kind: None,
@@ -588,12 +658,7 @@ impl FileCompletionMenu {
                 cancel.store(true, Ordering::Relaxed);
             }
             session.discovery = Discovery::Explicit {
-                candidates: explicit_candidates(
-                    self.resolver.as_ref(),
-                    &session.root,
-                    self.home.as_deref(),
-                    query,
-                ),
+                candidates: self.discovery.explicit_candidates(&session.root, query),
             };
             session.walking = false;
             session.matching = false;
@@ -617,7 +682,10 @@ impl FileCompletionMenu {
                 session.file_matches.clear();
             }
             if let Discovery::Project { nucleo, .. } = &mut session.discovery {
-                let pattern = if session.mode == CompletionMode::Directory {
+                let pattern = if matches!(
+                    session.mode,
+                    CompletionMode::File | CompletionMode::Directory
+                ) {
                     query
                 } else {
                     &query.to_lowercase()
@@ -963,10 +1031,12 @@ fn refresh_file_matches(s: &mut Session) {
     };
     for item in snapshot.matched_items(0..scan_count) {
         let path = item.matcher_columns[0].slice(..);
-        if s.mode == CompletionMode::Directory
-            && (path.len() <= 1 || !matches!(path.chars().next_back(), Some('/' | '\\')))
-        {
-            continue;
+        if matches!(s.mode, CompletionMode::File | CompletionMode::Directory) {
+            let is_directory =
+                path.len() > 1 && matches!(path.chars().next_back(), Some('/' | '\\'));
+            if path.len() <= 1 || is_directory != (s.mode == CompletionMode::Directory) {
+                continue;
+            }
         }
         coarse_match_count += 1;
         if paths.len() < MAX_MATERIALIZED as usize {
@@ -983,9 +1053,15 @@ fn refresh_file_matches(s: &mut Session) {
     s.truncated = coarse_match_count > materialized_count;
     s.file_matches.clear();
     for (order, path) in paths.into_iter().enumerate() {
-        let directory = s.mode == CompletionMode::Directory && path.ends_with(['/', '\\']);
+        let directory = path.ends_with(['/', '\\']);
         let item = if directory {
-            CompletionItem::raw_directory(path)
+            if s.mode == CompletionMode::Reference {
+                CompletionItem::directory(path)
+            } else {
+                CompletionItem::raw_directory(path)
+            }
+        } else if s.mode == CompletionMode::File {
+            CompletionItem::raw_file(path)
         } else {
             CompletionItem::file(path)
         };
@@ -1001,7 +1077,11 @@ fn refresh_explicit_matches(s: &mut Session) {
         return;
     };
     let mut paths = candidates.clone();
-    paths.retain(|candidate| s.mode == CompletionMode::Reference || candidate.is_directory);
+    paths.retain(|candidate| match s.mode {
+        CompletionMode::Reference => true,
+        CompletionMode::File => !candidate.is_directory,
+        CompletionMode::Directory => candidate.is_directory,
+    });
     paths.sort_by(|a, b| a.path.cmp(&b.path));
     s.file_matches.clear();
     for (order, candidate) in paths.into_iter().enumerate() {
@@ -1328,7 +1408,10 @@ mod tests {
             reads: std::sync::Mutex::new(Vec::new()),
             entries: Vec::new(),
         });
-        let mut menu = FileCompletionMenu::with_dependencies(resolver, spawner, None);
+        let mut menu = FileCompletionMenu::with_dependencies(
+            PathDiscovery::with_resolver(resolver, None),
+            spawner,
+        );
 
         menu.open("/project", Vec::new(), "../", (0, 3));
         assert!(spawns.lock().unwrap().is_empty());
@@ -1362,7 +1445,10 @@ mod tests {
                 is_directory: false,
             }],
         });
-        let mut menu = FileCompletionMenu::with_dependencies(resolver, spawner, None);
+        let mut menu = FileCompletionMenu::with_dependencies(
+            PathDiscovery::with_resolver(resolver, None),
+            spawner,
+        );
         menu.open("/project", Vec::new(), "src", (0, 4));
         menu.sync_query("../out");
         drop(done_tx);
@@ -1410,12 +1496,14 @@ mod tests {
             Some((nucleo, done_rx, Arc::new(AtomicBool::new(false))))
         });
         let mut menu = FileCompletionMenu::with_dependencies(
-            Arc::new(CountingResolver {
-                reads: std::sync::Mutex::new(Vec::new()),
-                entries: Vec::new(),
-            }),
+            PathDiscovery::with_resolver(
+                Arc::new(CountingResolver {
+                    reads: std::sync::Mutex::new(Vec::new()),
+                    entries: Vec::new(),
+                }),
+                None,
+            ),
             spawner,
-            None,
         );
         menu.open("/project", Vec::new(), "src", (0, 4));
 
@@ -1436,7 +1524,10 @@ mod tests {
                 is_directory: false,
             }],
         });
-        let mut menu = FileCompletionMenu::with_dependencies(resolver, spawner, None);
+        let mut menu = FileCompletionMenu::with_dependencies(
+            PathDiscovery::with_resolver(resolver, None),
+            spawner,
+        );
         menu.open(
             "/project",
             vec![item("skill:review", "skill", "@skill:review")],
@@ -1496,7 +1587,7 @@ mod tests {
     #[test]
     fn explicit_discovery_reads_parent_once_and_marks_directories() {
         let cwd = PathBuf::from("/workspace/project");
-        let resolver = CountingResolver {
+        let resolver = Arc::new(CountingResolver {
             reads: std::sync::Mutex::new(Vec::new()),
             entries: vec![
                 FileCandidate {
@@ -1508,8 +1599,9 @@ mod tests {
                     is_directory: true,
                 },
             ],
-        };
-        let candidates = explicit_candidates(&resolver, &cwd, None, "../ar");
+        });
+        let discovery = PathDiscovery::with_resolver(resolver.clone(), None);
+        let candidates = discovery.explicit_candidates(&cwd, "../ar");
         assert_eq!(resolver.reads.lock().unwrap().as_slice(), &[cwd.join("..")]);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].path, "../archive");
@@ -1545,9 +1637,8 @@ mod tests {
             ],
         });
         let mut menu = FileCompletionMenu::with_dependencies(
-            resolver.clone(),
+            PathDiscovery::with_resolver(resolver.clone(), Some(PathBuf::from("/home/tester"))),
             Arc::new(|_| Some(test_walker())),
-            Some(PathBuf::from("/home/tester")),
         );
         menu.open_with_mode(
             "/workspace/project",
@@ -1590,14 +1681,15 @@ mod tests {
     fn home_discovery_preserves_tilde_namespace() {
         let cwd = PathBuf::from("/workspace/project");
         let home = PathBuf::from("/home/tester");
-        let resolver = CountingResolver {
+        let resolver = Arc::new(CountingResolver {
             reads: std::sync::Mutex::new(Vec::new()),
             entries: vec![FileCandidate {
                 path: "notes.txt".into(),
                 is_directory: false,
             }],
-        };
-        let candidates = explicit_candidates(&resolver, &cwd, Some(&home), "~/not");
+        });
+        let discovery = PathDiscovery::with_resolver(resolver.clone(), Some(home.clone()));
+        let candidates = discovery.explicit_candidates(&cwd, "~/not");
         assert_eq!(resolver.reads.lock().unwrap().as_slice(), &[home]);
         assert_eq!(candidates[0].path, "~/notes.txt");
     }
@@ -2585,9 +2677,8 @@ mod tests {
     #[test_case("@notes"; "at_prefix")]
     fn directory_queries_are_literal_and_exclude_lua_items(query: &str) {
         let mut menu = FileCompletionMenu::with_dependencies(
-            Arc::new(RealFileResolver),
+            PathDiscovery::new(None),
             Arc::new(|_| Some(test_walker())),
-            None,
         );
         menu.open_with_mode(
             "/project",

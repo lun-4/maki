@@ -432,6 +432,52 @@ impl PluginHost {
         reply_rx.recv().map_err(|_| PluginError::HostDead)?
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn pause_worker_for_test(&self) -> flume::Sender<()> {
+        let (ready_tx, ready_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        self.inner
+            .prio_tx
+            .send(Request::TestPause {
+                ready: ready_tx,
+                release: release_rx,
+            })
+            .expect("Lua worker is alive");
+        ready_rx.recv().expect("Lua worker reached test pause");
+        release_tx
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn queue_load_source_for_test(
+        &self,
+        name: &str,
+        source: &str,
+    ) -> Result<flume::Receiver<Result<(), PluginError>>, PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .prio_tx
+            .send(Request::LoadSource {
+                name: Arc::from(name),
+                source: source.to_owned(),
+                plugin_dir: None,
+                permissions: PluginPermissions::trusted(),
+                opts: PluginOpts::default(),
+                reply: reply_tx,
+            })
+            .map_err(|_| PluginError::HostDead)?;
+        Ok(reply_rx)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn wait_for_worker_barrier_for_test(&self) {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::TestBarrier { reply: reply_tx })
+            .expect("Lua worker is alive");
+        reply_rx.recv().expect("Lua worker reached test barrier");
+    }
+
     /// Option specs declared by loaded plugins via `maki.api.register_options`,
     /// keyed by plugin name. Used by docgen.
     pub fn plugin_options(&self) -> Result<PluginOptionSpecs, PluginError> {
@@ -773,7 +819,7 @@ impl EventHandle {
         command: Arc<str>,
         args: String,
         depth: u8,
-    ) -> flume::Receiver<()> {
+    ) -> flume::Receiver<Result<(), String>> {
         let (completion, rx) = flume::bounded(1);
         let _ = self.prio_tx.try_send(Request::RunCommand {
             plugin,
@@ -803,6 +849,7 @@ impl EventHandle {
         self.command_arguments
             .submit(CommandArgumentRequest {
                 context,
+                callbacks: None,
                 cancel,
                 reply,
             })
@@ -819,6 +866,7 @@ impl EventHandle {
         self.command_argument_lifecycle
             .submit(CommandArgumentLifecycleRequest {
                 context,
+                callbacks: None,
                 event,
                 item,
                 cancel,
@@ -1209,6 +1257,9 @@ mod tests {
                     mode: "build".to_string(),
                     session: 1,
                     generation: 1,
+                    argument_name: None,
+                    argument_kind: None,
+                    preceding_values: Arc::from([]),
                 },
                 maki_agent::CancelToken::none(),
             )

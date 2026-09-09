@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::arguments::{ArgumentParseError, CommandArguments, ParsedArguments, parse_positional};
 use crate::completion::CommandCompletion;
 use crate::registry::{
     CommandRegistry, RegistrationRecord, TargetHandle, normalize, target_record,
@@ -135,19 +136,36 @@ impl CommandRegistry {
                     &command.spec().name,
                 )));
             }
-            let count = arguments.split_whitespace().count();
-            if !command.spec().arguments.accepts(count) {
-                return CommandOutcome::Failed(CommandError::InvalidArguments {
-                    command: Arc::clone(&command.spec().name),
-                    expected: command.spec().arguments,
-                    actual: count,
-                });
-            }
+            let parsed_arguments = match &command.spec().arguments {
+                CommandArguments::Legacy(arity) => {
+                    let count = arguments.split_whitespace().count();
+                    if !arity.accepts(count) {
+                        return CommandOutcome::Failed(CommandError::InvalidArguments {
+                            command: Arc::clone(&command.spec().name),
+                            expected: *arity,
+                            actual: count,
+                        });
+                    }
+                    None
+                }
+                CommandArguments::Positional(schema) => {
+                    match parse_positional(&arguments, Arc::clone(schema)) {
+                        Ok(parsed) => Some(parsed),
+                        Err(error) => {
+                            return CommandOutcome::Failed(CommandError::TypedArguments {
+                                command: Arc::clone(&command.spec().name),
+                                error,
+                            });
+                        }
+                    }
+                }
+            };
             let invocation = CommandInvocation {
                 command_id: command.command_id(),
                 canonical_name: Arc::clone(&command.spec().name),
                 invoked_name: Arc::clone(&command.invoked_name),
                 arguments,
+                parsed_arguments,
                 content,
                 depth,
                 target,
@@ -211,6 +229,10 @@ impl ResolvedCommand {
 
     pub fn completion(&self) -> Option<Arc<dyn CommandCompletion>> {
         self.record.registration.completion.clone()
+    }
+
+    pub fn argument_completions(&self) -> Vec<Option<Arc<dyn CommandCompletion>>> {
+        self.record.registration.argument_completions.clone()
     }
 
     pub fn invoked_name(&self) -> &str {
@@ -299,6 +321,7 @@ pub struct CommandInvocation {
     pub canonical_name: Arc<str>,
     pub invoked_name: Arc<str>,
     pub arguments: Arc<str>,
+    pub parsed_arguments: Option<ParsedArguments>,
     pub content: CommandContent,
     pub depth: usize,
     target: TargetHandle,
@@ -370,6 +393,14 @@ pub enum RegistrationError {
     InvalidAlias(Arc<str>),
     #[error("command argument arity is invalid")]
     InvalidArgumentArity { min: usize, max: usize },
+    #[error("invalid positional argument schema: {0}")]
+    InvalidArgumentSchema(Arc<str>),
+    #[error("optional positional argument precedes required argument: {0}")]
+    InvalidArgumentOrder(Arc<str>),
+    #[error("variadic argument must be last: {0}")]
+    VariadicArgumentMustBeLast(Arc<str>),
+    #[error("invalid enum choices for argument: {0}")]
+    InvalidEnum(Arc<str>),
     #[error("duplicate command spelling: {0}")]
     DuplicateSpelling(Arc<str>),
 }
@@ -391,6 +422,11 @@ pub enum CommandError {
         command: Arc<str>,
         expected: ArgumentArity,
         actual: usize,
+    },
+    #[error("invalid typed arguments for {command}: {error}")]
+    TypedArguments {
+        command: Arc<str>,
+        error: ArgumentParseError,
     },
     #[error("command is unavailable: {0}")]
     UnavailableCommand(Arc<str>),

@@ -218,6 +218,9 @@ fn lifecycle_ctx() -> CommandArgumentContext {
         mode: "build".into(),
         session: 1,
         generation: 1,
+        argument_name: None,
+        argument_kind: None,
+        preceding_values: Arc::from([]),
     }
 }
 

@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::arguments::{
+    CommandArguments, StaticArgumentKind, StaticCommandArguments, StaticPositionalArgument,
+};
 use crate::completion::CommandCompletion;
 use crate::dispatch::{CommandAttachment, CommandBehavior};
 
@@ -139,7 +142,7 @@ pub struct BuiltinDefinition {
     pub name: &'static str,
     pub aliases: &'static [&'static str],
     pub description: &'static str,
-    pub arguments: ArgumentArity,
+    pub arguments: StaticCommandArguments,
     pub argument_hint: Option<&'static str>,
     pub required_capabilities: TargetCapabilities,
     pub completion: Option<CompletionKey>,
@@ -163,19 +166,38 @@ const LIFECYCLE: TargetCapabilities =
 const RELOAD: TargetCapabilities = TargetCapabilities::from_capability(TargetCapability::Reload);
 
 macro_rules! builtin {
+    ($id:ident, $name:expr, $aliases:expr, $description:expr, typed $arguments:expr, $hint:expr, $caps:expr, $completion:expr $(,)?) => {
+        BuiltinDefinition {
+            id: BuiltinId::$id,
+            name: $name,
+            aliases: $aliases,
+            description: $description,
+            arguments: StaticCommandArguments::Positional($arguments),
+            argument_hint: $hint,
+            required_capabilities: $caps,
+            completion: $completion,
+        }
+    };
     ($id:ident, $name:expr, $aliases:expr, $description:expr, $arguments:expr, $hint:expr, $caps:expr, $completion:expr $(,)?) => {
         BuiltinDefinition {
             id: BuiltinId::$id,
             name: $name,
             aliases: $aliases,
             description: $description,
-            arguments: $arguments,
+            arguments: StaticCommandArguments::Legacy($arguments),
             argument_hint: $hint,
             required_capabilities: $caps,
             completion: $completion,
         }
     };
 }
+
+const CD_ARGUMENTS: &[StaticPositionalArgument] = &[StaticPositionalArgument {
+    name: "path",
+    kind: StaticArgumentKind::Directory,
+    optional: true,
+    variadic: false,
+}];
 
 pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
     builtin!(
@@ -272,9 +294,9 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
         Cd,
         "/cd",
         &[],
-        "Change working directory. Paths may contain spaces.",
-        ArgumentArity::ANY,
-        Some("<path>"),
+        "Change working directory. Quote paths containing spaces.",
+        typed CD_ARGUMENTS,
+        None,
         CWD,
         None,
     ),
@@ -344,17 +366,32 @@ pub const BUILTIN_COMMANDS: &[BuiltinDefinition] = &[
 pub struct CommandSpec {
     pub name: Arc<str>,
     pub aliases: Arc<[Arc<str>]>,
-    pub arguments: ArgumentArity,
+    pub arguments: CommandArguments,
     pub docs: CommandDocs,
     pub required_capabilities: TargetCapabilities,
 }
 
+impl CommandSpec {
+    pub fn argument_hint(&self) -> Option<Arc<str>> {
+        self.docs
+            .argument_hint
+            .clone()
+            .or_else(|| self.arguments.usage_hint())
+    }
+}
+
 impl BuiltinDefinition {
     pub fn spec(&self) -> CommandSpec {
+        let arguments = match self.arguments {
+            StaticCommandArguments::Legacy(arguments) => CommandArguments::Legacy(arguments),
+            StaticCommandArguments::Positional(arguments) => {
+                CommandArguments::Positional(arguments.iter().copied().map(Into::into).collect())
+            }
+        };
         CommandSpec {
             name: Arc::from(self.name),
             aliases: self.aliases.iter().copied().map(Arc::from).collect(),
-            arguments: self.arguments,
+            arguments,
             docs: CommandDocs {
                 summary: Arc::from(self.description),
                 argument_hint: self.argument_hint.map(Arc::from),
@@ -364,9 +401,7 @@ impl BuiltinDefinition {
     }
 }
 
-/// Argument count bounds. Arguments are counted by splitting the raw
-/// remainder on whitespace, with no shell-like quoting: `/cd "my dir"` counts
-/// as two arguments.
+/// Argument count bounds for legacy commands. Arguments are counted by splitting the raw remainder on whitespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArgumentArity {
     pub min: usize,
@@ -413,6 +448,27 @@ pub struct Registration {
     pub spec: CommandSpec,
     pub behavior: Arc<dyn CommandBehavior>,
     pub completion: Option<Arc<dyn CommandCompletion>>,
+    pub argument_completions: Vec<Option<Arc<dyn CommandCompletion>>>,
+}
+
+impl Registration {
+    pub fn with_argument_completion(
+        mut self,
+        name: impl Into<Arc<str>>,
+        provider: Arc<dyn CommandCompletion>,
+    ) -> Self {
+        let name = name.into();
+        if let Some(arguments) = self.spec.arguments.positional()
+            && let Some(index) = arguments.iter().position(|argument| argument.name == name)
+        {
+            if self.argument_completions.len() != arguments.len() {
+                self.argument_completions
+                    .resize_with(arguments.len(), || None);
+            }
+            self.argument_completions[index] = Some(provider);
+        }
+        self
+    }
 }
 
 impl fmt::Debug for Registration {
