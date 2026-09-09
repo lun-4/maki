@@ -167,6 +167,7 @@ impl App {
     }
 
     pub(super) fn reset_ui_chrome(&mut self) {
+        let _ = self.cancel_middle_scroll();
         let splash_frame = self.chats.first().and_then(Chat::splash_frame).cloned();
         self.chats.clear();
         let mut main = Chat::new(

@@ -31,6 +31,13 @@ end
 
 Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for any command listed above, plus plugin commands and MCP prompts. See [`maki.api.run_command`](/docs/lua-api/#maki-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#maki-ui-action) to bind a key instead of a name."#;
 
+fn markdown_cell(value: &str) -> String {
+    value
+        .replace('|', "\\|")
+        .replace("\r\n", "<br>")
+        .replace(['\r', '\n'], "<br>")
+}
+
 fn write_row(
     out: &mut String,
     name: &str,
@@ -40,15 +47,16 @@ fn write_row(
 ) {
     writeln!(
         out,
-        "| `{name}` | {} | {} | {} |",
-        description.replace('|', "\\|"),
-        argument_hint.unwrap_or(""),
+        "| `{}` | {} | {} | {} |",
+        markdown_cell(name),
+        markdown_cell(description),
+        markdown_cell(argument_hint.unwrap_or("")),
         if tui_only { "yes" } else { "no" }
     )
     .unwrap();
 }
 
-pub fn generate() -> String {
+pub fn generate() -> color_eyre::Result<String> {
     let mut out = String::new();
     writeln!(out, "+++").unwrap();
     writeln!(out, "title = \"Commands\"").unwrap();
@@ -61,7 +69,7 @@ pub fn generate() -> String {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "Type `/` in the TUI input box to open the command palette. A leading slash command is also recognized in `--print`, SDK stream mode, and ACP. Command names use exact ASCII-insensitive matching. Unknown and unavailable slash-prefixed text remains a model prompt. A known available command with invalid arguments returns an error instead of becoming a prompt."
+        "Type `/` in the TUI input box to open the command palette. A leading slash command is also recognized in `--print`, SDK stream mode, and ACP. Command names use exact ASCII-insensitive matching. Unknown and unavailable slash-prefixed text is rejected with an error instead of becoming a prompt. Prefix a literal message that starts with `/` with another slash to send it as text: `//lmao` sends `/lmao`. Text sent programmatically (`maki.session.prompt`, subagent chat) is not parsed as a command. A known available command with invalid arguments returns an error instead of becoming a prompt."
     )
     .unwrap();
     writeln!(out).unwrap();
@@ -101,7 +109,7 @@ pub fn generate() -> String {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "The portable built-ins are `/compact`, `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises these built-ins plus custom, MCP, and portable Lua commands. ACP hides `/new` and `/clear`. The ACP client owns session creation through `session/new`. A typed `/new` or `/clear` resolves locally and returns guidance to use `session/new`; it does not invoke model inference or reset model history. Commands that require TUI capabilities are omitted from ACP. Invoking an unavailable command sends the complete input as ordinary model text."
+        "The portable built-ins are `/compact`, `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises these built-ins plus custom, MCP, and portable Lua commands. ACP hides `/new` and `/clear`. The ACP client owns session creation through `session/new`. A typed `/new` or `/clear` resolves locally and returns guidance to use `session/new`; it does not invoke model inference or reset model history. Commands that require TUI capabilities are omitted from ACP. Invoking an unavailable command returns an error; to send it as a literal prompt, escape the leading slash (`//help` sends `/help`)."
     )
     .unwrap();
 
@@ -116,7 +124,7 @@ pub fn generate() -> String {
     writeln!(out).unwrap();
     writeln!(out, "| Command | Description | Arguments | TUI-only |").unwrap();
     writeln!(out, "|---------|-------------|-----------|----------|").unwrap();
-    for cmd in lua_util::load_builtin_plugin_commands() {
+    for cmd in lua_util::load_builtin_plugin_commands()? {
         write_row(
             &mut out,
             &cmd.name,
@@ -285,7 +293,7 @@ pub fn generate() -> String {
     if out.ends_with('\n') {
         out.pop();
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -295,8 +303,24 @@ mod tests {
     use super::generate;
 
     #[test]
+    fn markdown_cells_escape_table_delimiters_and_newlines() {
+        let mut generated = String::new();
+        super::write_row(
+            &mut generated,
+            "name|value",
+            "line 1\nline 2",
+            Some("<a|b>"),
+            false,
+        );
+        assert_eq!(
+            generated,
+            "| `name\\|value` | line 1<br>line 2 | <a\\|b> | no |\n"
+        );
+    }
+
+    #[test]
     fn doc_projection_separates_builtins_and_bundled_plugins() {
-        let generated = generate();
+        let generated = generate().expect("generated commands");
         let (builtins, plugins) = generated
             .split_once("## Bundled plugin commands")
             .expect("bundled plugin command section");
@@ -309,8 +333,19 @@ mod tests {
                 );
             }
         }
-        assert!(plugins.contains(
-            "| `/thinking` | Set thinking effort (bare opens a selector) | [effort] | yes |"
-        ));
+        for row in [
+            "| `/automode` | Toggle bash auto mode (classifier gates every bash command) |  | no |",
+            "| `/build` | Switch to build mode (full tool access) |  | no |",
+            "| `/memory` | View, edit, and delete memory files |  | yes |",
+            "| `/plan` | Switch to plan mode (analyse and write only the plan file) |  | no |",
+            "| `/rename` | Rename the current session | <title> | yes |",
+            "| `/sessions` | Browse and switch sessions | [query] | yes |",
+            "| `/splash` | Preview and select a splash renderer | [splash] | yes |",
+            "| `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. |  | yes |",
+            "| `/thinking` | Set thinking effort (bare opens a selector) | [effort] | yes |",
+            "| `/usage` | Show provider quota and focused-session token usage |  | yes |",
+        ] {
+            assert!(plugins.contains(row), "{row}");
+        }
     }
 }

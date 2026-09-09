@@ -224,7 +224,17 @@ fn drive_print(
             ));
         }
         InputDispatch::Dispatched(CommandOutcome::Failed(error)) => return Err(error.into()),
-        InputDispatch::LiteralInput(_) => literal,
+        InputDispatch::LiteralInput(content) => AgentInput {
+            message: content.text.to_string(),
+            mode: literal.mode.clone(),
+            images: command_attachments::into_images(&content.attachments)?,
+            preamble: Vec::new(),
+            thinking: Default::default(),
+            fast: literal.fast,
+            workflow: literal.workflow,
+            prompt: None,
+            lease_committer: None,
+        },
     };
     runner.run(input)
 }
@@ -539,6 +549,7 @@ pub fn run(
 mod tests {
     use super::*;
     use maki_providers::TokenUsage;
+    use test_case::test_case;
 
     const PRINT_RESULT_FIELDS: &[&str] = &[
         "type",
@@ -732,11 +743,31 @@ mod tests {
     }
 
     #[test]
-    fn unknown_command_runs_literal_input() {
+    fn unknown_command_rejects_and_skips_runner() {
         let registry = CommandRegistry::new();
         let target = target(&registry);
         let sink = CommandTurnMarker;
         let mut literal = input("/unknown literal");
+        literal.images.push(ImageSource::new(
+            maki_agent::ImageMediaType::Webp,
+            Arc::from("AAAA"),
+        ));
+        let mut ran = false;
+        let _ = drive_print(&registry, &target, &sink, literal, |_input: AgentInput| {
+            ran = true;
+            Ok(())
+        })
+        .expect_err("unknown slash command must be rejected");
+        assert!(!ran);
+    }
+
+    #[test_case("//unknown literal", "/unknown literal"; "escaped literal strips one slash")]
+    #[test_case("///unknown literal", "//unknown literal"; "triple slash strips one slash")]
+    fn escaped_slash_runs_literal_input(message: &str, expected: &str) {
+        let registry = CommandRegistry::new();
+        let target = target(&registry);
+        let sink = CommandTurnMarker;
+        let mut literal = input(message);
         literal.images.push(ImageSource::new(
             maki_agent::ImageMediaType::Webp,
             Arc::from("AAAA"),
@@ -748,7 +779,7 @@ mod tests {
         })
         .unwrap();
         let received = received.unwrap();
-        assert_eq!(received.message, "/unknown literal");
+        assert_eq!(received.message, expected);
         assert_eq!(received.images.len(), 1);
         assert_eq!(
             received.images[0].media_type,

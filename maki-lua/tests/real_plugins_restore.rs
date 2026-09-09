@@ -7,14 +7,14 @@ use std::sync::Arc;
 
 use maki_agent::AgentEvent;
 use maki_agent::SessionMailbox;
-use maki_agent::ToolOutput;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PERMISSION_DENIED_PREFIX};
 use maki_agent::session_coordinator::{
     DirectoryAdoptionFuture, ModelAdoptionFuture, SessionCheckpoint, SessionCoordinatorHandle,
     SessionCoordinatorParams, builtin_option_definitions,
 };
-use maki_agent::tools::ToolRegistry;
+use maki_agent::tools::{FILE_TRUNCATED_MARKER, ToolRegistry};
+use maki_agent::{SnapshotLine, SpanStyle, ToolOutput};
 use maki_config::{
     DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey, ToolOutputLines,
 };
@@ -77,6 +77,7 @@ fn batch_state() -> Value {
 struct Restored {
     body: String,
     header: String,
+    spans: Vec<SnapshotLine>,
 }
 
 fn restore(
@@ -110,10 +111,14 @@ fn restore(
     let mut out = Restored {
         body: String::new(),
         header: String::new(),
+        spans: Vec::new(),
     };
     for env in rx.drain() {
         match env.event {
-            AgentEvent::ToolSnapshot { snapshot, .. } => out.body = snapshot.text(),
+            AgentEvent::ToolSnapshot { snapshot, .. } => {
+                out.body = snapshot.text();
+                out.spans = snapshot.lines.to_vec();
+            }
             AgentEvent::ToolHeaderSnapshot { snapshot, .. } => out.header = snapshot.text(),
             _ => {}
         }
@@ -159,7 +164,7 @@ fn batch_restore_renders_real_children_and_click_expands_grep() {
     assert!(text.contains("grep> "), "grep child header: {text}");
     assert!(text.contains("bash> "), "bash child header: {text}");
     // grep's real view reformats `nr:` into gutter lines.
-    assert!(text.contains("    1: fn main() {}"), "grep gutter: {text}");
+    assert!(text.contains(" 1 fn main() {}"), "grep gutter: {text}");
     assert!(
         !text.contains("\n1: fn main"),
         "raw llm text means the child restore degraded to fallback: {text}"
@@ -193,7 +198,7 @@ fn batch_restore_renders_real_children_and_click_expands_grep() {
     );
     let text = &clicked.body;
     assert!(
-        text.contains("    10: fn other() {}"),
+        text.contains("10 fn other() {}"),
         "expanded grep tail visible: {text}"
     );
     assert!(
@@ -285,7 +290,9 @@ const ENTRIES_SUFFIX: &str = " entries";
 
 struct Live {
     body: String,
+    spans: Vec<SnapshotLine>,
     output: String,
+    state: Option<Value>,
     annotation: Option<String>,
 }
 
@@ -307,18 +314,22 @@ fn exec_live(host: &PluginHost, reg: &ToolRegistry, tool: &str, input: Value) ->
     let result = smol::block_on(async { inv.execute(&ctx).await });
     host.load_source("live_barrier", "").unwrap();
     let mut body = String::new();
+    let mut spans = Vec::new();
     for env in rx.drain() {
         if let AgentEvent::ToolSnapshot { snapshot, .. } = env.event {
             body = snapshot.text();
+            spans = snapshot.lines.to_vec();
         }
     }
-    let output = match result.output.expect("tool failed") {
-        maki_agent::ToolOutput::Plain(s) | maki_agent::ToolOutput::Markdown(s) => s.text,
+    let (output, state) = match result.output.expect("tool failed") {
+        maki_agent::ToolOutput::Plain(s) | maki_agent::ToolOutput::Markdown(s) => (s.text, s.state),
         other => panic!("unexpected output: {other:?}"),
     };
     Live {
         body,
+        spans,
         output,
+        state,
         annotation: result.annotation,
     }
 }
@@ -360,6 +371,192 @@ fn index_dir_renders_identically_live_and_restored() {
     assert_eq!(
         restored.body, live.body,
         "restored dir listing must match the live one"
+    );
+}
+
+const READ_TOOL: &str = "read";
+const RUST_SRC: &str = "fn main() {\n    let x = 42;\n    println!(\"{x}\");\n}\n";
+const RUST_LINES: usize = 4;
+
+fn has_syntax_colors(lines: &[SnapshotLine]) -> bool {
+    lines
+        .iter()
+        .flat_map(|l| &l.spans)
+        .any(|s| matches!(&s.style, SpanStyle::Inline(inline) if inline.fg.is_some()))
+}
+
+/// A finished tool is re-rendered through `restore` once its warm buffer is
+/// gone (cache eviction, theme rebake), so restore must produce the same
+/// highlighted view the live handler did, truncation notice included.
+/// Anything less shows up as "clicking lost the syntax highlighting".
+/// `path_key` is the model's spelling: restore gets the raw input, before
+/// alias resolution, so the view must not depend on it.
+#[test_case::test_case(0, "path" ; "whole_file")]
+#[test_case::test_case(2, "path" ; "truncated")]
+#[test_case::test_case(0, "file_path" ; "aliased_path")]
+fn read_renders_identically_live_and_restored(limit: usize, path_key: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("main.rs");
+    std::fs::write(&path, RUST_SRC).unwrap();
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let input = json!({ path_key: path.to_str().unwrap(), "offset": 1, "limit": limit });
+
+    let live = exec_live(&host, &reg, READ_TOOL, input.clone());
+    let restored = restore(
+        &host,
+        READ_TOOL,
+        input,
+        &live.output,
+        live.state,
+        Vec::new(),
+    );
+
+    assert!(
+        has_syntax_colors(&live.spans),
+        "live read view is syntax highlighted: {}",
+        live.body
+    );
+    if limit > 0 && limit < RUST_LINES {
+        assert!(
+            live.body.contains("Truncated"),
+            "live view notes the cut: {}",
+            live.body
+        );
+    }
+    assert_eq!(
+        restored.spans, live.spans,
+        "restored read view must match the live one, colors included"
+    );
+}
+
+const GREP_TOOL: &str = "grep";
+
+/// Same contract as read: grep's restore used to rebuild a plain view from
+/// the LLM output while the live handler highlighted, so an expand that went
+/// through restore dropped the colors.
+#[test]
+fn grep_renders_identically_live_and_restored() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "fn one() {}\nfn two() {}\n").unwrap();
+    std::fs::write(dir.path().join("b.rs"), "fn three() {}\n").unwrap();
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let input = json!({ "pattern": "fn", "path": dir.path().to_str().unwrap() });
+
+    let live = exec_live(&host, &reg, GREP_TOOL, input.clone());
+    let restored = restore(&host, GREP_TOOL, input, &live.output, None, Vec::new());
+
+    assert!(
+        has_syntax_colors(&live.spans),
+        "live grep view is syntax highlighted: {}",
+        live.body
+    );
+    assert_eq!(
+        restored.spans, live.spans,
+        "restored grep view must match the live one, colors included"
+    );
+}
+
+/// The host appends its truncation marker after the last entry. The view
+/// has to keep it, or a cut result set looks complete.
+#[test]
+fn grep_restore_keeps_truncation_marker() {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let output = format!("src/a.rs:\n  1: fn main() {{}}\n\n{FILE_TRUNCATED_MARKER}");
+    let restored = restore(
+        &host,
+        GREP_TOOL,
+        json!({ "pattern": "fn" }),
+        &output,
+        None,
+        Vec::new(),
+    );
+    assert!(
+        restored.body.contains("fn main() {}"),
+        "entry rendered: {}",
+        restored.body
+    );
+    assert!(
+        restored.body.ends_with(FILE_TRUNCATED_MARKER),
+        "marker kept as the last line: {}",
+        restored.body
+    );
+}
+
+/// A batch rebuilds each child through the child's own restore, both when
+/// the child settles live and on batch restore. The child's tool state has
+/// to travel with it, or a read child comes back plain and its expand click
+/// finds no truncated view to open.
+#[test]
+fn batch_read_child_restores_highlighted_and_click_expands_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("long.rs");
+    let src: String = (0..READ_VIEW_CAP + 3)
+        .map(|i| format!("fn f{i}() {{}}\n"))
+        .collect();
+    std::fs::write(&path, &src).unwrap();
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let read_input = json!({ "path": path.to_str().unwrap(), "offset": 1, "limit": 0 });
+
+    let read = exec_live(&host, &reg, READ_TOOL, read_input.clone());
+    assert!(read.state.is_some(), "read reply carries state for restore");
+    let batch_input = json!({ "tool_calls": [
+        { "tool": READ_TOOL, "parameters": read_input },
+    ]});
+    let state = json!({ "children": [
+        { "tool": READ_TOOL, "status": "success", "output": read.output, "state": read.state },
+    ]});
+
+    let collapsed = restore(
+        &host,
+        "batch",
+        batch_input.clone(),
+        "whatever",
+        Some(state.clone()),
+        Vec::new(),
+    );
+    assert!(
+        has_syntax_colors(&collapsed.spans),
+        "read child keeps its highlighting inside a batch: {}",
+        collapsed.body
+    );
+    assert!(
+        collapsed.body.contains(EXPAND_HINT),
+        "read child collapsed past its cap: {}",
+        collapsed.body
+    );
+    let last_fn = format!("f{}()", READ_VIEW_CAP + 2);
+    assert!(
+        !collapsed.body.contains(&last_fn),
+        "tail hidden while collapsed: {}",
+        collapsed.body
+    );
+
+    let notice_row = 1 + collapsed
+        .body
+        .lines()
+        .position(|l| l.contains(EXPAND_HINT))
+        .expect("read truncation notice in collapsed render");
+    let clicked = restore(
+        &host,
+        "batch",
+        batch_input,
+        "whatever",
+        Some(state),
+        vec![notice_row],
+    );
+    assert!(
+        clicked.body.contains(&last_fn),
+        "click on the read child expands it: {}",
+        clicked.body
+    );
+    assert!(
+        has_syntax_colors(&clicked.spans),
+        "expanded read child is still highlighted: {}",
+        clicked.body
     );
 }
 

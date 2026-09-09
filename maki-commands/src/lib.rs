@@ -13,7 +13,7 @@ pub use dispatch::{
     AgentTurn, CommandAttachment, CommandBehavior, CommandContent, CommandError, CommandHost,
     CommandInvocation, CommandOutcome, FrontendFeedback, HostRequest, HostResponse, InputDispatch,
     IsolatedTurn, PromptReference, RegistrationError, ResolutionError, ResolvedCommand,
-    ResolvedInput,
+    ResolvedInput, SlashClass, classify_input,
 };
 pub use registry::{
     CommandRegistry, PresentedCommand, Producer, ProducerPrecedence, RegistrySnapshot,

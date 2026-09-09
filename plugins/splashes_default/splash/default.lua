@@ -36,29 +36,26 @@ local TIPS = {
   { "/cd", "to switch to a different directory" },
 }
 
-local function theme_or(name, fallback)
+local function theme_rgb(name)
   local c = maki.ui.theme_color(name)
-  if c then
-    return {
-      tonumber(string.sub(c, 2, 3), 16),
-      tonumber(string.sub(c, 4, 5), 16),
-      tonumber(string.sub(c, 6, 7), 16),
-    }
+  if not c then
+    return nil
   end
-  return fallback
+  return {
+    tonumber(string.sub(c, 2, 3), 16),
+    tonumber(string.sub(c, 4, 5), 16),
+    tonumber(string.sub(c, 6, 7), 16),
+  }
 end
 
--- theme_color resolves these from the seeded UI palette; the fallback is the
--- dracula default (kept in sync with the old Rust splash) for a host that has
--- not seeded them yet. Resolved per frame (not cached at load) so the splash
--- tracks the active theme and never bakes a pre-seed fallback.
-local BG, FG, ACCENT, TIP, BG_HEX
+-- Resolved per frame (not cached at load) so the splash tracks the active
+-- theme; an unresolved name degrades to the host theme's foreground.
+local BG, FG, ACCENT, TIP
 local function refresh_colors()
-  BG = theme_or("background", { 40, 42, 54 })
-  FG = theme_or("foreground", { 248, 248, 242 })
-  ACCENT = theme_or("accent", { 255, 184, 108 })
-  TIP = theme_or("todo_in_progress", { 241, 250, 140 })
-  BG_HEX = string.format("#%02x%02x%02x", BG[1], BG[2], BG[3])
+  BG = theme_rgb("background")
+  FG = theme_rgb("foreground")
+  ACCENT = theme_rgb("accent")
+  TIP = theme_rgb("todo_in_progress")
 end
 
 local function charlen(s)
@@ -101,9 +98,14 @@ local function hex(r, g, b)
 end
 
 local function text_color(target, alpha, bold)
+  if not target then
+    return { bold = bold }
+  end
+  if not BG then
+    return { fg = hex(target[1], target[2], target[3]), bold = bold }
+  end
   return {
     fg = hex(lerp_u8(BG[1], target[1], alpha), lerp_u8(BG[2], target[2], alpha), lerp_u8(BG[3], target[3], alpha)),
-    bg = BG_HEX,
     bold = bold,
   }
 end
@@ -280,7 +282,7 @@ local function render_splash(w, h, t, fade)
     local items = {
       { "tip: ", text_color(TIP, 0.75 * fade, true) },
       { label, text_color(ACCENT, 0.75 * fade, false) },
-      { " ", { fg = BG_HEX, bg = BG_HEX, bold = false } },
+      { " ", { bold = false } },
       { desc, text_color(FG, 0.5 * fade, false) },
     }
     place_seqs(rows, tip_y + 1, math.floor((w - total) / 2) + 1, items)

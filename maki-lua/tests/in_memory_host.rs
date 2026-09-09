@@ -101,17 +101,7 @@ fn splash_host_boots_disk_free() {
     );
 
     let (handle, _guard) = maki_lua::test_support::spawn_host_for_tests(&["splashes_default"]);
-    let start = Instant::now();
-    let frame = loop {
-        if let Some(frame) = handle.splash_frame(80, 20, 10.0, 1.0) {
-            break frame;
-        }
-        assert!(
-            start.elapsed() < SPLASH_DEADLINE,
-            "splash frame never arrived"
-        );
-        std::thread::sleep(SPLASH_BACKOFF);
-    };
+    let frame = pull_frame(&handle, None);
     assert!(!frame.is_empty(), "rows must be non-empty");
 
     assert!(
@@ -190,10 +180,23 @@ fn wait_for_selection(guard: &maki_lua::test_support::PluginHostGuard, needle: &
 fn pull_frame(handle: &maki_lua::EventHandle, needle: Option<&str>) -> maki_lua::SplashFrame {
     let deadline = Instant::now() + SPLASH_DEADLINE;
     loop {
-        if let Some(frame) = handle.splash_frame(80, 20, 10.0, 1.0) {
-            let all: String = frame.rows.iter().map(|r| r.glyphs.as_str()).collect();
-            if needle.is_none_or(|n| all.contains(n)) {
-                return frame;
+        let reply = handle
+            .request_splash_frame(80, 20, 10.0, 1.0)
+            .expect("splash host disconnected before serving a frame");
+        // Wait on the host's reply instead of re-polling on the 100 ms UI-latency
+        // pull timeout: under CI contention the Lua host thread misses those
+        // windows for seconds at a stretch, and a timer-based poll burns the
+        // whole deadline before the host ever answers.
+        match reply.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Some(frame)) => {
+                let all: String = frame.rows.iter().map(|r| r.glyphs.as_str()).collect();
+                if needle.is_none_or(|n| all.contains(n)) {
+                    return frame;
+                }
+            }
+            Ok(None) | Err(flume::RecvTimeoutError::Timeout) => {}
+            Err(flume::RecvTimeoutError::Disconnected) => {
+                panic!("splash host dropped the frame reply")
             }
         }
         assert!(
@@ -855,17 +858,7 @@ fn splash_fps_overlay_toggles_through_store_and_readout() {
     // them, or the readout would show a dead pipeline (regression: PerfInfo
     // was never seeded, so fps stayed 0 no matter what the splash did).
     for _ in 0..3 {
-        let start = Instant::now();
-        loop {
-            if handle.splash_frame(80, 20, 10.0, 1.0).is_some() {
-                break;
-            }
-            assert!(
-                start.elapsed() < SPLASH_DEADLINE,
-                "blocking pull must render"
-            );
-            std::thread::sleep(SPLASH_BACKOFF);
-        }
+        pull_frame(&handle, None);
     }
     guard
         .host()

@@ -200,13 +200,14 @@ impl Splash {
                     // Explicit styles paint every char (spaces erase the field
                     // behind them), matching the old opaque text block. The bg
                     // is owned by the host (the same `theme.background` the field
-                    // and screen use) so the block never reads as a cut-out, even
-                    // when the plugin's own bg guess is stale.
+                    // and screen use) so the block never reads as a cut-out.
                     SplashStyle::Hex(r, g, b) => Style::new().fg(Color::Rgb(*r, *g, *b)),
-                    SplashStyle::Rgba { fg, bg: _, bold } => {
-                        let mut s = Style::new()
-                            .fg(Color::Rgb(fg.0, fg.1, fg.2))
-                            .bg(Color::Rgb(bg.0, bg.1, bg.2));
+                    SplashStyle::Rgba { fg, bold } => {
+                        let mut s = match fg {
+                            Some((r, g, b)) => Style::new().fg(Color::Rgb(*r, *g, *b)),
+                            None => Style::new().fg(theme.foreground),
+                        }
+                        .bg(Color::Rgb(bg.0, bg.1, bg.2));
                         if *bold {
                             s = s.add_modifier(Modifier::BOLD);
                         }
@@ -257,6 +258,8 @@ mod tests {
     use maki_lua::SplashRow;
     use std::time::Duration;
     use test_case::test_case;
+
+    const EXPLICIT_FG: (u8, u8, u8) = (10, 20, 30);
 
     fn transition_at(from: (u8, u8, u8), to: (u8, u8, u8), offset: Duration) -> (u8, u8, u8) {
         let mut ct = ColorTransition::new(Color::Rgb(from.0, from.1, from.2));
@@ -355,8 +358,7 @@ mod tests {
         let rows = frame(vec![SplashRow {
             glyphs: "ab cd".into(),
             style: SplashStyle::Rgba {
-                fg: (10, 20, 30),
-                bg: (40, 42, 54),
+                fg: Some(EXPLICIT_FG),
                 bold: false,
             },
         }]);
@@ -364,31 +366,15 @@ mod tests {
         assert!(text.contains('a') && text.contains(' ') && text.contains('d'));
     }
 
-    /// Diagnostic for the "cut-out text" regression: the plugin sends an
-    /// explicit text bg (resolved from `theme_color` with a Dracula fallback),
-    /// but the field cells and the screen are painted with `theme.background`.
-    /// The blit must paint the text bg with the host's `theme.background`, not
-    /// the plugin's, or the centered block reads as a different colour.
+    /// A segment without `fg` degrades to the host theme's foreground on the
+    /// theme background: the plugin carries no palette of its own.
     #[test]
-    fn blit_text_bg_uses_theme_background_not_plugin_bg() {
+    fn blit_rgba_missing_fg_uses_theme_foreground() {
         let theme = theme::current();
-        let (tr, tg, tb) = match theme.background {
-            Color::Rgb(r, g, b) => (r, g, b),
-            other => panic!("expected rgb theme background, got {other:?}"),
-        };
-        let theme_bg = Color::Rgb(tr, tg, tb);
-        // Deliberately divergent plugin bg so a buggy blit is detectable.
-        let plugin_bg: (u8, u8, u8) = (200, 100, 50);
-        assert_ne!(
-            plugin_bg,
-            (tr, tg, tb),
-            "fixture bg must differ from theme bg"
-        );
         let rows = frame(vec![SplashRow {
             glyphs: "abc".into(),
             style: SplashStyle::Rgba {
-                fg: (10, 20, 30),
-                bg: plugin_bg,
+                fg: None,
                 bold: false,
             },
         }]);
@@ -396,11 +382,30 @@ mod tests {
         let mut buf = Buffer::empty(area);
         let splash = Splash::new(true);
         splash.blit(area, &mut buf, &rows, Color::Blue);
-        let cell_bg = buf.cell((0, 0)).unwrap().style().bg.unwrap_or(Color::Reset);
-        assert_eq!(
-            cell_bg, theme_bg,
-            "text bg must be the theme background, got {cell_bg:?} (theme {theme_bg:?})"
-        );
+        let cell = buf.cell((0, 0)).unwrap();
+        assert_eq!(cell.style().fg, Some(theme.foreground));
+        assert_eq!(cell.style().bg, Some(theme.background));
+    }
+
+    /// An explicit `fg` keeps the segment colour; the cell background is
+    /// always the host's theme background, never a plugin-supplied one.
+    #[test]
+    fn blit_rgba_keeps_explicit_fg_on_theme_bg() {
+        let theme = theme::current();
+        let rows = frame(vec![SplashRow {
+            glyphs: "abc".into(),
+            style: SplashStyle::Rgba {
+                fg: Some(EXPLICIT_FG),
+                bold: false,
+            },
+        }]);
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+        let splash = Splash::new(true);
+        splash.blit(area, &mut buf, &rows, Color::Blue);
+        let cell = buf.cell((0, 0)).unwrap();
+        assert_eq!(cell.style().fg, Some(Color::Rgb(10, 20, 30)));
+        assert_eq!(cell.style().bg, Some(theme.background));
     }
 
     fn serialize_cells(buf: &Buffer) -> String {

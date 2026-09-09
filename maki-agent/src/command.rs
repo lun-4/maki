@@ -1101,7 +1101,9 @@ mod tests {
         for input in ["/new", "/clear"] {
             assert!(matches!(
                 smol::block_on(registry.dispatch_input(&target, input.into())),
-                maki_commands::InputDispatch::LiteralInput(content) if content.text.as_ref() == input
+                maki_commands::InputDispatch::Dispatched(CommandOutcome::Failed(
+                    CommandError::UnknownCommand(name)
+                )) if name.as_ref() == input
             ));
         }
     }

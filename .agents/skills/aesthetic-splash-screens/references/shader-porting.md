@@ -73,9 +73,9 @@ silently get a different (usually uglier) dynamic.
 
 Full-color effects map each cell to a quantized hex fg style plus a glyph from
 the luminance ramp (`" .:-=+*#%@"`). Use the template's `shade_style` (5-bit
-quantization) and `ramp_glyph`. Effects that ARE light (fire) use bg-colored
-spaces via a small `pixel_style` helper instead; they look blank in text
-dumps, judge them by `seg.style.bg` values.
+quantization) and `ramp_glyph`. Effects that ARE light (fire) use
+theme-background-colored spaces via a small `pixel_style` helper instead; they
+look blank in text dumps, judge them by `seg.style.fg` values.
 
 ## Performance playbook
 
