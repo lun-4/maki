@@ -181,8 +181,8 @@ Every named test below must be added or updated so it fails when the correspondi
 | AC.8 | `plugins/options/tests/spec.lua`: `renders_options_with_current_values`, `opens_values_at_current_selection`, `sets_selected_value`, `reports_stale_option`, `reports_setter_error`; config/loader test `options_plugin_is_default_without_keybinding` |
 | AC.9 | `plugins/bash/tests/spec.lua`: `automode_reads_explicit_session`, `automode_sessions_do_not_leak`, `automode_persisted_value_wins_over_default`; integration test `automode_command_and_selector_share_setter` |
 | AC.10 | `maki-agent`: `change_directory_returns_and_commits_canonical_path`, `failed_change_directory_is_atomic`; `maki-acp`: `cd_feedback_is_visible_not_history`, `tool_locations_follow_live_cwd`; persistence reload test `canonical_cwd_round_trips` |
-| AC.11 | `maki-agent`: `manual_compaction_checkpoints_before_completion`, `manual_compaction_failure_and_cancel_are_terminal`; `maki-acp`: `compact_tool_progress_success_sequence`, `compact_tool_progress_failure_sequence`, `compact_prompt_completes_once`; reload test `compacted_history_loads_without_followup_turn` |
-| AC.12 | new `maki-agent::agent::isolated_turn` tests: `isolated_turn_closes_copy_and_uses_empty_tools`, `isolated_turn_preserves_images_and_build_system`, `isolated_turn_preserves_primary_history_on_success`, `..._on_failure`, `..._on_cancel`; `maki-acp`: `btw_streams_and_completes_active_prompt`; `maki-ui`: `btw_modal_uses_shared_isolated_service` |
+| AC.11 | `maki-agent`: `manual_compaction_persists_before_reporting_success`, `failed_persistence_reports_failure_and_rolls_history_back`, `a_failed_compaction_is_never_persisted`, `cancelled_persistence_reports_cancellation_not_failure`; `maki-acp`: `compact_tool_progress_success_sequence`, `compact_tool_progress_failure_sequence`, `compact_prompt_cancellation_completes_once`; reload test `compacted_history_loads_without_followup_turn` |
+| AC.12 | `maki-agent::agent::isolated_turn`: `isolated_turn_uses_copy_and_empty_tools` (empty tools and the Build system text), `isolated_turn_closes_dangling_tool_calls_in_its_copy`, `isolated_turn_preserves_primary_history_on_failure`, `..._on_cancel`; `maki-acp`: `btw_streams_and_completes_active_prompt`, `isolated_btw_is_not_forwarded_to_primary_agent`. The primary history is untouched by construction rather than by assertion -- `IsolatedTurnRequest.history` is an owned `Vec<Message>`, so the turn has nothing to mutate |
 | AC.13 | Retain or add individually named regressions: `command_precedence_prefers_expected_producer`, `registry_generation_invalidates_stale_target`, `custom_lua_command_dispatches_on_portable_target`, `mcp_prompt_preserves_reference_and_arguments`, `normal_command_preserves_image_attachments`, `unknown_slash_prompt_is_rejected`, `unavailable_interactive_command_is_rejected`, `escaped_slash_prompt_is_sent_literal`, `stale_session_option_handle_is_rejected`, `tui_model_selector_uses_coordinator`, `tui_toggle_controls_use_coordinator`, `tui_new_and_clear_reset_session`, `tui_compact_preserves_expected_presentation`, `tui_cd_uses_canonical_feedback`, `tui_btw_uses_shared_isolated_service`, `session_restore_preserves_pricing_and_history` |
 | AC.14 | `maki-acp`: harness self-tests `collector_preserves_wire_order`, `operation_terminal_is_compare_and_set`, `fake_provider_drives_stream_without_stdio`, plus end-to-end scenarios `server_session_harness_drives_new_load_prompt_compact_and_btw_with_ordered_terminals` and `server_session_harness_close_cancel_races_complete_once`; `just gen-docs-check`; manual record `zed-acp-command-effects` containing the requested message/order and visible-behavior checks |
 
@@ -531,3 +531,62 @@ Two semantic conflicts that merged cleanly and failed afterwards:
 `cargo test --workspace`: it shares the `CHECK_CALLS`/`WRITE_CALLS` atomics with
 the other tests in its binary. It came in with `db1a54f9` and nextest does not
 hit it, since each test gets its own process. Upstream of this plan.
+
+## Follow-ups from the merge audit
+
+Three agents audited the merged branch: the resolution itself, the acceptance
+criteria, and whether anything from `mistress` had been quietly undone. The
+merge came back clean on all three counts -- no side's changes were lost, the
+`//` escape and unknown-command rejection reach every frontend, and the
+`self.focused` invariant from `4b12e80b` survives the rewritten restore path.
+What the audit did find was one interaction bug and a set of criteria whose
+tests do not pin what their names claim.
+
+### Fixed
+
+- `maki-lua/src/api/tool.rs`: `nested_dispatch_result` matched `Dispatched(_)`
+  as success. `mistress` wrote it when the only outcomes were `Completed` and
+  `AgentTurn`; this plan added `IsolatedTurn`, `ManualCompaction` and
+  `FrontendFeedback`, and a nested dispatch has no frontend to execute any of
+  them. So `maki.api.run_command("/compact")` from inside another command's
+  handler returned `true` to Lua having done nothing, and `/new`'s guidance text
+  was discarded. Only `Completed` is finished by the time it returns; everything
+  else now reports that it needs a frontend. `AgentTurn` is included -- it was
+  swallowed on `mistress` too, for the same reason.
+- `maki-agent/src/headless.rs`: the manual-compaction arm committed history
+  before reporting `Completed`, correctly, but nothing tested it, and
+  `headless.rs` has no seam to test it through. The persist-then-decide step is
+  now `settle_manual_compaction`, taking the persistence step as a parameter.
+  Reversing commit and terminal, or persisting a compaction that failed, breaks
+  three of its four tests.
+- `maki-agent/src/agent/isolated_turn.rs`: `run_with_outcome` asserted that a
+  locally-owned `Vec` was unchanged after passing a `.clone()` into the callee.
+  That cannot fail, and it was standing in for AC.12's history guarantee. The
+  guarantee is real but structural, so the assertion is gone and the tests now
+  pin what the provider is handed: empty tools, the Build system text, and
+  dangling tool calls closed in the copy.
+- `maki-docgen/src/gen_commands.rs`: the built-ins table's `TUI-only` column
+  reported only the interactive-UI capability, so `/new` read as `no` directly
+  above prose saying it is not portable. The column is now `Frontends`, computed
+  against `portable_capabilities()`, which asks the question the reader has.
+
+### Left open
+
+- **AC.7's restricted validator environment was never built.** `session_option.rs`
+  runs validators with the plugin's full environment; the only guard is a
+  reentrancy flag with no test coverage. This is an unbuilt phase, not a
+  regression.
+- **AC.8, AC.10, AC.14 remain partly unpinned**: `/options`' command body is
+  uncovered beyond three pure helpers, the ACP half of `/cd` (feedback rendering
+  and live-cwd tool locations) has no test, and AC.14's `ServerDeps`/
+  `SessionFactory` refactor and Zed record do not exist -- though the harness
+  capability the AC asks for is genuinely present.
+- **`maki-commands/src/registry.rs`: `resolves_input_for` has no callers.** Dead
+  on both sides of the merge.
+- **Three shared-process-state test defects**, all upstream of this plan and all
+  invisible under nextest, which gives each test its own process:
+  `maki-storage/src/lib.rs`'s `wait_at_replacement_boundary` clones `release_tx`
+  into every waiter so the channel never disconnects, deadlocking
+  `cargo test -p maki-storage` outright; `maki-docgen/src/main.rs` shares
+  `CHECK_CALLS`/`WRITE_CALLS` across tests that run in parallel; and
+  `maki-providers`' `seed_catalog_for_tests` races on a `OnceLock`.
