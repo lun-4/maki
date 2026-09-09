@@ -34,7 +34,6 @@ use maki_providers::{
     ContentBlock, Message, Model, ModelError, Role, ThinkingConfig, TokenUsage, add_cost,
 };
 use maki_storage::id::MakiId;
-use maki_storage::sessions::StoredThinking;
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
 use serde_json::Value as JsonValue;
 use tracing::{info, warn};
@@ -590,7 +589,9 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
 ///     annotation event. Must not yield.
 ///   `on_usage` (function?) - called with a formatted cumulative token usage
 ///     string. Must not yield.
-/// @return (string?, string?) Tool output text, or `(nil, err)` on failure.
+/// @return (string?, string?, any) Tool output text, or `(nil, err)` on
+///   failure. The third value is the tool's `state` (see `register_tool`),
+///   for callers that hand it back to the tool's `restore` later.
 /// @example
 /// local out, err = maki.agent.call_tool(ctx, "bash", {
 ///   command = "ls -la",
@@ -605,9 +606,12 @@ async fn call_tool(
     name: String,
     input: LuaValue,
     opts: Option<Table>,
-) -> LuaResult<Pair<String>> {
+) -> LuaResult<(Option<String>, Option<String>, LuaValue)> {
     let input_json = lua_to_json(&lua, &input)?;
-    let agent = try_pair!(dispatch_ctx(&ctx, "call_tool"));
+    let agent = match dispatch_ctx(&ctx, "call_tool") {
+        Ok(a) => a,
+        Err(e) => return Ok((None, Some(e.to_string()), LuaValue::Nil)),
+    };
     let mut tctx = agent.to_tool_context();
     let (mut on_buf, mut on_ann, mut on_usage, mut rx) = (None, None, None, None);
     if let Some(o) = opts {
@@ -627,7 +631,7 @@ async fn call_tool(
     }
     drop(ctx);
     if let Err(e) = tctx.deadline.check() {
-        return Ok(err_pair(e));
+        return Ok((None, Some(e.to_string()), LuaValue::Nil));
     }
     let cbs = LiveCallbacks {
         tool: &name,
@@ -645,9 +649,13 @@ async fn call_tool(
     if let Some(a) = annotation {
         cbs.deliver(ToolLive::Annotation(a)).await;
     }
+    let state = match done.output.state() {
+        Some(v) => json_to_lua(&lua, v)?,
+        None => LuaValue::Nil,
+    };
     match interpreter_bridge::flatten(&done) {
-        Ok(text) => Ok((Some(text), None)),
-        Err(err) => Ok((None, Some(err))),
+        Ok(text) => Ok((Some(text), None, state)),
+        Err(err) => Ok((None, Some(err), state)),
     }
 }
 
@@ -871,8 +879,8 @@ async fn session(
     }
 
     let thinking = match thinking_val {
-        Some(LuaValue::String(s)) => match StoredThinking::parse_setting(&s.to_str()?) {
-            Ok(stored) => ThinkingConfig::from(stored),
+        Some(LuaValue::String(s)) => match s.to_str()?.parse::<ThinkingConfig>() {
+            Ok(config) => config,
             Err(e) => return Ok(err_pair(format!("invalid thinking: {e}"))),
         },
         Some(LuaValue::Integer(n)) => match u32::try_from(n) {

@@ -154,7 +154,8 @@ local function child_body_buf(c, tol)
   local t = maki.api.get_tool(c.tool)
   local buf
   if t and t.restore then
-    local ok, res = pcall(t.restore, c.params, output, c.status == STATUS.ERROR, { tool_output_lines = tol })
+    local rctx = { tool_output_lines = tol, state = c.state }
+    local ok, res = pcall(t.restore, c.params, output, c.status == STATUS.ERROR, rctx)
     buf = ok and res or nil
   end
   return buf or ToolView.restore(output, { max_lines = tol[c.tool] or tol.other, keep = "head" })
@@ -284,6 +285,7 @@ local function to_state(children)
       output = c.output,
       annotation = c.annotation,
       usage = c.usage,
+      state = c.state,
     }
   end
   return { children = out }
@@ -424,13 +426,16 @@ end
 
 -- A child the sweep settled may be settled once more, when its own call
 -- comes back with the partial output the sweep could not know about.
-function Batch:settle(c, status, output)
+-- `state` is the child's own tool state, handed back to its restore so
+-- the settled body matches a standalone run of the same tool.
+function Batch:settle(c, status, output, state)
   if TERMINAL[c.status] and not c.swept then
     error(string.format(RESETTLE_FMT, c.tool, c.status, status))
   end
   c.swept = nil
   c.status = status
   c.output = output
+  c.state = state
   self:attach_body(c)
   self:rerender()
 end
@@ -443,7 +448,7 @@ function Batch:run_child(c, ctx)
   end
   c.status = STATUS.RUNNING
   self:rerender()
-  local text, err = maki.agent.call_tool(ctx, c.tool, c.params, {
+  local text, err, state = maki.agent.call_tool(ctx, c.tool, c.params, {
     -- Clicks on a still-streaming child are a no-op: its click handler
     -- lives on the child's own handle, not on this wrapper buf.
     on_live_buf = function(b)
@@ -464,14 +469,14 @@ function Batch:run_child(c, ctx)
   -- keeping.
   if TERMINAL[c.status] then
     if err and c.swept and err ~= c.output then
-      self:settle(c, STATUS.ERROR, err)
+      self:settle(c, STATUS.ERROR, err, state)
     end
     return
   end
   if err then
-    self:settle(c, STATUS.ERROR, err)
+    self:settle(c, STATUS.ERROR, err, state)
   else
-    self:settle(c, STATUS.SUCCESS, text)
+    self:settle(c, STATUS.SUCCESS, text, state)
   end
 end
 
@@ -572,7 +577,7 @@ local function restore(input, output, _is_error, rctx)
       local c = children[i]
       c.status = TERMINAL[sc.status] and sc.status or STATUS.ERROR
       c.output, c.annotation = sc.output, sc.annotation
-      c.usage = sc.usage
+      c.usage, c.state = sc.usage, sc.state
     end
     return Batch.new(children, tol).buf
   end

@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::providers::ResolvedAuth;
+use crate::types::ThinkingConfigExt;
 use crate::{
     AgentError, ContentBlock, EffortDialect, Message, ProviderEvent, Role, StopReason,
     StreamResponse, ThinkingConfig, TokenUsage,

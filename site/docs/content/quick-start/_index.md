@@ -96,6 +96,8 @@ Type what you want done, press Enter, watch it work. Worth knowing on day one:
 - **Escape hatch.** `Esc Esc` cancels a streaming response. When idle, it rewinds instead.
 - **Help.** `Ctrl+H` lists every keybinding, or see [Keybindings](/docs/keybindings/).
 
+Middle-click the conversation transcript to start continuous scrolling, then release the button. A marker shows the starting position. Move above it to scroll up or below it to scroll down; greater vertical distance increases speed, while the starting row and one row on either side pause scrolling. Scrolling continues when the pointer stops. Middle-click again or press Escape to stop; other key presses, paste, mouse clicks and wheel scrolling also stop it and retain their usual action. This works only in the transcript, not input fields, pickers or overlays. The terminal must report middle-clicks and pointer movement without a held button; some terminals or multiplexers paste on middle-click or do not report these events.
+
 ## Default model (optional)
 
 ```lua

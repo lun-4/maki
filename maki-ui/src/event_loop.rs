@@ -26,6 +26,7 @@ use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
 use maki_config::{ModelPolicy, UiConfig};
+use maki_domain::ThinkingConfig as DomainThinkingConfig;
 use maki_lua::{
     EventHandle, HintReader, KeymapReader, ModelRequest, ProviderUsageAck,
     ProviderUsageInvalidation, ProviderUsageLimit, ProviderUsageReply, ProviderUsageSnapshot,
@@ -33,14 +34,13 @@ use maki_lua::{
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
-use maki_providers::{Message, Model, ThinkingConfig, TokenUsage};
+use maki_providers::{Message, Model, TokenUsage};
 use maki_storage::StateDir;
 use maki_storage::StorageError;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::session_lock;
 use maki_storage::sessions::{
-    Prefs, SESSIONS_DIR, SessionError, StoredThinking, StoredTokenUsage, normalize_title,
-    write_prefs,
+    Prefs, SESSIONS_DIR, SessionError, StoredTokenUsage, normalize_title, write_prefs,
 };
 use serde_json::json;
 use tracing::{info, warn};
@@ -291,6 +291,46 @@ fn terminal_input_proves_focus(event: &Event) -> bool {
 #[cfg(windows)]
 fn terminal_input_proves_focus(_event: &Event) -> bool {
     false
+}
+
+fn route_terminal_lifecycle(app: &mut App, event: &Event) {
+    if matches!(event, Event::FocusLost | Event::Resize(..)) {
+        let _ = app.cancel_middle_scroll();
+    }
+}
+
+fn assign_session_focus(outgoing: &mut App, focused: &mut usize, next: usize) {
+    if *focused != next {
+        let _ = outgoing.cancel_middle_scroll();
+        *focused = next;
+    }
+}
+
+fn prepare_terminal_handoff<'a>(
+    apps: impl IntoIterator<Item = &'a mut App>,
+    terminal_focused: &mut bool,
+) {
+    for app in apps {
+        let _ = app.cancel_middle_scroll();
+    }
+    *terminal_focused = false;
+}
+
+fn tick_session(app: &mut App, focused: bool, now: Instant) -> (Dirty, Vec<Action>) {
+    let actions = app.poll_login_picker();
+    let mut dirty = Dirty::NO;
+    if focused {
+        dirty |= app.tick_at(now);
+    } else {
+        let _ = app.float_mgr.tick();
+        dirty |= app.tick_edge_scroll();
+        dirty |= app.tick_error_expiry();
+        dirty |= app.poll_image_paste();
+        dirty |= app.btw_modal.poll();
+        dirty |= app.status_bar.poll_branch_update();
+        dirty |= app.mcp_picker.refresh();
+    }
+    (dirty, actions)
 }
 
 fn parse_session_id(id: &str) -> Result<MakiId, String> {
@@ -753,7 +793,7 @@ impl<'t> EventLoop<'t> {
             }) {
                 // A backgrounded session can finish an `exit_on_done` turn;
                 // focus it so shutdown reports its exit code and id.
-                self.focused = i;
+                self.set_focused(i);
                 self.emit_notifications();
                 break Ok(());
             }
@@ -981,21 +1021,11 @@ impl<'t> EventLoop<'t> {
         }
         let mut login_actions: Vec<(usize, Vec<Action>)> = Vec::new();
         for (i, rt) in self.sessions.iter_mut().enumerate() {
-            if i == self.focused {
-                dirty |= rt.app.tick();
-            } else {
-                let _ = rt.app.float_mgr.tick();
-            }
-            dirty |= rt.app.tick_edge_scroll();
-            dirty |= rt.app.tick_error_expiry();
-            dirty |= rt.app.poll_image_paste();
-            dirty |= rt.app.btw_modal.poll();
-            let actions = rt.app.poll_login_picker();
+            let (session_dirty, actions) = tick_session(&mut rt.app, i == self.focused, now);
+            dirty |= session_dirty;
             if !actions.is_empty() {
                 login_actions.push((i, actions));
             }
-            dirty |= rt.app.status_bar.poll_branch_update();
-            dirty |= rt.app.mcp_picker.refresh();
         }
         for (i, actions) in login_actions {
             self.dispatch(i, actions);
@@ -1351,9 +1381,17 @@ impl<'t> EventLoop<'t> {
         })
     }
 
+    fn prepare_terminal_handoff(&mut self) {
+        prepare_terminal_handoff(
+            self.sessions.iter_mut().map(|rt| &mut rt.app),
+            &mut self.terminal_focused,
+        );
+    }
+
     /// Exits with the editor's status code; `-1` (flashed on the session's
     /// app) when the editor could not be launched.
     fn open_editor(&mut self, idx: usize, path: &std::path::Path) -> i32 {
+        self.prepare_terminal_handoff();
         let result = {
             let _pause = self.input.pause();
             terminal::open_in_editor(path, self.terminal)
@@ -1534,7 +1572,7 @@ impl<'t> EventLoop<'t> {
                     let _ = self.submit_text(idx, prompt);
                 }
                 if focus {
-                    self.focused = idx;
+                    self.set_focused(idx);
                 }
                 let _ = reply_tx.send(Ok(json!(id)));
             }
@@ -1572,9 +1610,11 @@ impl<'t> EventLoop<'t> {
             }
             SessionRequest::GetThinking => {
                 let app = &self.sessions[self.focused].app;
+                let options = maki_domain::THINKING_OPTIONS.to_vec();
                 let reply = Ok(json!({
                     "mode": app.state.thinking.to_string(),
                     "supports_thinking": app.state.model.supports_thinking(),
+                    "options": options,
                 }));
                 let _ = reply_tx.send(reply);
             }
@@ -1587,18 +1627,19 @@ impl<'t> EventLoop<'t> {
                     if !self.sessions[idx].app.state.model.supports_thinking() {
                         return Err("Thinking requires a model that supports it".into());
                     }
-                    let parsed =
-                        StoredThinking::parse_setting(&thinking).map_err(|e| e.to_string())?;
+                    let parsed = thinking
+                        .parse::<DomainThinkingConfig>()
+                        .map_err(|e| e.to_string())?;
                     if set_default {
                         write_prefs(
                             &self.ctx.storage,
                             &Prefs {
-                                default_thinking: Some(parsed),
+                                default_thinking: Some(parsed.into()),
                             },
                         )
                         .map_err(|e| e.to_string())?;
                     }
-                    self.sessions[idx].app.state.thinking = ThinkingConfig::from(parsed);
+                    self.sessions[idx].app.state.thinking = parsed;
                     let mode = self.sessions[idx].app.state.thinking.to_string();
                     self.sessions[idx].app.flash(format!("Thinking: {mode}"));
                     Ok(json!({ "mode": mode }))
@@ -1694,6 +1735,14 @@ impl<'t> EventLoop<'t> {
         self.sessions.len() - 1
     }
 
+    fn set_focused(&mut self, next: usize) {
+        assign_session_focus(
+            &mut self.sessions[self.focused].app,
+            &mut self.focused,
+            next,
+        );
+    }
+
     /// Focus a live session, or bring a stored one up: in place when the
     /// focused session is a blank idle one (nothing worth keeping), otherwise
     /// as a new runtime so the session you came from stays live. A stored
@@ -1701,7 +1750,7 @@ impl<'t> EventLoop<'t> {
     /// elsewhere, is rejected.
     fn focus_session(&mut self, id: MakiId) -> Result<(), String> {
         if let Some(i) = self.position(id) {
-            self.focused = i;
+            self.set_focused(i);
             return Ok(());
         }
         let session = AppSession::load(id, &self.ctx.storage)
@@ -1731,7 +1780,7 @@ impl<'t> EventLoop<'t> {
             return Ok(());
         }
         let idx = self.push_runtime(self.ctx.spawn_runtime(session));
-        self.focused = idx;
+        self.set_focused(idx);
         Ok(())
     }
 
@@ -1753,6 +1802,7 @@ impl<'t> EventLoop<'t> {
     }
 
     fn translate(&mut self, raw: Event) -> (Option<Msg>, Option<Event>) {
+        route_terminal_lifecycle(self.focused_app(), &raw);
         let supports_focus_reporting = self
             .notifier
             .as_ref()
@@ -1949,6 +1999,7 @@ impl<'t> EventLoop<'t> {
                 self.open_editor(idx, &path);
             }
             Action::EditInputInEditor => {
+                self.prepare_terminal_handoff();
                 let current_text = self.sessions[idx].app.input_box.buffer.value();
                 let result = {
                     let _pause = self.input.pause();
@@ -1973,6 +2024,7 @@ impl<'t> EventLoop<'t> {
                 );
             }
             Action::Suspend => {
+                self.prepare_terminal_handoff();
                 let _pause = self.input.pause();
                 terminal::suspend(self.terminal);
                 self.terminal_focused = false;
@@ -2199,12 +2251,125 @@ fn ring_bell() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::selection::SelectionZone;
+    use crossterm::event::KeyModifiers;
     use maki_agent::{AgentId, DoneReason, TurnId, TurnOutcome};
     use maki_providers::TokenUsage;
+    use ratatui::{Terminal, backend::TestBackend};
     use test_case::test_case;
 
     const OBSERVATION: &str = "failed";
     const SHELL_RESULT: &str = "command finished";
+
+    const MIDDLE_SCROLL_STEP: Duration = Duration::from_millis(100);
+    const MIDDLE_SCROLL_CADENCE: Duration = Duration::from_millis(25);
+    const MIDDLE_SCROLL_START: u16 = 60;
+    const MIDDLE_SCROLL_LINES: u16 = 12;
+    const MIDDLE_SCROLL_WIDTH: u16 = 80;
+    const MIDDLE_SCROLL_HEIGHT: u16 = 60;
+
+    fn middle_scroll_app() -> App {
+        let mut app = crate::app::tests::test_app();
+        app.main_chat()
+            .push_user_message("transcript row\n".repeat(200));
+        let mut terminal =
+            Terminal::new(TestBackend::new(MIDDLE_SCROLL_WIDTH, MIDDLE_SCROLL_HEIGHT)).unwrap();
+        terminal.draw(|frame| app.view(frame)).unwrap();
+        app.set_scroll_top(MIDDLE_SCROLL_START);
+        app
+    }
+
+    fn activate_middle_scroll(app: &mut App) -> Instant {
+        let area = app.zones.find(SelectionZone::Messages).unwrap().area;
+        let anchor = area.bottom() - 2;
+        for (kind, row) in [
+            (MouseEventKind::Down(MouseButton::Middle), anchor),
+            (MouseEventKind::Up(MouseButton::Middle), anchor),
+            (MouseEventKind::Moved, area.y),
+        ] {
+            app.update(Msg::Mouse(CtMouseEvent {
+                kind,
+                column: area.x + 2,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }));
+        }
+        assert_eq!(app.cadence().frame(), Some(MIDDLE_SCROLL_CADENCE));
+        Instant::now()
+    }
+
+    #[test_case(Event::FocusLost ; "focus_loss")]
+    #[test_case(Event::Resize(MIDDLE_SCROLL_WIDTH, MIDDLE_SCROLL_HEIGHT) ; "resize")]
+    fn middle_scroll_lifecycle_routing(event: Event) {
+        let mut outgoing = middle_scroll_app();
+        let baseline = outgoing.cadence();
+        let now = activate_middle_scroll(&mut outgoing);
+        route_terminal_lifecycle(&mut outgoing, &event);
+        route_terminal_lifecycle(&mut outgoing, &Event::FocusGained);
+        let _ = tick_session(&mut outgoing, true, now + MIDDLE_SCROLL_STEP);
+        assert_eq!(outgoing.main_chat().scroll_top(), MIDDLE_SCROLL_START);
+        assert_eq!(outgoing.cadence(), baseline);
+
+        let now = activate_middle_scroll(&mut outgoing);
+        let mut focused = 0;
+        assign_session_focus(&mut outgoing, &mut focused, 0);
+        assert_eq!(outgoing.cadence().frame(), Some(MIDDLE_SCROLL_CADENCE));
+        assign_session_focus(&mut outgoing, &mut focused, 1);
+        assert_eq!(focused, 1);
+        let mut incoming = middle_scroll_app();
+        assign_session_focus(&mut incoming, &mut focused, 0);
+        let _ = tick_session(&mut outgoing, true, now + MIDDLE_SCROLL_STEP);
+        assert_eq!(outgoing.main_chat().scroll_top(), MIDDLE_SCROLL_START);
+        assert_eq!(outgoing.cadence(), baseline);
+
+        let now = activate_middle_scroll(&mut outgoing);
+        activate_middle_scroll(&mut incoming);
+        let mut terminal_focused = true;
+        prepare_terminal_handoff([&mut outgoing, &mut incoming], &mut terminal_focused);
+        assert!(!terminal_focused);
+        for app in [&mut outgoing, &mut incoming] {
+            route_terminal_lifecycle(app, &Event::FocusGained);
+            let _ = tick_session(app, true, now + MIDDLE_SCROLL_STEP);
+            assert_eq!(app.main_chat().scroll_top(), MIDDLE_SCROLL_START);
+            assert_eq!(app.cadence(), baseline);
+        }
+    }
+
+    #[test]
+    fn middle_scroll_cadence_and_focus() {
+        let mut focused = middle_scroll_app();
+        let mut background = middle_scroll_app();
+        let baseline = focused.cadence();
+        assert_ne!(baseline.frame(), Some(MIDDLE_SCROLL_CADENCE));
+        activate_middle_scroll(&mut focused);
+        let now = activate_middle_scroll(&mut background);
+        let next = now + MIDDLE_SCROLL_STEP;
+        let (dirty, _) = tick_session(&mut focused, true, next);
+        let _ = tick_session(&mut background, false, next);
+        assert_eq!(dirty, Dirty::YES);
+        assert_eq!(
+            focused.main_chat().scroll_top(),
+            MIDDLE_SCROLL_START - MIDDLE_SCROLL_LINES
+        );
+        assert_eq!(background.main_chat().scroll_top(), MIDDLE_SCROLL_START);
+        let _ = tick_session(&mut focused, true, next);
+        assert_eq!(
+            focused.main_chat().scroll_top(),
+            MIDDLE_SCROLL_START - MIDDLE_SCROLL_LINES
+        );
+        let _ = tick_session(&mut focused, true, next + MIDDLE_SCROLL_STEP);
+        assert_eq!(
+            focused.main_chat().scroll_top(),
+            MIDDLE_SCROLL_START - 2 * MIDDLE_SCROLL_LINES
+        );
+        route_terminal_lifecycle(&mut focused, &Event::FocusLost);
+        assert_eq!(focused.cadence(), baseline);
+        let _ = tick_session(&mut focused, true, next + 2 * MIDDLE_SCROLL_STEP);
+        assert_eq!(
+            focused.main_chat().scroll_top(),
+            MIDDLE_SCROLL_START - 2 * MIDDLE_SCROLL_LINES
+        );
+    }
 
     #[test]
     fn live_session_response_includes_main_message_count() {

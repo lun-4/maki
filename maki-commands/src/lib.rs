@@ -12,7 +12,7 @@ pub use completion::{
 pub use dispatch::{
     AgentTurn, CommandAttachment, CommandBehavior, CommandContent, CommandError, CommandHost,
     CommandInvocation, CommandOutcome, HostRequest, HostResponse, InputDispatch, PromptReference,
-    RegistrationError, ResolutionError, ResolvedCommand, ResolvedInput,
+    RegistrationError, ResolutionError, ResolvedCommand, ResolvedInput, SlashClass, classify_input,
 };
 pub use registry::{
     CommandRegistry, PresentedCommand, Producer, ProducerPrecedence, RegistrySnapshot,
@@ -23,7 +23,6 @@ pub use spec::{
     COMPACT_COMMAND_NAME, CommandDocs, CommandFuture, CommandId, CommandSpec, CompletionKey,
     CompletionSessionId, HostContextRequest, HostContextResponse, InvocationTargetId,
     MAX_COMMAND_DEPTH, ProducerId, Registration, TargetCapabilities, TargetCapability,
-    ThinkingConfig,
 };
 
 #[cfg(test)]

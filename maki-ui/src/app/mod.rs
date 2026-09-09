@@ -4,6 +4,7 @@
 //! places, one per transition: `start_run`, `handle_cancel`, and
 //! `AgentHandles::respawn`. Everything else only reads it.
 
+use maki_providers::ThinkingConfigExt;
 mod btw;
 mod image_paste;
 pub(crate) mod mode;
@@ -59,7 +60,7 @@ use crate::image;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpSnapshotReader, SharedBuf,
@@ -67,14 +68,16 @@ use maki_agent::{
 };
 use maki_commands::{
     AgentTurn, BuiltinOperation, CommandAttachment, CommandContent, CommandError,
-    HostContextRequest, HostContextResponse, HostRequest, HostResponse, TargetHandle,
+    HostContextRequest, HostContextResponse, HostRequest, HostResponse, SlashClass, TargetHandle,
+    classify_input,
 };
 use maki_config::{ModelPolicy, ToolKey, UiConfig};
+use maki_domain::ThinkingConfig;
 use maki_lua::{
     BuiltinAction, CompletionCtx, EventHandle, FloatConfig, HintReader, HintSnapshot, ItemSpec,
     KeymapReader, Split, StatusContentReader, StatusContentSnapshot, WinCommand, WinEvent, WinView,
 };
-use maki_providers::{ContentBlock, Message, Model, Role, ThinkingConfig, add_cost, format_tokens};
+use maki_providers::{ContentBlock, Message, Model, Role, add_cost, format_tokens};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
@@ -87,38 +90,10 @@ const SUBAGENT_STREAMING_STATUS: Status = Status::Streaming;
 
 pub(crate) use crate::agent::QueuedMessage;
 
-fn command_thinking(config: ThinkingConfig) -> maki_commands::ThinkingConfig {
-    use maki_providers::Effort;
-    match config {
-        ThinkingConfig::Off => maki_commands::ThinkingConfig::Off,
-        ThinkingConfig::Adaptive => maki_commands::ThinkingConfig::Adaptive,
-        ThinkingConfig::Effort(Effort::Minimal) => maki_commands::ThinkingConfig::Minimal,
-        ThinkingConfig::Effort(Effort::Low) => maki_commands::ThinkingConfig::Low,
-        ThinkingConfig::Effort(Effort::Medium) => maki_commands::ThinkingConfig::Medium,
-        ThinkingConfig::Effort(Effort::High) => maki_commands::ThinkingConfig::High,
-        ThinkingConfig::Effort(Effort::XHigh) => maki_commands::ThinkingConfig::XHigh,
-        ThinkingConfig::Effort(Effort::Max) => maki_commands::ThinkingConfig::Max,
-        ThinkingConfig::Budget(budget) => maki_commands::ThinkingConfig::Budget(budget),
-    }
-}
-
-fn provider_thinking(config: maki_commands::ThinkingConfig) -> ThinkingConfig {
-    use maki_providers::Effort;
-    match config {
-        maki_commands::ThinkingConfig::Off => ThinkingConfig::Off,
-        maki_commands::ThinkingConfig::Adaptive => ThinkingConfig::Adaptive,
-        maki_commands::ThinkingConfig::Minimal => ThinkingConfig::Effort(Effort::Minimal),
-        maki_commands::ThinkingConfig::Low => ThinkingConfig::Effort(Effort::Low),
-        maki_commands::ThinkingConfig::Medium => ThinkingConfig::Effort(Effort::Medium),
-        maki_commands::ThinkingConfig::High => ThinkingConfig::Effort(Effort::High),
-        maki_commands::ThinkingConfig::XHigh => ThinkingConfig::Effort(Effort::XHigh),
-        maki_commands::ThinkingConfig::Max => ThinkingConfig::Effort(Effort::Max),
-        maki_commands::ThinkingConfig::Budget(budget) => ThinkingConfig::Budget(budget),
-    }
-}
 pub(crate) use mode::{Mode, PlanState, PlanTrigger};
 #[cfg(test)]
 use mouse::EDGE_SCROLL_LINES;
+use mouse::{MIDDLE_SCROLL_INTERVAL, MiddleScroll};
 pub(crate) use queue::{MessageQueue, SubmitOutcome};
 use session::Sent;
 pub(crate) use session::session_has_content;
@@ -378,6 +353,7 @@ pub struct App {
     pub(super) retry_info: Option<RetryInfo>,
     pub(super) zones: ZoneRegistry,
     pub(super) selection_state: Option<SelectionState>,
+    middle_scroll: Option<MiddleScroll>,
     pub(super) clipboard: ClipboardState,
     pub(super) last_esc: Option<Instant>,
     /// Last user keystroke/paste; `None` until the first. Drives input deferral.
@@ -495,6 +471,7 @@ impl App {
             retry_info: None,
             zones: ZoneRegistry::new(),
             selection_state: None,
+            middle_scroll: None,
             clipboard: ClipboardState::new(),
             last_esc: None,
             last_input: None,
@@ -682,6 +659,20 @@ impl App {
     }
 
     pub fn update(&mut self, msg: Msg) -> Vec<Action> {
+        match &msg {
+            Msg::Key(key) if key.kind == KeyEventKind::Release => return vec![],
+            Msg::Key(key) => {
+                let active = self.middle_scroll.is_some();
+                let _ = self.cancel_middle_scroll();
+                if active && key.code == KeyCode::Esc {
+                    return vec![];
+                }
+            }
+            Msg::Paste(_) | Msg::Scroll { .. } => {
+                let _ = self.cancel_middle_scroll();
+            }
+            _ => {}
+        }
         let actions = match msg {
             Msg::Key(key) => {
                 self.last_input = Some(Instant::now());
@@ -723,6 +714,7 @@ impl App {
         // A modal-closing key or an answered permission yields the next demand
         // immediately, rather than waiting for the next 100ms tick.
         let _ = self.promote_deferred_if_ready();
+        let _ = self.validate_middle_scroll();
         actions
     }
 
@@ -1549,7 +1541,7 @@ impl App {
         self.exit_request = ExitRequest::None;
     }
 
-    pub(crate) fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
+    pub(crate) fn handle_submit(&mut self, mut sub: Submission) -> Vec<Action> {
         // Any main-input submit releases a manual Alt+M hold, so the deferred
         // panel re-promotes once the user has placed their message.
         self.submit_released = true;
@@ -1582,7 +1574,31 @@ impl App {
                 visible: prefix.visible,
             }];
         }
-        self.submit_or_queue(sub.into())
+        match classify_input(&sub.text) {
+            SlashClass::Plain => self.submit_or_queue(sub.into()),
+            SlashClass::EscapedLiteral(literal) => {
+                sub.text = literal.to_owned();
+                self.submit_or_queue(sub.into())
+            }
+            SlashClass::Command(_) => {
+                let attachments = sub
+                    .images
+                    .iter()
+                    .map(|image| CommandAttachment {
+                        media_type: Arc::from(image.media_type.mime()),
+                        data: Arc::clone(&image.data),
+                    })
+                    .collect::<Arc<[_]>>();
+                self.command_runtime.dispatch_input(
+                    &self.command_target,
+                    CommandContent {
+                        text: Arc::from(sub.text.as_str()),
+                        attachments,
+                    },
+                );
+                vec![]
+            }
+        }
     }
 
     fn handle_cancel(&mut self) -> Vec<Action> {
@@ -2136,9 +2152,6 @@ impl App {
                     HostContextRequest::WorkingDirectory => HostContextResponse::WorkingDirectory(
                         PathBuf::from(&self.state.session.cwd),
                     ),
-                    HostContextRequest::ThinkingConfig => {
-                        HostContextResponse::ThinkingConfig(command_thinking(self.state.thinking))
-                    }
                     HostContextRequest::FastModeSupported => {
                         HostContextResponse::FastModeSupported(self.state.model.supports_fast())
                     }
@@ -2234,15 +2247,6 @@ impl App {
                     }
                     .into(),
                 );
-                vec![]
-            }
-            BuiltinOperation::SetThinking { config } => {
-                if !self.state.model.supports_thinking() {
-                    self.flash("Thinking requires a model that supports it".into());
-                } else {
-                    self.state.thinking = provider_thinking(config);
-                    self.flash(format!("Thinking: {}", self.state.thinking));
-                }
                 vec![]
             }
             BuiltinOperation::ToggleFast => {
@@ -2631,6 +2635,10 @@ impl App {
     }
 
     pub fn tick(&mut self) -> Dirty {
+        self.tick_at(Instant::now())
+    }
+
+    pub(crate) fn tick_at(&mut self, now: Instant) -> Dirty {
         // `|` never short-circuits: every poller must run on every tick.
         let mut dirty = self.float_mgr.tick()
             | self.lua_picker.tick()
@@ -2648,7 +2656,7 @@ impl App {
                 .poll(self.status_content_reader.load_full())
             | self.tick_file_picker()
             | self.tick_file_completion()
-            | self.command_palette.poll_arguments();
+            | self.command_palette.tick();
         dirty |= self.tick_chats();
         while let Some(shown) = self.chats[0].take_splash_event() {
             // The autocmd is fire-and-forget; repainting is the frame pull's
@@ -2661,6 +2669,7 @@ impl App {
         // `float_mgr.tick` above may have closed the active question float; the
         // promote call reconciles that, then pops the queue head when idle.
         dirty |= self.promote_deferred_if_ready();
+        dirty |= self.tick_middle_scroll_at(now);
         dirty
     }
 
@@ -2689,6 +2698,10 @@ impl App {
     /// adding one to [`Self::overlays`] is enough.
     pub fn cadence(&self) -> Cadence {
         Cadence::any([
+            Cadence::when(
+                self.middle_scroll.is_some(),
+                Cadence::after(MIDDLE_SCROLL_INTERVAL),
+            ),
             Cadence::any(self.overlays().into_iter().map(Overlay::cadence)),
             StatusBar::cadence(
                 self.status_for_chat(self.active_chat),
@@ -2699,6 +2712,7 @@ impl App {
                 .as_ref()
                 .map_or(Cadence::IDLE, SelectionState::cadence),
             self.file_completion.cadence(),
+            self.command_palette.cadence(),
             Cadence::any(self.chats.iter().map(Chat::cadence)),
             // Wake precisely at the 2s idle mark to promote a queued demand.
             Cadence::when(
