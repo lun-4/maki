@@ -892,8 +892,14 @@ fn register_command(
 /// finishes, so aliasing something long-running like `/compact` does not
 /// block your handler.
 ///
+/// Called from inside another command's handler there is no frontend waiting
+/// on the result, so a command that needs one to run it -- a model turn, a
+/// custom Markdown command, `/compact`, `/btw`, `/cd` -- reports an error
+/// instead of pretending it ran. Call it from a keybinding or an autocmd if
+/// you need those.
+///
 /// @param cmdline string Command line, e.g. `"/new"` or `"/cd ~/src"`.
-/// @return (boolean|nil, string|nil) `true` once dispatched, or nil and an error message for an unknown command.
+/// @return (boolean|nil, string|nil) `true` once dispatched, or nil and an error message if the command is unknown or cannot run here.
 /// @example
 /// -- /resume as an alias for the built-in session picker:
 /// maki.api.register_command({
@@ -920,7 +926,7 @@ async fn run_command(
             .invocation
             .dispatch(CommandContent::from(cmdline.as_str()))
             .await;
-        try_pair!(nested_dispatch_result(result));
+        try_pair!(nested_dispatch_result(&cmdline, result));
     } else {
         let reply = try_pair!(
             ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::RunCommand {
@@ -935,13 +941,26 @@ async fn run_command(
     Ok((Some(true), None))
 }
 
-fn nested_dispatch_result(result: InputDispatch) -> Result<(), String> {
+const NESTED_NEEDS_FRONTEND: &str =
+    "needs a frontend to run it and cannot be nested inside another command";
+
+/// A nested dispatch has no frontend behind it: the outcome comes back here
+/// and stops. Only `Completed` is actually finished by the time it arrives, so
+/// every outcome that still needs a frontend to run it is an error rather than
+/// a `true` the caller would read as "it ran".
+fn nested_dispatch_result(cmdline: &str, result: InputDispatch) -> Result<(), String> {
     match result {
         InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::UnknownCommand(_))) => {
             Err("unknown command".to_owned())
         }
         InputDispatch::Dispatched(CommandOutcome::Failed(error)) => Err(error.to_string()),
-        InputDispatch::Dispatched(_) => Ok(()),
+        InputDispatch::Dispatched(CommandOutcome::Completed) => Ok(()),
+        InputDispatch::Dispatched(
+            CommandOutcome::AgentTurn(_)
+            | CommandOutcome::IsolatedTurn(_)
+            | CommandOutcome::ManualCompaction
+            | CommandOutcome::FrontendFeedback(_),
+        ) => Err(format!("{cmdline} {NESTED_NEEDS_FRONTEND}")),
         InputDispatch::LiteralInput(_) => Err("unknown command".to_owned()),
     }
 }
@@ -2412,7 +2431,34 @@ mod tests {
         Err("unknown command".to_owned()) ;
         "literal input is not a command"
     )]
+    #[test_case::test_case(
+        InputDispatch::Dispatched(CommandOutcome::AgentTurn(maki_commands::AgentTurn {
+            content: CommandContent::from("review this"),
+            prompt: None,
+        })),
+        Err(format!("/nested {NESTED_NEEDS_FRONTEND}")) ;
+        "an agent turn has no frontend to run it"
+    )]
+    #[test_case::test_case(
+        InputDispatch::Dispatched(CommandOutcome::IsolatedTurn(maki_commands::IsolatedTurn {
+            content: CommandContent::from("why?"),
+        })),
+        Err(format!("/nested {NESTED_NEEDS_FRONTEND}")) ;
+        "an isolated turn has no frontend to run it"
+    )]
+    #[test_case::test_case(
+        InputDispatch::Dispatched(CommandOutcome::ManualCompaction),
+        Err(format!("/nested {NESTED_NEEDS_FRONTEND}")) ;
+        "manual compaction has no frontend to run it"
+    )]
+    #[test_case::test_case(
+        InputDispatch::Dispatched(CommandOutcome::FrontendFeedback(
+            maki_commands::FrontendFeedback::Text(Arc::from("use session/new")),
+        )),
+        Err(format!("/nested {NESTED_NEEDS_FRONTEND}")) ;
+        "frontend feedback has no frontend to show it"
+    )]
     fn nested_dispatch_result_maps_outcomes(result: InputDispatch, expected: Result<(), String>) {
-        assert_eq!(nested_dispatch_result(result), expected);
+        assert_eq!(nested_dispatch_result("/nested", result), expected);
     }
 }

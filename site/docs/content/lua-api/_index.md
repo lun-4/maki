@@ -595,11 +595,17 @@ This returns as soon as the command has been dispatched, not when it
 finishes, so aliasing something long-running like `/compact` does not
 block your handler.
 
+Called from inside another command's handler there is no frontend waiting
+on the result, so a command that needs one to run it -- a model turn, a
+custom Markdown command, `/compact`, `/btw`, `/cd` -- reports an error
+instead of pretending it ran. Call it from a keybinding or an autocmd if
+you need those.
+
 **Parameters:**
 
 - `{cmdline}` (`string`) Command line, e.g. `"/new"` or `"/cd ~/src"`.
 
-**Returns:** (`boolean|nil`, `string|nil`) `true` once dispatched, or nil and an error message for an unknown command.
+**Returns:** (`boolean|nil`, `string|nil`) `true` once dispatched, or nil and an error message if the command is unknown or cannot run here.
 
 **Example:**
 
