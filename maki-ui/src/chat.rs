@@ -146,7 +146,9 @@ impl Chat {
             AgentEvent::QueueItemConsumed { text, image_count } => {
                 return ChatEventResult::QueueItemConsumed { text, image_count };
             }
-            AgentEvent::QueueDrained => {}
+            // The app tracks the running model to show a queued switch; the
+            // chat panel has nothing to render for it.
+            AgentEvent::ModelSwitched { .. } | AgentEvent::QueueDrained => {}
             AgentEvent::Retry { .. } => unreachable!("handled before handle_event"),
             AgentEvent::TurnOutcome(outcome) => {
                 self.messages_panel.flush();

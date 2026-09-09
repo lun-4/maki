@@ -774,6 +774,12 @@ pub enum AgentEvent {
         image_count: usize,
     },
     QueueDrained,
+    /// A run picked up a model that changed while it was in flight. Carries
+    /// the spec now in use, so a frontend showing the run's model can stop
+    /// reporting the one it started on.
+    ModelSwitched {
+        spec: String,
+    },
     /// The sole terminal event for an accepted agent turn.
     TurnOutcome(TurnOutcome),
     AutoCompacting,

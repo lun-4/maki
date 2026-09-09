@@ -17,8 +17,6 @@ use color_eyre::eyre::{Context, Result, eyre};
 const CONTENT_DIR: &str = "site/docs/content";
 
 type Page = (&'static str, fn() -> Result<String>);
-type CheckSink = fn(&Path, &str) -> Result<bool>;
-type WriteSink = fn(&Path, &str) -> Result<()>;
 
 const PAGES: [Page; 7] = [
     ("tools", || Ok(gen_tools::generate())),
@@ -62,12 +60,19 @@ fn check_file(path: &Path, expected: &str) -> Result<bool> {
     }
 }
 
-fn run_generation(
+/// Generic over the sinks rather than taking `fn` pointers, so a test can pass
+/// closures over its own counters instead of sharing statics with every other
+/// test in the binary.
+fn run_generation<C, W>(
     check: bool,
     pages: &[Page],
-    check_output: CheckSink,
-    write_output: WriteSink,
-) -> Result<ExitCode> {
+    check_output: C,
+    write_output: W,
+) -> Result<ExitCode>
+where
+    C: Fn(&Path, &str) -> Result<bool>,
+    W: Fn(&Path, &str) -> Result<()>,
+{
     let outputs = thread::scope(|scope| {
         let running: Vec<_> = pages
             .iter()
@@ -143,53 +148,70 @@ mod tests {
         panic!("test panic")
     }
 
-    fn count_check(_: &Path, _: &str) -> Result<bool> {
-        CHECK_CALLS.fetch_add(1, Ordering::Relaxed);
-        Ok(true)
+    /// One set of counters per test: these used to be statics, and the binary
+    /// runs its tests in parallel, so a success case's writes were visible to
+    /// the failure case asserting that nothing had been written.
+    #[derive(Default)]
+    struct Sinks {
+        checks: AtomicUsize,
+        writes: AtomicUsize,
     }
 
-    fn count_write(_: &Path, _: &str) -> Result<()> {
-        WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
+    impl Sinks {
+        fn check(&self) -> impl Fn(&Path, &str) -> Result<bool> {
+            move |_, _| {
+                self.checks.fetch_add(1, Ordering::Relaxed);
+                Ok(true)
+            }
+        }
 
-    static CHECK_CALLS: AtomicUsize = AtomicUsize::new(0);
-    static WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn write(&self) -> impl Fn(&Path, &str) -> Result<()> {
+            move |_, _| {
+                self.writes.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        fn counts(&self) -> (usize, usize) {
+            (
+                self.checks.load(Ordering::Relaxed),
+                self.writes.load(Ordering::Relaxed),
+            )
+        }
+    }
 
     #[test]
     fn generation_failure_prevents_output() {
-        CHECK_CALLS.store(0, Ordering::Relaxed);
-        WRITE_CALLS.store(0, Ordering::Relaxed);
+        let sinks = Sinks::default();
         let pages: [Page; 2] = [("ok", generated_page), ("broken", failed_page)];
 
         for check in [false, true] {
-            let error = run_generation(check, &pages, count_check, count_write)
+            let error = run_generation(check, &pages, sinks.check(), sinks.write())
                 .expect_err("generation failure");
             assert!(error.to_string().contains(GENERATION_ERROR));
-            assert_eq!(CHECK_CALLS.load(Ordering::Relaxed), 0);
-            assert_eq!(WRITE_CALLS.load(Ordering::Relaxed), 0);
+            assert_eq!(sinks.counts(), (0, 0));
         }
     }
 
     #[test]
     fn worker_panic_reports_generation_failure() {
         let pages: [Page; 1] = [("panic", panicking_page)];
+        let sinks = Sinks::default();
         let error =
-            run_generation(false, &pages, count_check, count_write).expect_err("worker panic");
+            run_generation(false, &pages, sinks.check(), sinks.write()).expect_err("worker panic");
         assert!(error.to_string().contains("panic"));
         assert!(error.to_string().contains("documentation generator"));
     }
 
     #[test]
     fn generation_success_emits_all_pages() {
-        CHECK_CALLS.store(0, Ordering::Relaxed);
-        WRITE_CALLS.store(0, Ordering::Relaxed);
+        let sinks = Sinks::default();
         let pages: [Page; 2] = [("one", generated_page), ("two", generated_page)];
 
-        run_generation(false, &pages, count_check, count_write).expect("generation");
-        assert_eq!(WRITE_CALLS.load(Ordering::Relaxed), 2);
+        run_generation(false, &pages, sinks.check(), sinks.write()).expect("generation");
+        assert_eq!(sinks.counts(), (0, 2));
 
-        run_generation(true, &pages, count_check, count_write).expect("check");
-        assert_eq!(CHECK_CALLS.load(Ordering::Relaxed), 2);
+        run_generation(true, &pages, sinks.check(), sinks.write()).expect("check");
+        assert_eq!(sinks.counts(), (2, 2));
     }
 }

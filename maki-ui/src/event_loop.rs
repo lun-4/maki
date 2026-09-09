@@ -20,8 +20,13 @@ use color_eyre::eyre::{Context, eyre};
 use crossterm::event::{
     Event, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
+use maki_agent::SessionMailbox;
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
+use maki_agent::session_coordinator::{
+    DirectoryAdoptionFuture, ModelAdoptionFuture, SessionCoordinatorHandle,
+    SessionCoordinatorParams, builtin_option_definitions,
+};
 use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
@@ -32,6 +37,7 @@ use maki_lua::{
     ProviderUsageInvalidation, ProviderUsageLimit, ProviderUsageReply, ProviderUsageSnapshot,
     ProviderUsageWindow, SessionRequest, StatusContentReader, UiAction, UiReply,
 };
+use maki_providers::ThinkingConfigExt;
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
 use maki_providers::{Message, Model, TokenUsage};
@@ -82,9 +88,6 @@ use crate::theme::ThemesProvider;
 const DRAIN_BUDGET: usize = 256;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
-const MODEL_POLICY_ERR: &str = "Model is not allowed by policy";
-const INVALID_MODEL_ERR: &str = "Invalid model";
-const PROVIDER_INIT_ERR: &str = "Failed to create provider";
 const PROVIDER_USAGE_CHANGED_ERR: &str = "provider changed while fetching usage";
 const PROVIDER_USAGE_SHUTDOWN_ERR: &str = "UI shut down while fetching usage";
 const NOT_LIVE_ERR: &str = "session not live";
@@ -340,6 +343,8 @@ fn parse_session_id(id: &str) -> Result<MakiId, String> {
 struct SessionRuntime {
     app: App,
     handles: AgentHandles,
+    model_slot: Arc<ProviderSlot>,
+    coordinator: SessionCoordinatorHandle,
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
     last_status: SessionStatus,
@@ -395,17 +400,209 @@ struct SpawnCtx {
     command_runtime: Arc<CommandRuntime>,
 }
 
+/// The slice of [`SpawnCtx`] that registering a coordinator needs. Split out
+/// so the session-rotation invariant can be tested without standing up an
+/// event loop, which owns a terminal and has no test harness.
+struct CoordinatorDeps {
+    catalog: maki_agent::session_coordinator::SessionOptionCatalog,
+    model_policy: Arc<ModelPolicy>,
+    timeouts: Timeouts,
+    storage_writer: Arc<StorageWriter>,
+}
+
+/// Registers the coordinator that owns a session's options, history and lease.
+/// Keyed to the session id, so anything that changes a tab's session -- `/new`
+/// rotates to a fresh one -- must register again rather than keep the old
+/// handle.
+#[allow(clippy::too_many_arguments)]
+fn register_coordinator(
+    deps: &CoordinatorDeps,
+    session: &AppSession,
+    history: Vec<Message>,
+    available_models: Vec<Arc<str>>,
+    model_slot: &Arc<ProviderSlot>,
+    handles: &AgentHandles,
+    permissions: &Arc<PermissionManager>,
+    thinking: DomainThinkingConfig,
+) -> Result<SessionCoordinatorHandle> {
+    let mailbox = handles
+        .mailbox()
+        .ok_or_else(|| eyre!("session mailbox unavailable"))?;
+    register_coordinator_with_mailbox(
+        deps,
+        session,
+        history,
+        available_models,
+        model_slot,
+        handles,
+        permissions,
+        mailbox,
+        thinking,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn register_coordinator_with_mailbox(
+    deps: &CoordinatorDeps,
+    session: &AppSession,
+    history: Vec<Message>,
+    available_models: Vec<Arc<str>>,
+    model_slot: &Arc<ProviderSlot>,
+    handles: &AgentHandles,
+    permissions: &Arc<PermissionManager>,
+    mailbox: SessionMailbox,
+    thinking: DomainThinkingConfig,
+) -> Result<SessionCoordinatorHandle> {
+    // The coordinator checkpoints by merging into the writer's snapshot for
+    // this session, so the snapshot has to exist first. Seeding it here rather
+    // than at each call site is what keeps a newly rotated session from
+    // failing its first checkpoint with "session snapshot is unavailable".
+    deps.storage_writer.send(Arc::new(session.clone()));
+    let model_spec = session.model.clone();
+    let definitions = builtin_option_definitions(
+        Arc::from(model_spec.as_str()),
+        available_models,
+        session.meta.yolo,
+        session.meta.fast,
+        session.meta.workflow,
+        thinking,
+    );
+    SessionCoordinatorHandle::register(SessionCoordinatorParams {
+        session_id: session.id,
+        catalog: deps.catalog.clone(),
+        definitions,
+        persisted_options: session.meta.session_options.clone(),
+        history,
+        model: Arc::from(model_spec.as_str()),
+        cwd: PathBuf::from(&session.cwd),
+        model_policy: Arc::clone(&deps.model_policy),
+        model_adopter: Arc::new({
+            let model_slot = Arc::clone(model_slot);
+            let timeouts = deps.timeouts;
+            move |mut model: Model| {
+                let model_slot = Arc::clone(&model_slot);
+                Box::pin(async move {
+                    let provider = from_model(&mut model, timeouts)
+                        .map_err(|error| Arc::from(error.to_string()))?;
+                    model_slot.install(model, Arc::from(provider));
+                    Ok(())
+                }) as ModelAdoptionFuture
+            }
+        }),
+        directory_adopter: Arc::new({
+            let cwd = handles.cwd_slot();
+            let permissions = Arc::clone(permissions);
+            move |path: PathBuf| {
+                let cwd = Arc::clone(&cwd);
+                let permissions = Arc::clone(&permissions);
+                Box::pin(async move {
+                    let canonical = path
+                        .canonicalize()
+                        .map_err(|error| Arc::from(error.to_string()))?;
+                    cwd.store(Arc::new(canonical.clone()));
+                    permissions.set_cwd(canonical.clone());
+                    Ok(canonical)
+                }) as DirectoryAdoptionFuture
+            }
+        }),
+        checkpoint: deps.storage_writer.coordinator_checkpoint(),
+        mailbox,
+    })
+    .map_err(|error| eyre!(error))
+}
+
+/// Retires a tab's coordinator and registers one for the session id its app
+/// has just rotated onto, returning the retired handle for the caller to
+/// close. A runtime's coordinator, mailbox and app session id must always
+/// agree: `/new` mints a new session, and a coordinator left on the old id
+/// makes the previous session unrestorable and denies the new one a lease.
+fn rotate_session_coordinator(
+    deps: &CoordinatorDeps,
+    rt: &mut SessionRuntime,
+    available_models: Vec<Arc<str>>,
+) -> Result<SessionCoordinatorHandle> {
+    let session = Arc::clone(&rt.app.state.session);
+    let permissions = Arc::clone(&rt.app.permissions);
+    let thinking = rt.app.state.thinking;
+    // Registration first: rotating the mailbox is not undoable, and a failure
+    // after it would leave the tab on a session id nothing can resolve, with
+    // every later operation checkpointing into the retired session's file.
+    let mailbox = SessionMailbox::new(session.id);
+    let coordinator = register_coordinator_with_mailbox(
+        deps,
+        &session,
+        Vec::new(),
+        available_models,
+        &rt.model_slot,
+        &rt.handles,
+        &permissions,
+        mailbox.clone(),
+        thinking,
+    )?;
+    rt.handles.set_mailbox(mailbox);
+    let retired = std::mem::replace(&mut rt.coordinator, coordinator.clone());
+    rt.app.coordinator = Some(coordinator);
+    Ok(retired)
+}
+
 impl SpawnCtx {
-    fn spawn_runtime(&self, session: AppSession) -> SessionRuntime {
+    fn coordinator_deps(&self) -> CoordinatorDeps {
+        CoordinatorDeps {
+            catalog: self.lua_event_handle.session_option_catalog(),
+            model_policy: Arc::clone(&self.model_policy),
+            timeouts: self.timeouts,
+            storage_writer: Arc::clone(&self.storage_writer),
+        }
+    }
+
+    fn available_model_specs(&self) -> Vec<Arc<str>> {
+        self.available_models
+            .load_full()
+            .map(|models| {
+                models
+                    .iter()
+                    .map(|spec| Arc::from(spec.as_str()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    fn spawn_runtime(&self, session: AppSession) -> Result<SessionRuntime> {
         let resumed = !session.messages().is_empty();
+        let session_id = session.id;
+        let history = session.messages().to_vec();
+        let model_spec = session.model.clone();
+        let cwd = PathBuf::from(&session.cwd);
+        let startup = self.model_slot.load();
+        let (model, provider) = if startup.model.spec() == model_spec {
+            (
+                startup.model.clone(),
+                Arc::clone(&startup.provider) as Arc<dyn Provider>,
+            )
+        } else {
+            let mut model = Model::from_spec(&model_spec).context("restore session model")?;
+            let provider: Arc<dyn Provider> = Arc::from(
+                from_model(&mut model, self.timeouts).context("restore session provider")?,
+            );
+            (model, provider)
+        };
+        drop(startup);
+        // Per-session slot: restoring a session with its own model must not
+        // repoint every other tab. It shares the event loop's change channel,
+        // so an install or a re-auth here still reaches the usage coordinator.
+        let model_slot =
+            ProviderSlot::with_change_tx(model.clone(), provider, self.model_slot.change_tx());
         let permissions = Arc::new(self.permissions.fork());
+        permissions.set_yolo(session.meta.yolo);
+        permissions.load_session_rules(crate::app::stored_to_rules(&session.meta.session_rules));
         let handles = AgentHandles::spawn(
-            &self.model_slot,
-            session.messages().to_vec(),
+            &model_slot,
+            history.clone(),
             self.config.clone(),
             self.ui_config.tool_output_lines,
             &permissions,
-            Some(SessionRef::from(session.id)),
+            cwd.clone(),
+            Some(SessionRef::from(session_id)),
             self.timeouts,
             self.lua_event_handle.clone(),
             self.mcp_handle.clone(),
@@ -413,8 +610,19 @@ impl SpawnCtx {
             Arc::clone(&self.model_policy),
             self.system_prompt.clone(),
         );
+        let available_models = self.available_model_specs();
+        let coordinator = register_coordinator(
+            &self.coordinator_deps(),
+            &session,
+            history,
+            available_models,
+            &model_slot,
+            &handles,
+            &permissions,
+            crate::app::session_state::resolve_thinking(&session, &model, &self.storage),
+        )?;
         let mut app = App::new(
-            &self.model_slot.load().model,
+            &model,
             session,
             self.storage.clone(),
             Arc::clone(&self.available_models),
@@ -432,19 +640,22 @@ impl SpawnCtx {
             crate::theme::default_provider().clone(),
             Arc::clone(&self.command_runtime),
         );
+        app.coordinator = Some(coordinator.clone());
         handles.apply_to_app(&mut app);
         if resumed {
             app.restore_resumed_session();
         }
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
-        SessionRuntime {
+        Ok(SessionRuntime {
             app,
             handles,
+            model_slot,
+            coordinator,
             shell_tx,
             shell_rx,
             last_status: SessionStatus::Idle,
             notifications: RunNotificationState::default(),
-        }
+        })
     }
 }
 
@@ -459,6 +670,50 @@ enum InternalEvent {
         fetch_id: ProviderUsageFetchId,
         provider: ProviderIdentity,
         result: ProviderUsageFetchResult,
+    },
+    /// A coordinator operation dispatched off the event-loop thread has
+    /// finished. See [`SessionOpKind`] for why they cannot run inline.
+    SessionOp {
+        session: MakiId,
+        kind: SessionOpKind,
+        result: Result<(), String>,
+    },
+}
+
+/// The event loop must never await a coordinator operation on its own thread.
+/// A running turn holds the session lease for its whole duration, and the
+/// coordinator parks every other operation behind it -- including one issued
+/// from here. If that turn is itself waiting on the UI (a permission prompt, a
+/// question), the wait is circular and the process hangs unkillably. So the
+/// operation is dispatched, the loop keeps rendering, and the follow-up work
+/// named here runs when the result comes back.
+enum SessionOpKind {
+    /// `/new` and session restore: respawn the agent on the new history.
+    HistoryReplaced {
+        history: Vec<Message>,
+        model_spec: Option<String>,
+    },
+    /// `/model` from a keybinding or command: apply the adopted model.
+    ModelChanged { spec: String },
+    /// `/yolo`, `/fast`, `/workflow`: apply the toggle the coordinator took.
+    OptionToggled { id: &'static str, enabled: bool },
+    /// `/cd`: apply the canonical path the coordinator resolved, which is not
+    /// necessarily the one that was typed.
+    DirectoryChanged {
+        adopted: Arc<std::sync::Mutex<Option<PathBuf>>>,
+    },
+    /// `maki.session.set_thinking` from Lua, which owes its caller a reply.
+    ThinkingSet {
+        thinking: DomainThinkingConfig,
+        set_default: bool,
+        reply_tx: flume::Sender<UiReply>,
+    },
+    /// `maki.model.set` from Lua, which owes its caller a reply.
+    ModelSet {
+        spec: Option<String>,
+        thinking: Option<DomainThinkingConfig>,
+        fast: Option<bool>,
+        reply_tx: flume::Sender<UiReply>,
     },
 }
 
@@ -483,6 +738,9 @@ pub(crate) struct EventLoop<'t> {
     provider_usage: ProviderUsageCoordinator<flume::Sender<ProviderUsageReply>>,
     next_status_invalidation: u64,
     pending_status_invalidation: Option<ProviderUsageInvalidation>,
+    /// The model list last published into every session's coordinator. See
+    /// [`Self::sync_model_values`].
+    published_model_specs: Option<Arc<Vec<String>>>,
     internal_tx: flume::Sender<InternalEvent>,
     internal_rx: flume::Receiver<InternalEvent>,
     _model_fetch_task: smol::Task<()>,
@@ -507,6 +765,27 @@ struct BackgroundModels {
     warn_rx: flume::Receiver<String>,
     warn_tx: flume::Sender<String>,
     task: smol::Task<()>,
+}
+
+/// Brings each tab's displayed model in line with the slot that tab actually
+/// runs on. It takes only the sessions on purpose: reading the event loop's
+/// global slot here would rewrite -- and persist -- every session's model as
+/// the last one to change, while inference kept using the session's real
+/// provider.
+fn sync_session_models(sessions: &mut [SessionRuntime]) -> bool {
+    let mut changed = false;
+    for rt in sessions {
+        let slot_model = rt.model_slot.load();
+        if rt.app.state.session.model != slot_model.model.spec()
+            || rt.app.state.model.context_window != slot_model.model.context_window
+        {
+            let model = slot_model.model.clone();
+            drop(slot_model);
+            rt.app.update_model(&model);
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn merge_batch(
@@ -699,7 +978,7 @@ impl<'t> EventLoop<'t> {
         let mut runtimes: Vec<SessionRuntime> = sessions
             .into_iter()
             .map(|session| ctx.spawn_runtime(session))
-            .collect();
+            .collect::<Result<_>>()?;
         if runtimes.is_empty() {
             return Err(eyre!("event loop needs at least one session"));
         }
@@ -744,6 +1023,7 @@ impl<'t> EventLoop<'t> {
             provider_usage: ProviderUsageCoordinator::new(initial_provider),
             next_status_invalidation: 0,
             pending_status_invalidation: None,
+            published_model_specs: None,
             internal_tx,
             internal_rx,
             _model_fetch_task: bg.task,
@@ -881,15 +1161,30 @@ impl<'t> EventLoop<'t> {
                     && current.provider.identity() == expected_provider;
                 drop(current);
                 if still_current {
-                    self.ctx.model_slot.install(model, provider);
+                    self.ctx
+                        .model_slot
+                        .install(model.clone(), Arc::clone(&provider));
+                    // Sessions spawned before the fetch resolved copied the
+                    // unrefined startup model; hand them the resolved one so
+                    // context windows and capabilities are not left stale.
+                    for rt in &self.sessions {
+                        if rt.model_slot.load().model.spec() == requested_spec {
+                            rt.model_slot.install(model.clone(), Arc::clone(&provider));
+                        }
+                    }
                 }
             }
+            InternalEvent::SessionOp {
+                session,
+                kind,
+                result,
+            } => self.handle_session_op(session, kind, result),
             InternalEvent::ProviderUsageFetched {
                 fetch_id,
                 provider,
                 result,
             } => {
-                let current = self.ctx.model_slot.load().provider.identity();
+                let current = self.focused_model_slot().load().provider.identity();
                 if provider != current {
                     let outputs = self
                         .provider_usage
@@ -907,7 +1202,7 @@ impl<'t> EventLoop<'t> {
     }
 
     fn handle_provider_change(&mut self, _change: ProviderChange) {
-        let provider = self.ctx.model_slot.load().provider.identity();
+        let provider = self.focused_model_slot().load().provider.identity();
         for runtime in &self.sessions {
             runtime
                 .app
@@ -934,7 +1229,7 @@ impl<'t> EventLoop<'t> {
                     .store(false, Ordering::Release);
             }
         }
-        let current = self.ctx.model_slot.load();
+        let current = self.focused_model_slot().load();
         self.ctx.lua_event_handle.fire_autocmd(
             "ProviderChanged",
             serde_json::json!({
@@ -981,10 +1276,18 @@ impl<'t> EventLoop<'t> {
                     let actions = self.sessions[index].app.submit_command_turn(turn);
                     self.dispatch(index, actions);
                 }
+                maki_commands::CommandOutcome::IsolatedTurn(turn) => {
+                    let actions = self.sessions[index].app.submit_isolated_turn(turn);
+                    self.dispatch(index, actions);
+                }
+                maki_commands::CommandOutcome::FrontendFeedback(feedback) => {
+                    self.sessions[index].app.present_frontend_feedback(feedback);
+                }
                 maki_commands::CommandOutcome::Failed(error) => {
                     self.sessions[index].app.flash(error.to_string());
                 }
-                maki_commands::CommandOutcome::Completed => {}
+                maki_commands::CommandOutcome::ManualCompaction
+                | maki_commands::CommandOutcome::Completed => {}
             },
         }
     }
@@ -1075,17 +1378,11 @@ impl<'t> EventLoop<'t> {
             }
         }
 
-        let slot_model = self.ctx.model_slot.load();
-        let spec = slot_model.model.spec();
-        for rt in &mut self.sessions {
-            if rt.app.state.session.model != spec
-                || rt.app.state.model.context_window != slot_model.model.context_window
-            {
-                rt.app.update_model(&slot_model.model);
-                dirty = Dirty::YES;
-            }
+        self.sync_model_values();
+
+        if sync_session_models(&mut self.sessions) {
+            dirty = Dirty::YES;
         }
-        drop(slot_model);
 
         // These two only fire Lua autocmds. Anything a handler does comes back
         // as a `UiAction` on the next wake, which repaints then.
@@ -1153,14 +1450,22 @@ impl<'t> EventLoop<'t> {
             UiAction::Session { req, reply_tx } => {
                 self.handle_session_request(req, reply_tx);
             }
-            UiAction::Model { req, reply_tx } => {
-                let _ = reply_tx.send(self.handle_model_request(req));
-            }
+            UiAction::Model { req, reply_tx } => match req {
+                // Touches the coordinator, so it answers once that returns.
+                ModelRequest::Set {
+                    spec,
+                    thinking,
+                    fast,
+                } => self.dispatch_model_set(spec, thinking, fast, reply_tx),
+                req => {
+                    let _ = reply_tx.send(self.handle_model_request(req));
+                }
+            },
             UiAction::ProviderUsageAck(ack) => {
                 self.handle_provider_usage_ack(ack);
             }
             UiAction::UsageFetch { force, reply_tx } => {
-                let provider = self.ctx.model_slot.load().provider.identity();
+                let provider = self.focused_model_slot().load().provider.identity();
                 let outputs = self
                     .provider_usage
                     .handle(ProviderUsageInput::Transition { provider });
@@ -1296,7 +1601,7 @@ impl<'t> EventLoop<'t> {
     }
 
     fn start_provider_usage_fetch(&self, fetch: ProviderUsageFetch) {
-        let current = self.ctx.model_slot.load();
+        let current = self.focused_model_slot().load();
         if current.provider.identity() != fetch.provider {
             let _ = self.internal_tx.send(InternalEvent::ProviderUsageFetched {
                 fetch_id: fetch.id,
@@ -1327,7 +1632,7 @@ impl<'t> EventLoop<'t> {
     }
 
     fn provider_usage_loading_snapshot(&self) -> ProviderUsageSnapshot {
-        let current = self.ctx.model_slot.load();
+        let current = self.focused_model_slot().load();
         ProviderUsageSnapshot {
             provider_id: format!(
                 "{}:{}:{}",
@@ -1349,7 +1654,7 @@ impl<'t> EventLoop<'t> {
         provider: ProviderIdentity,
         result: ProviderUsageFetchResult,
     ) -> Option<ProviderUsageSnapshot> {
-        let current = self.ctx.model_slot.load();
+        let current = self.focused_model_slot().load();
         if current.provider.identity() != provider {
             return None;
         }
@@ -1528,7 +1833,14 @@ impl<'t> EventLoop<'t> {
                         return;
                     }
                     let rt = self.remove_runtime(i);
+                    // Cancel first so a running turn drops its lease, then let
+                    // the close settle off-thread: nothing here waits on it.
+                    let coordinator = rt.coordinator.clone();
                     rt.handles.cancel();
+                    smol::spawn(async move {
+                        let _ = coordinator.close().await;
+                    })
+                    .detach();
                 }
                 self.ctx.storage_writer.delete(id, move |res| {
                     let reply = match res {
@@ -1563,10 +1875,17 @@ impl<'t> EventLoop<'t> {
             }
             SessionRequest::New { prompt, focus } => {
                 let session = {
-                    let slot = self.ctx.model_slot.load();
+                    let slot = self.focused_model_slot().load();
                     AppSession::new(&slot.model.spec(), &self.session_cwd)
                 };
-                let idx = self.push_runtime(self.ctx.spawn_runtime(session));
+                let runtime = match self.ctx.spawn_runtime(session) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = reply_tx.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+                let idx = self.push_runtime(runtime);
                 let id = self.sessions[idx].id();
                 if let Some(prompt) = prompt {
                     let _ = self.submit_text(idx, prompt);
@@ -1621,31 +1940,7 @@ impl<'t> EventLoop<'t> {
             SessionRequest::SetThinking {
                 set_default,
                 thinking,
-            } => {
-                let reply = (|| {
-                    let idx = self.focused;
-                    if !self.sessions[idx].app.state.model.supports_thinking() {
-                        return Err("Thinking requires a model that supports it".into());
-                    }
-                    let parsed = thinking
-                        .parse::<DomainThinkingConfig>()
-                        .map_err(|e| e.to_string())?;
-                    if set_default {
-                        write_prefs(
-                            &self.ctx.storage,
-                            &Prefs {
-                                default_thinking: Some(parsed.into()),
-                            },
-                        )
-                        .map_err(|e| e.to_string())?;
-                    }
-                    self.sessions[idx].app.state.thinking = parsed;
-                    let mode = self.sessions[idx].app.state.thinking.to_string();
-                    self.sessions[idx].app.flash(format!("Thinking: {mode}"));
-                    Ok(json!({ "mode": mode }))
-                })();
-                let _ = reply_tx.send(reply);
-            }
+            } => self.dispatch_thinking_set(set_default, &thinking, reply_tx),
         }
     }
 
@@ -1660,24 +1955,121 @@ impl<'t> EventLoop<'t> {
                     available.as_deref().map(Vec::as_slice).unwrap_or(&[])
                 ))
             }
-            ModelRequest::Set {
+            // Handled by `dispatch_model_set`; it cannot answer inline.
+            ModelRequest::Set { .. } => Err("model set must be dispatched".to_owned()),
+        }
+    }
+
+    /// `maki.session.set_thinking`: the coordinator owns thinking, so the value
+    /// is resolved here -- empty input toggles, which only the current value
+    /// can answer -- and committed there before any of it reaches the app.
+    fn dispatch_thinking_set(
+        &mut self,
+        set_default: bool,
+        thinking: &str,
+        reply_tx: flume::Sender<UiReply>,
+    ) {
+        let idx = self.focused;
+        let app = &self.sessions[idx].app;
+        if !app.state.model.supports_thinking() {
+            let _ = reply_tx.send(Err(crate::app::THINKING_UNSUPPORTED_MSG.to_owned()));
+            return;
+        }
+        let resolved = match DomainThinkingConfig::parse(thinking.trim(), app.state.thinking) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let _ = reply_tx.send(Err(error.to_owned()));
+                return;
+            }
+        };
+        let coordinator = self.sessions[idx].coordinator.clone();
+        let value = resolved.to_string();
+        self.dispatch_session_op(
+            idx,
+            SessionOpKind::ThinkingSet {
+                thinking: resolved,
+                set_default,
+                reply_tx,
+            },
+            async move {
+                coordinator
+                    .set_option(
+                        maki_agent::session_options::THINKING_OPTION_ID,
+                        value.as_str(),
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            },
+        );
+    }
+
+    /// `maki.model.set`: adopt the model and the fast flag through the
+    /// coordinator off-thread, then apply the app-side state and reply.
+    fn dispatch_model_set(
+        &mut self,
+        spec: Option<String>,
+        thinking: Option<String>,
+        fast: Option<bool>,
+        reply_tx: flume::Sender<UiReply>,
+    ) {
+        let idx = self.focused;
+        // Relative input ("" toggles) can only be read against the value the
+        // session is on, so it is resolved here and the coordinator is handed
+        // a concrete setting.
+        let thinking = match thinking
+            .map(|input| {
+                DomainThinkingConfig::parse(input.trim(), self.sessions[idx].app.state.thinking)
+            })
+            .transpose()
+        {
+            Ok(thinking) => thinking,
+            Err(error) => {
+                let _ = reply_tx.send(Err(error.to_owned()));
+                return;
+            }
+        };
+        let coordinator = self.sessions[idx].coordinator.clone();
+        let op_spec = spec.clone();
+        let op_thinking = thinking.map(|thinking| thinking.to_string());
+        self.dispatch_session_op(
+            idx,
+            SessionOpKind::ModelSet {
                 spec,
                 thinking,
                 fast,
-            } => {
-                if let Some(spec) = spec {
-                    self.change_model(self.focused, &spec)?;
-                }
-                let app = self.focused_app();
-                if let Some(thinking) = thinking {
-                    app.set_thinking(&thinking)?;
+                reply_tx,
+            },
+            async move {
+                if let Some(spec) = op_spec {
+                    coordinator
+                        .set_option("model", spec.as_str())
+                        .await
+                        .map_err(|error| error.to_string())?;
                 }
                 if let Some(fast) = fast {
-                    app.set_fast(fast)?;
+                    coordinator
+                        .set_option(
+                            maki_agent::session_options::FAST_OPTION_ID,
+                            Self::boolean_option_value(fast),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
                 }
-                Ok(app.model_state())
-            }
-        }
+                // After the model, so a switch to a thinking model can turn
+                // thinking on in the same call.
+                if let Some(thinking) = op_thinking {
+                    coordinator
+                        .set_option(
+                            maki_agent::session_options::THINKING_OPTION_ID,
+                            thinking.as_str(),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            },
+        );
     }
 
     fn submit_text(&mut self, idx: usize, text: String) -> UiReply {
@@ -1760,27 +2152,32 @@ impl<'t> EventLoop<'t> {
         if let Some(block) = session_lock::resume_block(&session.cwd, &cwd, open_elsewhere) {
             return Err(block.to_string());
         }
-        let focused = &mut self.sessions[self.focused];
-        if SessionStatus::of(&focused.app) == SessionStatus::Idle && !focused.app.has_content() {
-            let old_id = focused.id();
-            let actions = focused.app.load_loaded_session(session);
-            let sessions_dir = self.sessions_dir.clone();
-            smol::unblock(move || {
-                session_lock::release(&sessions_dir, &old_id);
-            })
-            .detach();
-            let sessions_dir = self.sessions_dir.clone();
-            smol::unblock(move || {
-                if let Err(e) = session_lock::heartbeat(&sessions_dir, &id) {
-                    warn!(id = %id, error = %e, "session lock claim failed");
-                }
-            })
-            .detach();
-            self.dispatch(self.focused, actions);
-            return Ok(());
-        }
-        let idx = self.push_runtime(self.ctx.spawn_runtime(session));
+        // A blank idle tab is nothing worth keeping, so the restore replaces
+        // it. The new runtime is pushed first and the old one dropped after:
+        // each session owns a coordinator and a mailbox keyed to its id, so a
+        // tab cannot be re-pointed at a different session in place.
+        let replaced = {
+            let focused = &self.sessions[self.focused];
+            (SessionStatus::of(&focused.app) == SessionStatus::Idle && !focused.app.has_content())
+                .then_some(self.focused)
+        };
+        let runtime = self
+            .ctx
+            .spawn_runtime(session)
+            .map_err(|error| error.to_string())?;
+        let idx = self.push_runtime(runtime);
         self.set_focused(idx);
+        if let Some(stale) = replaced {
+            // `remove_runtime` releases the lock and shifts `focused` down to
+            // keep it on the runtime just pushed.
+            let rt = self.remove_runtime(stale);
+            let coordinator = rt.coordinator.clone();
+            rt.handles.cancel();
+            smol::spawn(async move {
+                let _ = coordinator.close().await;
+            })
+            .detach();
+        }
         Ok(())
     }
 
@@ -1895,6 +2292,32 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    /// Retires the tab's coordinator and registers one for the session id the
+    /// app just rotated onto, then respawns the agent against it.
+    fn rotate_session(&mut self, idx: usize) {
+        let deps = self.ctx.coordinator_deps();
+        let available_models = self.ctx.available_model_specs();
+        let retired =
+            match rotate_session_coordinator(&deps, &mut self.sessions[idx], available_models) {
+                Ok(retired) => retired,
+                Err(error) => {
+                    self.sessions[idx].app.flash(error.to_string());
+                    return;
+                }
+            };
+        // The previous session keeps the history it ended with; closing, and
+        // then forgetting the snapshot the empty-session cleanup may have left
+        // behind, is all that is owed to it.
+        let retired_id = retired.read().session_id();
+        let storage_writer = Arc::clone(&self.ctx.storage_writer);
+        smol::spawn(async move {
+            let _ = retired.close().await;
+            storage_writer.forget(retired_id);
+        })
+        .detach();
+        self.respawn_agent(idx, Vec::new());
+    }
+
     fn respawn_agent(&mut self, idx: usize, history: Vec<Message>) {
         let rt = &mut self.sessions[idx];
         rt.reset_run_notifications();
@@ -1902,7 +2325,7 @@ impl<'t> EventLoop<'t> {
         let permissions = Arc::clone(&rt.app.permissions);
         rt.handles.respawn(
             history,
-            &self.ctx.model_slot,
+            &rt.model_slot,
             self.ctx.config.clone(),
             self.ctx.ui_config.tool_output_lines,
             &permissions,
@@ -1938,27 +2361,73 @@ impl<'t> EventLoop<'t> {
                     .cmd_tx
                     .try_send(AgentCommand::CancelSubagent { tool_use_id });
             }
+            // `reset_session` has already swapped the app onto a fresh
+            // session id. The coordinator is keyed to the *old* id, so it is
+            // retired and a new one registered rather than reused: clearing
+            // its history instead would checkpoint the previous conversation
+            // away, and leaving it in place strands the tab under an id that
+            // no longer resolves.
             Action::NewSession => {
-                self.respawn_agent(idx, Vec::new());
+                self.note_if_deferred(idx, "the new session");
+                self.rotate_session(idx)
             }
             Action::LoadSession(loaded) => {
                 let loaded = *loaded;
-                if loaded.model_spec != self.ctx.model_slot.load().model.spec()
-                    && self.ctx.model_policy.allows(&loaded.model_spec)
-                    && let Ok(mut new_model) = Model::from_spec(&loaded.model_spec)
-                    && let Ok(new_provider) = from_model(&mut new_model, self.ctx.timeouts)
-                {
-                    self.ctx
-                        .model_slot
-                        .install(new_model, Arc::from(new_provider));
-                }
-                self.respawn_agent(idx, loaded.messages);
+                let coordinator = self.sessions[idx].coordinator.clone();
+                let spec = loaded.model_spec.clone();
+                let messages = loaded.messages.clone();
+                self.dispatch_session_op(
+                    idx,
+                    SessionOpKind::HistoryReplaced {
+                        history: loaded.messages,
+                        model_spec: Some(loaded.model_spec),
+                    },
+                    async move {
+                        coordinator
+                            .set_option("model", spec.as_str())
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        coordinator
+                            .replace_history(messages)
+                            .await
+                            .map_err(|error| error.to_string())
+                    },
+                );
             }
-            Action::ChangeModel(spec) => {
-                if let Err(error) = self.change_model(idx, &spec) {
-                    self.sessions[idx].app.flash(error);
-                }
+            Action::ToggleSessionOption { id, enabled } => {
+                let coordinator = self.sessions[idx].coordinator.clone();
+                let value = Self::boolean_option_value(enabled);
+                self.dispatch_session_op(
+                    idx,
+                    SessionOpKind::OptionToggled { id, enabled },
+                    async move {
+                        coordinator
+                            .set_option(id, value)
+                            .await
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    },
+                );
             }
+            Action::ChangeDirectory(path) => {
+                self.note_if_deferred(idx, "cd");
+                let coordinator = self.sessions[idx].coordinator.clone();
+                let adopted: Arc<std::sync::Mutex<Option<PathBuf>>> = Arc::default();
+                let slot = Arc::clone(&adopted);
+                self.dispatch_session_op(
+                    idx,
+                    SessionOpKind::DirectoryChanged { adopted },
+                    async move {
+                        let canonical = coordinator
+                            .change_directory(path)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(canonical);
+                        Ok(())
+                    },
+                );
+            }
+            Action::ChangeModel(spec) => self.change_model(idx, &spec),
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
             Action::AssignTier(spec, tier) => {
                 maki_providers::model_registry::set_and_persist(spec, tier, &self.ctx.storage);
@@ -2015,7 +2484,7 @@ impl<'t> EventLoop<'t> {
                 }
             }
             Action::Btw(question, images) => {
-                let slot = self.ctx.model_slot.load();
+                let slot = self.sessions[idx].model_slot.load();
                 self.sessions[idx].app.start_btw(
                     question,
                     images,
@@ -2035,21 +2504,205 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn change_model(&mut self, idx: usize, spec: &str) -> Result<(), String> {
-        if !self.ctx.model_policy.allows(spec) {
-            return Err(format!("{MODEL_POLICY_ERR}: {spec}"));
+    fn boolean_option_value(enabled: bool) -> &'static str {
+        if enabled {
+            maki_agent::session_options::ENABLED_VALUE
+        } else {
+            maki_agent::session_options::DISABLED_VALUE
         }
-        let mut new_model =
-            Model::from_spec(spec).map_err(|e| format!("{INVALID_MODEL_ERR}: {e}"))?;
-        let new_provider = from_model(&mut new_model, self.ctx.timeouts)
-            .map_err(|e| format!("{PROVIDER_INIT_ERR}: {e}"))?;
+    }
+
+    /// Runs `op` off the event-loop thread and delivers its result back as an
+    /// [`InternalEvent::SessionOp`]. See [`SessionOpKind`] for why.
+    fn dispatch_session_op<F>(&self, idx: usize, kind: SessionOpKind, op: F)
+    where
+        F: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let session = self.sessions[idx].id();
+        let internal_tx = self.internal_tx.clone();
+        smol::spawn(async move {
+            let result = op.await;
+            let _ = internal_tx.send(InternalEvent::SessionOp {
+                session,
+                kind,
+                result,
+            });
+        })
+        .detach();
+    }
+
+    /// The coordinator serves option changes while a turn holds the lease, but
+    /// still queues anything that changes what the turn is working on. Say so:
+    /// a command that is accepted and deferred should not look ignored.
+    fn note_if_deferred(&mut self, idx: usize, what: &str) {
+        if SessionStatus::of(&self.sessions[idx].app) != SessionStatus::Idle {
+            self.sessions[idx]
+                .app
+                .flash(format!("{what} applies when this turn finishes"));
+        }
+    }
+
+    fn handle_session_op(
+        &mut self,
+        session: MakiId,
+        kind: SessionOpKind,
+        result: Result<(), String>,
+    ) {
+        // The tab may have been closed or reordered while the operation ran.
+        let Some(idx) = self.position(session) else {
+            match kind {
+                SessionOpKind::ModelSet { reply_tx, .. }
+                | SessionOpKind::ThinkingSet { reply_tx, .. } => {
+                    let _ = reply_tx.send(Err(NOT_LIVE_ERR.to_owned()));
+                }
+                _ => {}
+            }
+            return;
+        };
+        match kind {
+            SessionOpKind::HistoryReplaced {
+                history,
+                model_spec,
+            } => match result {
+                Ok(()) => {
+                    if let Some(spec) = model_spec {
+                        self.apply_model_change(idx, &spec);
+                    }
+                    self.respawn_agent(idx, history);
+                }
+                Err(error) => self.sessions[idx].app.flash(error),
+            },
+            SessionOpKind::ModelChanged { spec } => match result {
+                Ok(()) => self.apply_model_change(idx, &spec),
+                Err(error) => self.sessions[idx].app.flash(error),
+            },
+            SessionOpKind::OptionToggled { id, enabled } => match result {
+                Ok(()) => self.sessions[idx].app.apply_toggled_option(id, enabled),
+                Err(error) => self.sessions[idx].app.flash(error),
+            },
+            SessionOpKind::DirectoryChanged { adopted } => match result {
+                Ok(()) => {
+                    let adopted = adopted.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    if let Some(path) = adopted {
+                        self.sessions[idx].app.apply_directory_change(path);
+                    }
+                }
+                Err(error) => self.sessions[idx].app.flash(format!("cd: {error}")),
+            },
+            SessionOpKind::ThinkingSet {
+                thinking,
+                set_default,
+                reply_tx,
+            } => {
+                let reply = result.and_then(|()| {
+                    if set_default {
+                        write_prefs(
+                            &self.ctx.storage,
+                            &Prefs {
+                                default_thinking: Some(thinking.into()),
+                            },
+                        )
+                        .map_err(|error| error.to_string())?;
+                    }
+                    let app = &mut self.sessions[idx].app;
+                    app.state.thinking = thinking;
+                    let mode = thinking.to_string();
+                    app.flash(format!("Thinking: {mode}"));
+                    Ok(json!({ "mode": mode }))
+                });
+                let _ = reply_tx.send(reply);
+            }
+            SessionOpKind::ModelSet {
+                spec,
+                thinking,
+                fast,
+                reply_tx,
+            } => {
+                let reply = result.and_then(|()| {
+                    if let Some(spec) = &spec {
+                        self.apply_model_change(idx, spec);
+                    }
+                    if let Some(thinking) = thinking {
+                        self.sessions[idx].app.state.thinking = thinking;
+                    }
+                    if let Some(fast) = fast {
+                        self.sessions[idx].app.set_fast(fast)?;
+                    }
+                    Ok(self.sessions[idx].app.model_state())
+                });
+                let _ = reply_tx.send(reply);
+            }
+        }
+    }
+
+    /// The app-side half of a model change, run once the coordinator has
+    /// adopted the model into the session's slot.
+    fn apply_model_change(&mut self, idx: usize, spec: &str) {
+        let model = self.sessions[idx].model_slot.load().model.clone();
         let app = &mut self.sessions[idx].app;
-        app.update_model(&new_model);
+        app.update_model(&model);
         app.record_recent_model(spec);
-        self.ctx
-            .model_slot
-            .install(new_model, Arc::from(new_provider));
-        Ok(())
+    }
+
+    /// A session's model option fixes its value list when the coordinator is
+    /// registered, but providers discover models in the background long after
+    /// that. Without republishing, `/model <a model discovered later>` is
+    /// rejected as an invalid option value -- and a session registered before
+    /// the first fetch landed can only ever select the model it started on.
+    fn sync_model_values(&mut self) {
+        let available = self.ctx.available_models.load_full();
+        let unchanged = match (&self.published_model_specs, &available) {
+            (Some(published), Some(current)) => Arc::ptr_eq(published, current),
+            (None, None) => true,
+            _ => false,
+        };
+        if unchanged {
+            return;
+        }
+        self.published_model_specs = available.clone();
+        // A refresh clears the list before refetching; publishing the empty
+        // state would strip every session back to its current model.
+        let Some(available) = available else {
+            return;
+        };
+        let specs: Vec<Arc<str>> = available
+            .iter()
+            .map(|spec| Arc::from(spec.as_str()))
+            .collect();
+        for rt in &self.sessions {
+            let coordinator = rt.coordinator.clone();
+            let specs = specs.clone();
+            // Off-thread like every other coordinator call: a running turn
+            // holds the lease and this would otherwise block the UI.
+            smol::spawn(async move {
+                if let Err(error) = coordinator.update_model_values(specs).await {
+                    warn!(%error, "publishing discovered models into a session failed");
+                }
+            })
+            .detach();
+        }
+    }
+
+    /// The slot the status line, usage panel, and new-session default are
+    /// about. Sessions own their models, so "current provider" means the
+    /// focused tab's, falling back to the startup slot before any tab exists.
+    fn focused_model_slot(&self) -> &Arc<ProviderSlot> {
+        self.sessions
+            .get(self.focused)
+            .map_or(&self.ctx.model_slot, |rt| &rt.model_slot)
+    }
+
+    fn change_model(&mut self, idx: usize, spec: &str) {
+        let coordinator = self.sessions[idx].coordinator.clone();
+        let spec = spec.to_owned();
+        let op_spec = spec.clone();
+        self.dispatch_session_op(idx, SessionOpKind::ModelChanged { spec }, async move {
+            coordinator
+                .set_option("model", op_spec.as_str())
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        });
     }
 
     fn refresh_models(&self) {
@@ -2069,17 +2722,16 @@ impl<'t> EventLoop<'t> {
     }
 
     fn refresh_provider(&mut self, slug: String) {
-        let mut model = self.ctx.model_slot.load().model.clone();
+        let slot = Arc::clone(self.focused_model_slot());
+        let mut model = slot.load().model.clone();
         if model.provider.to_string() == slug {
             if let Ok(provider) =
                 maki_providers::provider::from_model(&mut model, self.ctx.timeouts)
             {
-                self.ctx.model_slot.install(model, Arc::from(provider));
+                slot.install(model, Arc::from(provider));
             }
-        } else if let Some(builtin) = maki_config::providers::builtin_provider(&slug)
-            && let Err(e) = self.change_model(self.focused, builtin.default_model)
-        {
-            self.focused_app().flash(e);
+        } else if let Some(builtin) = maki_config::providers::builtin_provider(&slug) {
+            self.change_model(self.focused, builtin.default_model);
         }
     }
 
@@ -2106,11 +2758,16 @@ impl<'t> EventLoop<'t> {
         let kill_mcp_ms = lap();
         let mut tabs = Vec::with_capacity(self.sessions.len());
         let mut agent_tasks = Vec::with_capacity(self.sessions.len());
+        let mut coordinators = Vec::with_capacity(self.sessions.len());
         for rt in self.sessions.drain(..) {
             let SessionRuntime {
-                mut app, handles, ..
+                mut app,
+                handles,
+                coordinator,
+                ..
             } = rt;
             app.checkpoint_now();
+            coordinators.push(coordinator);
             // `app` drops at the end of this iteration, closing the
             // channels the agent loop waits on, so `join_all` can finish.
             tabs.push(Arc::unwrap_or_clone(app.state.session));
@@ -2118,6 +2775,12 @@ impl<'t> EventLoop<'t> {
         }
         let save_sessions_ms = lap();
         crate::agent::join_all(agent_tasks, AGENT_SHUTDOWN_TIMEOUT);
+        // Dropping the handles is the teardown: the coordinator's loop ends
+        // when its channel closes and unregisters on the way out, and `Close`
+        // persists nothing. Awaiting it would buy nothing and could hang exit,
+        // because a turn that never releases its lease defers the close
+        // forever.
+        drop(coordinators);
         let join_agents_ms = lap();
         if let Some(ref h) = self.ctx.mcp_handle {
             smol::block_on(h.shutdown());
@@ -2259,6 +2922,238 @@ mod tests {
     use test_case::test_case;
 
     const OBSERVATION: &str = "failed";
+
+    fn model_named(id: &str) -> Model {
+        let mut model = crate::components::test_model();
+        model.id = id.into();
+        model
+    }
+
+    /// A runtime whose app and provider slot both start on `model`.
+    fn test_runtime(model: Model) -> SessionRuntime {
+        let (model_slot, _change_rx) = ProviderSlot::new(model.clone(), Arc::new(StubProvider));
+        let permissions = Arc::new(PermissionManager::new(
+            maki_config::PermissionsConfig::default(),
+            PathBuf::from("/tmp"),
+            Arc::default(),
+        ));
+        let mut app = crate::app::tests::test_app();
+        app.update_model(&model);
+        let handles = AgentHandles::spawn(
+            &model_slot,
+            Vec::new(),
+            AgentConfig::default(),
+            maki_agent::ToolOutputLines::default(),
+            &permissions,
+            PathBuf::from("/tmp"),
+            None,
+            Timeouts::default(),
+            EventHandle::disconnected_for_test(),
+            None,
+            McpConfigErrors::new(PathBuf::new()),
+            Arc::new(ModelPolicy::default()),
+            SystemPromptOverride::default(),
+        );
+        let coordinator = test_coordinator(app.state.session.id);
+        let (shell_tx, shell_rx) = flume::unbounded();
+        SessionRuntime {
+            app,
+            handles,
+            model_slot,
+            coordinator,
+            shell_tx,
+            shell_rx,
+            last_status: SessionStatus::Idle,
+            notifications: RunNotificationState::default(),
+        }
+    }
+
+    fn test_coordinator(session_id: MakiId) -> SessionCoordinatorHandle {
+        use maki_storage::checkpoint::{CheckpointAck, CheckpointFuture, CheckpointRequest};
+        SessionCoordinatorHandle::register(SessionCoordinatorParams {
+            session_id,
+            catalog: Default::default(),
+            definitions: builtin_option_definitions(
+                "anthropic/test-model",
+                [Arc::from("anthropic/test-model")],
+                false,
+                false,
+                false,
+                maki_agent::ThinkingConfig::Off,
+            ),
+            persisted_options: Default::default(),
+            history: Vec::new(),
+            model: Arc::from("anthropic/test-model"),
+            cwd: PathBuf::from("/tmp"),
+            model_policy: Arc::default(),
+            model_adopter: Arc::new(|_: Model| Box::pin(async { Ok(()) }) as ModelAdoptionFuture),
+            directory_adopter: Arc::new(|path: PathBuf| {
+                Box::pin(async move { Ok(path) }) as DirectoryAdoptionFuture
+            }),
+            checkpoint: Arc::new(
+                |request: CheckpointRequest<maki_agent::session_coordinator::SessionCheckpoint>| {
+                    Box::pin(async move {
+                        Ok(CheckpointAck {
+                            session_id: request.session_id,
+                            version: request.version,
+                        })
+                    }) as CheckpointFuture
+                },
+            ),
+            mailbox: maki_agent::SessionMailbox::new(session_id),
+        })
+        .expect("coordinator registration")
+    }
+
+    struct StubProvider;
+
+    impl Provider for StubProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a serde_json::Value,
+            _event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
+            _opts: maki_providers::RequestOptions,
+            _session_id: Option<&'a SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<
+            'a,
+            Result<maki_providers::StreamResponse, maki_providers::AgentError>,
+        > {
+            Box::pin(std::future::pending())
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, maki_providers::AgentError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    /// A real `StorageWriter`, so the coordinator checkpoint path -- which
+    /// merges into the writer's snapshot for the session -- is exercised
+    /// rather than stubbed away.
+    fn test_coordinator_deps() -> CoordinatorDeps {
+        let (warn_tx, _warn_rx) = flume::unbounded();
+        let storage_writer = Arc::new(StorageWriter::new(
+            StateDir::from_path(std::env::temp_dir()),
+            warn_tx,
+        ));
+        CoordinatorDeps {
+            catalog: Default::default(),
+            model_policy: Arc::default(),
+            timeouts: Timeouts::default(),
+            storage_writer,
+        }
+    }
+
+    /// `/new` swaps the app onto a fresh session id. The coordinator is keyed
+    /// to the id, so it has to move with it: leaving it behind made the
+    /// previous session unrestorable ("session already live"), denied the new
+    /// session a lease, and left the tab's mailbox on the retired session.
+    #[test]
+    fn rotating_a_session_moves_its_coordinator_and_mailbox() {
+        let deps = test_coordinator_deps();
+        let mut rt = test_runtime(model_named("first"));
+        let old_id = rt.id();
+        assert_eq!(rt.coordinator.read().session_id(), old_id);
+
+        // What `reset_session` does: a brand new session in the same tab.
+        rt.app.state.session = Arc::new(AppSession::new("anthropic/test-model", "/tmp"));
+        let new_id = rt.id();
+        assert_ne!(new_id, old_id);
+
+        let retired = rotate_session_coordinator(&deps, &mut rt, Vec::new())
+            .expect("rotation registers a coordinator for the new session");
+
+        assert_eq!(retired.read().session_id(), old_id);
+        assert_eq!(
+            rt.coordinator.read().session_id(),
+            new_id,
+            "the tab's coordinator must follow its session id"
+        );
+        assert_eq!(
+            rt.handles.mailbox().map(|mailbox| mailbox.session_id()),
+            Some(new_id),
+            "the new coordinator hands out the mailbox the agent polls"
+        );
+        assert!(
+            SessionCoordinatorHandle::resolve(new_id).is_ok(),
+            "the new session must be addressable"
+        );
+
+        // The first option change on the rotated session checkpoints, which
+        // merges into the storage writer's snapshot for that id. Registering
+        // without seeding that snapshot failed here with "session snapshot is
+        // unavailable".
+        smol::block_on(rt.coordinator.set_option(
+            maki_agent::session_options::YOLO_OPTION_ID,
+            maki_agent::session_options::ENABLED_VALUE,
+        ))
+        .expect("a rotated session must be able to checkpoint");
+
+        // Restoring the previous session means registering it again, which is
+        // what failed with "session already live" while the retired handle
+        // stayed registered.
+        let _ = smol::block_on(retired.close());
+        let restored = register_coordinator(
+            &deps,
+            &AppSession::new("anthropic/test-model", "/tmp"),
+            Vec::new(),
+            Vec::new(),
+            &rt.model_slot,
+            &rt.handles,
+            &Arc::clone(&rt.app.permissions),
+            DomainThinkingConfig::Off,
+        );
+        assert!(
+            restored.is_ok(),
+            "a retired session must be re-registerable: {:?}",
+            restored.err().map(|error| error.to_string())
+        );
+
+        let _ = smol::block_on(restored.unwrap().close());
+        let _ = smol::block_on(rt.coordinator.close());
+    }
+
+    /// Tabs hold their own models. A sync that read one shared slot would
+    /// rewrite every tab to the last model changed, and persist it, while each
+    /// agent kept inferring on the model its own slot holds.
+    #[test]
+    fn each_tab_follows_its_own_model_slot() {
+        let mut sessions = vec![
+            test_runtime(model_named("first")),
+            test_runtime(model_named("second")),
+        ];
+
+        // Repoint only the second tab's slot, as `/model` on that tab would.
+        sessions[1]
+            .model_slot
+            .install(model_named("changed"), Arc::new(StubProvider));
+
+        assert!(sync_session_models(&mut sessions));
+        assert_eq!(
+            sessions[0].app.state.session.model,
+            model_named("first").spec(),
+            "an untouched tab must keep its own model"
+        );
+        assert_eq!(
+            sessions[1].app.state.session.model,
+            model_named("changed").spec()
+        );
+        assert!(
+            !sync_session_models(&mut sessions),
+            "a settled set of tabs reports no change"
+        );
+
+        for rt in sessions {
+            let _ = smol::block_on(rt.coordinator.close());
+        }
+    }
     const SHELL_RESULT: &str = "command finished";
 
     const MIDDLE_SCROLL_STEP: Duration = Duration::from_millis(100);

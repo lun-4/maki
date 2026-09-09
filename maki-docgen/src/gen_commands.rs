@@ -38,12 +38,26 @@ fn markdown_cell(value: &str) -> String {
         .replace(['\r', '\n'], "<br>")
 }
 
+/// Where a built-in is advertised. "TUI-only" used to mean the interactive-UI
+/// capability alone, which read as a contradiction for `/new`: it is not an
+/// interactive command, but it needs session replacement, which no portable
+/// frontend offers. The column asks the question the reader has instead --
+/// can I type this here? -- so anything the portable capability set cannot
+/// satisfy is TUI-only regardless of which capability it was missing.
+fn frontends(required: maki_commands::TargetCapabilities) -> &'static str {
+    if maki_agent::command::portable_capabilities().contains_all(required) {
+        "all"
+    } else {
+        "TUI only"
+    }
+}
+
 fn write_row(
     out: &mut String,
     name: &str,
     description: &str,
     argument_hint: Option<&str>,
-    tui_only: bool,
+    required: maki_commands::TargetCapabilities,
 ) {
     writeln!(
         out,
@@ -51,7 +65,7 @@ fn write_row(
         markdown_cell(name),
         markdown_cell(description),
         markdown_cell(argument_hint.unwrap_or("")),
-        if tui_only { "yes" } else { "no" }
+        frontends(required)
     )
     .unwrap();
 }
@@ -82,8 +96,8 @@ pub fn generate() -> color_eyre::Result<String> {
 
     writeln!(out, "## Built-in commands").unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "| Command | Description | Arguments | TUI-only |").unwrap();
-    writeln!(out, "|---------|-------------|-----------|----------|").unwrap();
+    writeln!(out, "| Command | Description | Arguments | Frontends |").unwrap();
+    writeln!(out, "|---------|-------------|-----------|------------|").unwrap();
     for cmd in BUILTIN_COMMANDS {
         let spec = cmd.spec();
         write_row(
@@ -91,8 +105,7 @@ pub fn generate() -> color_eyre::Result<String> {
             cmd.name,
             cmd.description,
             spec.docs.argument_hint.as_deref(),
-            cmd.required_capabilities
-                .contains(maki_commands::TargetCapability::InteractiveUi),
+            cmd.required_capabilities,
         );
         for alias in cmd.aliases {
             write_row(
@@ -100,8 +113,7 @@ pub fn generate() -> color_eyre::Result<String> {
                 alias,
                 &format!("Alias for `{}`", cmd.name),
                 spec.docs.argument_hint.as_deref(),
-                cmd.required_capabilities
-                    .contains(maki_commands::TargetCapability::InteractiveUi),
+                cmd.required_capabilities,
             );
         }
     }
@@ -109,7 +121,7 @@ pub fn generate() -> color_eyre::Result<String> {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "The portable built-ins are `/compact`, `/new` (and `/clear`), `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises these built-ins plus custom, MCP, and portable Lua commands. Commands that require TUI capabilities are omitted from ACP. Invoking an unavailable command returns an error; to send it as a literal prompt, escape the leading slash (`//help` sends `/help`)."
+        "The portable built-ins are `/compact`, `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises these built-ins plus custom, MCP, and portable Lua commands. ACP hides `/new` and `/clear`. The ACP client owns session creation through `session/new`. A typed `/new` or `/clear` resolves locally and returns guidance to use `session/new`; it does not invoke model inference or reset model history. Commands that require TUI capabilities are omitted from ACP. Invoking an unavailable command returns an error; to send it as a literal prompt, escape the leading slash (`//help` sends `/help`)."
     )
     .unwrap();
 
@@ -122,15 +134,21 @@ pub fn generate() -> color_eyre::Result<String> {
     )
     .unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "| Command | Description | Arguments | TUI-only |").unwrap();
-    writeln!(out, "|---------|-------------|-----------|----------|").unwrap();
+    writeln!(out, "| Command | Description | Arguments | Frontends |").unwrap();
+    writeln!(out, "|---------|-------------|-----------|------------|").unwrap();
     for cmd in lua_util::load_builtin_plugin_commands()? {
         write_row(
             &mut out,
             &cmd.name,
             &cmd.description,
             cmd.argument_hint.as_deref(),
-            cmd.tui_only,
+            if cmd.tui_only {
+                maki_commands::TargetCapabilities::from_capability(
+                    maki_commands::TargetCapability::InteractiveUi,
+                )
+            } else {
+                maki_commands::TargetCapabilities::NONE
+            },
         );
     }
 
@@ -310,11 +328,11 @@ mod tests {
             "name|value",
             "line 1\nline 2",
             Some("<a|b>"),
-            false,
+            maki_commands::TargetCapabilities::NONE,
         );
         assert_eq!(
             generated,
-            "| `name\\|value` | line 1<br>line 2 | <a\\|b> | no |\n"
+            "| `name\\|value` | line 1<br>line 2 | <a\\|b> | all |\n"
         );
     }
 
@@ -334,16 +352,16 @@ mod tests {
             }
         }
         for row in [
-            "| `/automode` | Toggle bash auto mode (classifier gates every bash command) |  | no |",
-            "| `/build` | Switch to build mode (full tool access) |  | no |",
-            "| `/memory` | View, edit, and delete memory files |  | yes |",
-            "| `/plan` | Switch to plan mode (analyse and write only the plan file) |  | no |",
-            "| `/rename` | Rename the current session | <title> | yes |",
-            "| `/sessions` | Browse and switch sessions | [query] | yes |",
-            "| `/splash` | Preview and select a splash renderer | [splash] | yes |",
-            "| `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. |  | yes |",
-            "| `/thinking` | Set thinking effort (bare opens a selector) | [effort] | yes |",
-            "| `/usage` | Show provider quota and focused-session token usage |  | yes |",
+            "| `/automode` | Toggle bash auto mode (classifier gates every bash command) |  | all |",
+            "| `/build` | Switch to build mode (full tool access) |  | all |",
+            "| `/memory` | View, edit, and delete memory files |  | TUI only |",
+            "| `/plan` | Switch to plan mode (analyse and write only the plan file) |  | all |",
+            "| `/rename` | Rename the current session | <title> | TUI only |",
+            "| `/sessions` | Browse and switch sessions | [query] | TUI only |",
+            "| `/splash` | Preview and select a splash renderer | [splash] | TUI only |",
+            "| `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. |  | TUI only |",
+            "| `/thinking` | Set thinking effort (bare opens a selector) | [effort] | TUI only |",
+            "| `/usage` | Show provider quota and focused-session token usage |  | TUI only |",
         ] {
             assert!(plugins.contains(row), "{row}");
         }

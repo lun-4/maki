@@ -943,6 +943,8 @@ async fn session(
     let (ui_input_tx, ui_input_rx) = flume::unbounded::<String>();
     let agent_id = AgentId::generate();
     let params = AgentParams {
+        settings_source: None,
+        tool_builder: None,
         agent_id,
         provider,
         model,
@@ -1050,6 +1052,7 @@ async fn session(
                         fast,
                         workflow: false,
                         prompt: None,
+                        lease_committer: None,
                     },
                     None,
                     String::new(),
@@ -1255,6 +1258,7 @@ async fn prompt(
             fast: state.fast,
             workflow: false,
             prompt: None,
+            lease_committer: None,
         },
         None,
         String::new(),
@@ -1361,6 +1365,7 @@ async fn send(
             fast: state.fast,
             workflow: false,
             prompt: None,
+            lease_committer: None,
         },
         None,
         String::new(),
@@ -1728,6 +1733,8 @@ mod tests {
         let (child_trigger, child_cancel) = CancelToken::new();
         let ctx = AgentContext::from(&stub_ctx(&AgentMode::Build));
         let params = AgentParams {
+            settings_source: None,
+            tool_builder: None,
             agent_id,
             provider,
             model: ctx.model.as_ref().clone(),
@@ -1809,6 +1816,7 @@ mod tests {
                     fast: state.fast,
                     workflow: false,
                     prompt: None,
+                    lease_committer: None,
                 },
                 None,
                 String::new(),
@@ -1833,6 +1841,7 @@ mod tests {
                         fast: state.fast,
                         workflow: false,
                         prompt: None,
+                        lease_committer: None,
                     },
                     None,
                     String::new(),
