@@ -1854,7 +1854,7 @@ mod tests {
     #[test]
     fn completion_kind_highlights_do_not_collapse_into_item_colour() {
         let t = theme::InMemoryThemesProvider::bundled()
-            .load("lunared")
+            .load("makima")
             .unwrap();
         // A kind highlight equal to the base item colour renders as plain
         // unhighlighted text, hiding prefix matches whose label starts with
@@ -2043,7 +2043,7 @@ mod tests {
         );
 
         let t = theme::InMemoryThemesProvider::bundled()
-            .load("lunared")
+            .load("makima")
             .unwrap();
         let line = cell_line(&c, 40, true, &t);
         let kind = t.completion_kinds.get("skill").copied().unwrap_or(t.item);
