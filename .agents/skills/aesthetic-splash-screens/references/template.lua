@@ -9,27 +9,24 @@ local LABEL = "mysplash"
 local RAMP = " .:-=+*#%@"
 local M = {}
 
-local function theme_or(name, fallback)
+local function theme_rgb(name)
   local c = maki.ui.theme_color(name)
-  if c then
-    return {
-      tonumber(string.sub(c, 2, 3), 16),
-      tonumber(string.sub(c, 4, 5), 16),
-      tonumber(string.sub(c, 6, 7), 16),
-    }
+  if not c then
+    return nil
   end
-  return fallback
+  return {
+    tonumber(string.sub(c, 2, 3), 16),
+    tonumber(string.sub(c, 4, 5), 16),
+    tonumber(string.sub(c, 6, 7), 16),
+  }
 end
 
-local BG, FG, ACCENT, BG_HEX
+local BG_HEX, FG
 local style_cache = {}
 
 local function refresh_colors()
-  BG = theme_or("background", { 40, 42, 54 })
-  FG = theme_or("foreground", { 248, 248, 242 })
-  ACCENT = theme_or("accent", { 255, 184, 108 })
-  -- also available in most themes: "green", "purple", "red", "yellow"
-  BG_HEX = string.format("#%02x%02x%02x", BG[1], BG[2], BG[3])
+  BG_HEX = maki.ui.theme_color("background")
+  FG = theme_rgb("foreground")
   style_cache = {}
 end
 
@@ -47,7 +44,7 @@ end
 local function color(hex)
   local s = style_cache[hex]
   if not s then
-    s = { fg = hex, bg = BG_HEX, bold = false }
+    s = { fg = hex, bold = false }
     style_cache[hex] = s
   end
   return s
@@ -56,12 +53,12 @@ end
 local W, H
 
 local function new_grid()
-  local bg = color(BG_HEX)
+  local cell_style = BG_HEX and color(BG_HEX) or { bold = false }
   local grid = {}
   for y = 1, H do
     local row = {}
     for x = 1, W do
-      row[x] = { glyph = " ", style = bg }
+      row[x] = { glyph = " ", style = cell_style }
     end
     grid[y] = row
   end
@@ -189,7 +186,7 @@ function M.render(w, h, t, fade)
   W, H = w, h
   local f = fade or 1.0
   if w < 8 or h < 6 then
-    return flat_rows(w, h, color(BG_HEX))
+    return flat_rows(w, h, { bold = false })
   end
   local grid = new_grid()
   for y = 1, h do
@@ -203,8 +200,8 @@ function M.render(w, h, t, fade)
       }
     end
   end
-  place_text(grid, H - 1, math.floor((W - #LABEL) / 2) + 1, LABEL, color(rgb_to_hex(FG, 0.5 * f)))
-  place_text(grid, 1, W - #("v" .. maki.version().current) + 1, "v" .. maki.version().current, color(rgb_to_hex(FG, 0.4 * f)))
+  place_text(grid, H - 1, math.floor((W - #LABEL) / 2) + 1, LABEL, FG and color(rgb_to_hex(FG, 0.5 * f)) or { bold = false })
+  place_text(grid, 1, W - #("v" .. maki.version().current) + 1, "v" .. maki.version().current, FG and color(rgb_to_hex(FG, 0.4 * f)) or { bold = false })
   return build_rows(grid)
 end
 

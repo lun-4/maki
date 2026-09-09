@@ -18,7 +18,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
-use super::{App, Mode, Status};
+use super::{App, Mode, Status, mouse::MIDDLE_SCROLL_ANCHOR};
 
 const SUBAGENT_INPUT_HINT: &str = "sends to this subagent \u{b7} TAB mode \u{b7} ESC cancel";
 
@@ -57,7 +57,15 @@ impl App {
         self.render_defer_hint(frame, layout.defer_hint_area);
         overlay_rect = self.render_top_modals(frame, overlay_rect);
         self.register_zones(&layout, overlay_rect);
+        let _ = self.validate_middle_scroll();
         self.apply_selection(frame, render_chat);
+        if let Some(state) = &self.middle_scroll
+            && layout.msg_area.contains(state.origin)
+        {
+            frame.buffer_mut()[state.origin]
+                .set_symbol(MIDDLE_SCROLL_ANCHOR)
+                .set_style(Style::new().fg(theme::current().mode_build));
+        }
         self.render_active_input(frame, &layout);
     }
 
@@ -232,7 +240,20 @@ impl App {
     fn render_messages(&mut self, frame: &mut Frame, layout: &ViewLayout, render_chat: usize) {
         let accent = self.effective_mode_color();
         self.chats[render_chat].set_accent(accent);
-        self.chats[render_chat].view(frame, layout.msg_area, self.selection_state.is_some());
+        let _ = self.validate_middle_scroll();
+        if self.middle_scroll.is_some()
+            && self
+                .zones
+                .find(SelectionZone::Messages)
+                .is_none_or(|zone| zone.area != layout.msg_area)
+        {
+            let _ = self.cancel_middle_scroll();
+        }
+        self.chats[render_chat].view(
+            frame,
+            layout.msg_area,
+            self.selection_state.is_some() || self.middle_scroll.is_some(),
+        );
     }
 
     fn render_bottom_panel(&mut self, frame: &mut Frame, layout: &ViewLayout) {

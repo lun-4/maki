@@ -33,7 +33,8 @@ These come from building 17 splashes and watching what worked:
   mandates a fixed palette (synthwave purple-orange), the intended split is:
   hardcoded colors for the scene, theme colors for the furniture (background,
   label, version). The scene is the art; the furniture should still match
-  the theme.
+  the theme. A name that `theme_color` cannot resolve degrades to the host
+  foreground; never bake a fallback palette.
 - **Calm timing.** Splash effects run at 0.1-0.6 Hz in feel. If it pulses
   faster than ~2 Hz it competes with the user's attention instead of
   decorating the screen.
@@ -54,7 +55,9 @@ end)
 - `w`, `h`: cells. `t`: seconds since the splash appeared. `fade`: 0 -> 1
   entry fade; multiply color intensity by it.
 - Style is `"field"` (transparent spaces), a hex string, or
-  `{ fg = "#rrggbb", bg = "#rrggbb", bold = bool }`. Cache style tables and
+  `{ fg = "#rrggbb", bold = bool }`. `fg` is optional: an omitted foreground
+  degrades to the host theme's foreground, and the cell background is always
+  the host theme's background. Cache style tables and
   reuse them by identity: the renderer coalesces runs of the *same table* into
   one segment, so fresh tables per cell explode the segment count.
 - Rendering is pull-driven: be pure in `t`, never block, never sleep.
@@ -130,7 +133,7 @@ end)
 
    Glyph-only dumps catch structural problems (asymmetry, clipping, label
    collisions) that unit checks miss. Background-color effects (fire) look
-   blank in text dumps; inspect `seg.style.bg` values instead.
+   blank in text dumps; inspect `seg.style.fg` values instead.
 5. **Run maki and watch the cycle.** Color balance, quantization banding, and
    pacing are only judgeable live. Iterate on the one effect until it's
    unmistakable.

@@ -52,7 +52,11 @@ impl Layout {
 /// 1. `cursor` stays in bounds while `cached_lines` is non-empty.
 /// 2. `scroll_offset` stays at or below `layout().max_offset(viewport_h)`.
 /// 3. [`set_cursor`] and [`bring_cursor_into_view`] place the cursor inside
-///    the visible band whenever there is anything to scroll.
+///    the visible band and slide the offset to follow it when the cursor row
+///    moves or content shrink clamps it. Re-asserting an unchanged cursor row
+///    never moves the offset, so wheel scrolls survive re-renders; the offset
+///    still stays at or below `max_offset`. An assert of a raw row differing
+///    from the stored clamped cursor still counts as a move.
 /// 4. [`refresh_layout`] only ever clamps the offset down to fit. It never
 ///    drags it back toward the cursor, which is the bug that ate wheel input
 ///    on every frame.
@@ -95,8 +99,9 @@ impl FloatWindow {
     }
 
     fn set_cursor(&mut self, row: usize) {
+        let cursor_moved = row != self.cursor;
         self.cursor = row;
-        self.bring_cursor_into_view();
+        self.bring_cursor_into_view(cursor_moved);
     }
 
     /// Called once per frame from the render path. Only shrinks the offset
@@ -113,19 +118,24 @@ impl FloatWindow {
     }
 
     /// Pulls the cursor into the scrollable band and then slides the offset
-    /// to follow it. Use this after the cursor moves or the buffer changes,
-    /// never on a plain redraw.
-    fn bring_cursor_into_view(&mut self) {
+    /// to follow it when `cursor_moved` is set, keeping a wheel-scrolled view
+    /// steady across re-renders that re-assert an unchanged cursor row. The
+    /// cursor itself is always clamped into bounds.
+    fn bring_cursor_into_view(&mut self, cursor_moved: bool) {
         let layout = self.layout();
         let effective_cursor = self.cursor.saturating_sub(layout.reserved_top);
         let clamped = effective_cursor.min(layout.scrollable.saturating_sub(1));
         self.cursor = clamped + layout.reserved_top;
-        self.scroll_offset = adjust_scroll(
-            clamped,
-            self.scroll_offset,
-            layout.scrollable,
-            self.viewport_h,
-        );
+        if cursor_moved || clamped != effective_cursor {
+            self.scroll_offset = adjust_scroll(
+                clamped,
+                self.scroll_offset,
+                layout.scrollable,
+                self.viewport_h,
+            );
+        } else {
+            self.scroll_offset = self.scroll_offset.min(layout.max_offset(self.viewport_h));
+        }
     }
 }
 
@@ -229,7 +239,7 @@ impl FloatManager {
         for win in &mut self.windows {
             if let Some(lines) = win.buf.read_if_dirty() {
                 win.cached_lines = lines;
-                win.bring_cursor_into_view();
+                win.bring_cursor_into_view(false);
                 dirty = Dirty::YES;
             }
 
@@ -1715,6 +1725,8 @@ mod tests {
     const SCROLL_PRESERVED: &str = "refresh_layout must not pull offset toward cursor";
     const CURSOR_VISIBLE: &str = "cursor must be inside the viewport";
     const OFFSET_IN_RANGE: &str = "scroll_offset must be <= max_offset";
+    const CURSOR_REASSERT_PRESERVED: &str =
+        "re-asserting an unchanged cursor must not pull the offset toward it";
 
     fn make_window_n(line_count: usize) -> FloatWindow {
         let (event_tx, _event_rx) = flume::bounded::<WinEvent>(8);
@@ -1796,10 +1808,63 @@ mod tests {
         win.set_cursor(2);
 
         win.cached_lines = Arc::new((0..30).map(|i| make_line(&format!("l{i}"))).collect());
-        win.bring_cursor_into_view();
+        win.bring_cursor_into_view(false);
 
         assert_cursor_visible(&win);
         assert_invariants(&win);
+    }
+
+    #[test]
+    fn set_cursor_same_row_preserves_wheel_scroll() {
+        let mut win = make_window_n(20);
+        win.config.reserved_top = 2;
+        win.refresh_layout(5);
+        win.set_cursor(2);
+        win.scroll_by(-8);
+        let scrolled = win.scroll_offset;
+
+        win.set_cursor(2);
+
+        assert_eq!(win.scroll_offset, scrolled, "{CURSOR_REASSERT_PRESERVED}");
+        assert_invariants(&win);
+    }
+
+    #[test]
+    fn set_cursor_new_row_after_wheel_scroll_brings_it_into_view() {
+        let mut win = make_window_n(20);
+        win.config.reserved_top = 2;
+        win.refresh_layout(5);
+        win.set_cursor(2);
+        win.scroll_by(-8);
+
+        win.set_cursor(5);
+
+        assert_cursor_visible(&win);
+        assert_invariants(&win);
+    }
+
+    #[test]
+    fn tick_preserves_wheel_scroll_across_periodic_rereder() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, _event_rx, cmd_tx) = make_channels();
+        let lines: Vec<String> = (0..20).map(|i| format!("line{i}")).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let buf = make_buf(&refs);
+        let mut cfg = make_config();
+        cfg.reserved_top = 2;
+        mgr.open(buf.clone(), cfg, true, event_tx, cmd_rx);
+        mgr.windows[0].refresh_layout(5);
+        mgr.windows[0].set_cursor(2);
+        mgr.windows[0].scroll_by(-8);
+        let scrolled = mgr.windows[0].scroll_offset;
+
+        cmd_tx.send(WinCommand::SetCursor(2)).unwrap();
+        buf.set_lines((0..20).map(|i| make_line(&format!("line{i}"))).collect());
+        let _ = mgr.tick();
+
+        let win = &mgr.windows[0];
+        assert_eq!(win.scroll_offset, scrolled, "{CURSOR_REASSERT_PRESERVED}");
+        assert_invariants(win);
     }
 
     #[test]

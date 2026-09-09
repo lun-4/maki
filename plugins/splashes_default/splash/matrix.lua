@@ -107,13 +107,13 @@ function M.render(w, h, t, fade)
     local fg = nil
     local function flush()
       if #buf > 0 then
-        segs[#segs + 1] = { glyphs = table.concat(buf), style = { fg = fg or "#000000", bg = "#000000", bold = false } }
+        segs[#segs + 1] = { glyphs = table.concat(buf), style = { fg = fg, bold = false } }
         buf = {}
       end
     end
     for x = 1, w do
       local cell = grid[y][x]
-      local next_fg = (cell and cell.fg) or "#000000"
+      local next_fg = cell and cell.fg
       if next_fg ~= fg then
         flush()
         fg = next_fg

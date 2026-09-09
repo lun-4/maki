@@ -133,6 +133,36 @@ local boot_skills = discover_skills()
 local description = "Load a skill that provides instructions and workflows for specific tasks."
   .. build_skill_list(boot_skills)
 
+local function format_skill(content, location)
+  local lines = {}
+  for i, line in ipairs(maki.split(content, "\n")) do
+    lines[#lines + 1] = string.format("%4d | %s", i, line)
+  end
+  return location .. "\n" .. table.concat(lines, "\n")
+end
+
+-- One body builder for the handler and restore, so both render alike.
+local function build_skill_view(content, location, ctx)
+  local buf = maki.ui.buf()
+  local tol = ctx:tool_output_lines()
+  local view = ToolView.new(buf, {
+    max_lines = (tol and tol.other) or 20,
+    keep = "head",
+  })
+  buf:on("click", function()
+    view:toggle()
+  end)
+
+  local ext = location:match("%.([^%.]+)$") or "md"
+  if not view:set_highlight(content, ext) then
+    for line in format_skill(content, location):gmatch("([^\n]*)\n?") do
+      view:append(line)
+    end
+  end
+  view:finish()
+  return buf
+end
+
 maki.api.register_tool({
   name = "skill",
   kind = "read",
@@ -150,6 +180,10 @@ maki.api.register_tool({
   end,
 
   restore = function(_input, output, _is_error, ctx)
+    local st = ctx:state()
+    if st and type(st.content) == "string" and type(st.location) == "string" then
+      return build_skill_view(st.content, st.location, ctx)
+    end
     local tol = ctx:tool_output_lines()
     return ToolView.restore(output, {
       max_lines = (tol and tol.other) or 20,
@@ -172,29 +206,7 @@ maki.api.register_tool({
       skill.content = skill.resolve()
     end
 
-    local lines = {}
-    for i, line in ipairs(maki.split(skill.content, "\n")) do
-      lines[#lines + 1] = string.format("%4d | %s", i, line)
-    end
-    local formatted = skill.location .. "\n" .. table.concat(lines, "\n")
-
-    local buf = maki.ui.buf()
-    local tol = ctx:tool_output_lines()
-    local view = ToolView.new(buf, {
-      max_lines = (tol and tol.other) or 20,
-      keep = "head",
-    })
-    buf:on("click", function()
-      view:toggle()
-    end)
-
-    local ext = skill.location:match("%.([^%.]+)$") or "md"
-    if not view:set_highlight(skill.content, ext) then
-      for line in formatted:gmatch("([^\n]*)\n?") do
-        view:append(line)
-      end
-    end
-    view:finish()
+    local formatted = format_skill(skill.content, skill.location)
 
     local short = shorten_path(skill.location)
     local header_buf = maki.ui.buf()
@@ -202,8 +214,10 @@ maki.api.register_tool({
 
     return {
       llm_output = formatted,
-      body = buf,
+      body = build_skill_view(skill.content, skill.location, ctx),
       header = header_buf,
+      -- What the view was built from, so restore renders the same view.
+      state = { content = skill.content, location = skill.location },
     }
   end,
 })
