@@ -13,25 +13,25 @@ The active registry combines built-ins, custom Markdown commands, MCP prompts, a
 
 ## Built-in commands
 
-| Command | Description | Arguments | TUI-only |
-|---------|-------------|-----------|----------|
-| `/tasks` | Browse and search tasks |  | yes |
-| `/compact` | Summarize and compact conversation history |  | no |
-| `/new` | Start a new session |  | no |
-| `/clear` | Alias for `/new` |  | no |
-| `/help` | Show keybindings |  | yes |
-| `/queue` | Remove items from queue |  | yes |
-| `/model` | Switch model | <model> | no |
-| `/theme` | Switch color theme | <theme> | yes |
-| `/mcp` | Configure MCP servers |  | yes |
-| `/login` | Authenticate with an LLM provider |  | yes |
-| `/cd` | Change working directory | <path> | no |
-| `/btw` | Ask a quick question (no tools, no history pollution) | <question> | no |
-| `/yolo` | Toggle YOLO mode (skip all permission prompts) |  | no |
-| `/fast` | Toggle Anthropic fast mode (Opus only) |  | no |
-| `/workflow` | Toggle workflow mode (task callable inside code_execution) |  | no |
-| `/exit` | Exit the application |  | no |
-| `/reload` | Reload plugins and config |  | no |
+| Command | Description | Arguments | Frontends |
+|---------|-------------|-----------|------------|
+| `/tasks` | Browse and search tasks |  | TUI only |
+| `/compact` | Summarize and compact conversation history |  | all |
+| `/new` | Start a new session |  | TUI only |
+| `/clear` | Alias for `/new` |  | TUI only |
+| `/help` | Show keybindings |  | TUI only |
+| `/queue` | Remove items from queue |  | TUI only |
+| `/model` | Switch model | <model> | all |
+| `/theme` | Switch color theme | <theme> | TUI only |
+| `/mcp` | Configure MCP servers |  | TUI only |
+| `/login` | Authenticate with an LLM provider |  | TUI only |
+| `/cd` | Change working directory | <path> | all |
+| `/btw` | Ask a quick question (no tools, no history pollution) | <question> | all |
+| `/yolo` | Toggle YOLO mode (skip all permission prompts) |  | all |
+| `/fast` | Toggle Anthropic fast mode (Opus only) |  | all |
+| `/workflow` | Toggle workflow mode (task callable inside code_execution) |  | all |
+| `/exit` | Exit the application |  | TUI only |
+| `/reload` | Reload plugins and config |  | TUI only |
 
 The portable built-ins are `/compact`, `/model`, `/cd`, `/btw`, `/yolo`, `/fast`, and `/workflow`. ACP advertises these built-ins plus custom, MCP, and portable Lua commands. ACP hides `/new` and `/clear`. The ACP client owns session creation through `session/new`. A typed `/new` or `/clear` resolves locally and returns guidance to use `session/new`; it does not invoke model inference or reset model history. Commands that require TUI capabilities are omitted from ACP. Invoking an unavailable command returns an error; to send it as a literal prompt, escape the leading slash (`//help` sends `/help`).
 
@@ -39,19 +39,19 @@ The portable built-ins are `/compact`, `/model`, `/cd`, `/btw`, `/yolo`, `/fast`
 
 Bundled Lua plugins register these commands at startup. Plugin commands have higher collision priority than built-ins, so a bundled plugin can replace a built-in implementation for the targets it supports.
 
-| Command | Description | Arguments | TUI-only |
-|---------|-------------|-----------|----------|
-| `/automode` | Toggle bash auto mode (classifier gates every bash command) |  | no |
-| `/build` | Switch to build mode (full tool access) |  | no |
-| `/memory` | View, edit, and delete memory files |  | yes |
-| `/options` | Browse and change session options |  | yes |
-| `/plan` | Switch to plan mode (analyse and write only the plan file) |  | no |
-| `/rename` | Rename the current session | <title> | yes |
-| `/sessions` | Browse and switch sessions | [query] | yes |
-| `/splash` | Preview and select a splash renderer | [splash] | yes |
-| `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. |  | yes |
-| `/thinking` | Set thinking effort (bare opens a selector) | [effort] | yes |
-| `/usage` | Show provider quota and focused-session token usage |  | yes |
+| Command | Description | Arguments | Frontends |
+|---------|-------------|-----------|------------|
+| `/automode` | Toggle bash auto mode (classifier gates every bash command) |  | all |
+| `/build` | Switch to build mode (full tool access) |  | all |
+| `/memory` | View, edit, and delete memory files |  | TUI only |
+| `/options` | Browse and change session options |  | TUI only |
+| `/plan` | Switch to plan mode (analyse and write only the plan file) |  | all |
+| `/rename` | Rename the current session | <title> | TUI only |
+| `/sessions` | Browse and switch sessions | [query] | TUI only |
+| `/splash` | Preview and select a splash renderer | [splash] | TUI only |
+| `/splash-fps` | Toggle the splash fps overlay: live fps and per-frame render time. |  | TUI only |
+| `/thinking` | Set thinking effort (bare opens a selector) | [effort] | TUI only |
+| `/usage` | Show provider quota and focused-session token usage |  | TUI only |
 
 ## Command arguments
 
