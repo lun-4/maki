@@ -3378,9 +3378,8 @@ fn invalid_typed_copy_input_does_not_execute(input: &str) {
 
 const RUN_COMMAND_NO_ACTION: &str = "run_command did not reach the UI";
 
-/// `/go` asks for `/cd ~/src` and flashes the `ok, err` pair it gets back. The
-/// command line travels untouched, since the UI is the side that parses it, and
-/// a handler reached at depth 0 asks for depth 1 so a chain of aliases keeps
+/// `/go` asks for `/cd ~/src` and flashes the `ok, err` pair it gets back. A
+/// handler reached at depth 0 asks for depth 1 so a chain of aliases keeps
 /// counting toward the cap.
 #[test_case::test_case(Ok(()), "true|nil" ; "dispatched")]
 #[test_case::test_case(Err("unknown command".into()), "nil|unknown command" ; "rejected")]
@@ -3393,7 +3392,7 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
             name = "/go",
             tui_only = false,
             handler = function()
-                local ok, err = maki.api.run_command("/cd ~/src")
+                local ok, err = maki.api.run_command("  //cd ~/src  ")
                 maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
             end,
         })
@@ -3421,6 +3420,127 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
         .recv_timeout(Duration::from_secs(5))
         .expect(RUN_COMMAND_NO_ACTION);
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == expected_flash));
+}
+
+/// `/go` nests `maki.api.run_command("/bogus")` from inside a real command
+/// invocation (dispatched through the registry, so the handler runs with an
+/// invocation context): the nested dispatch rejects the unknown command
+/// without touching the UI.
+#[test]
+fn nested_run_command_strips_extra_leading_slashes() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        maki.api.register_command({
+            name = "/target",
+            tui_only = false,
+            nargs = 1,
+            handler = function(opts)
+                maki.ui.flash("target|" .. opts.args)
+            end,
+        })
+        maki.api.register_command({
+            name = "/go",
+            tui_only = false,
+            handler = function()
+                local ok, err = maki.api.run_command("  //target value  ")
+                maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
+            end,
+        })
+        "#,
+    )
+    .unwrap();
+    let registry = host.command_registry();
+    let target = registry.bind_target(
+        maki_commands::TargetCapabilities::ALL,
+        Arc::new(FakeCommandHost),
+    );
+    let rx = host.ui_action_rx();
+
+    smol::block_on(registry.dispatch_input(&target, "/go".into()));
+
+    let messages: Vec<String> = (0..2)
+        .map(|_| {
+            let action = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("nested run_command did not finish");
+            let maki_lua::UiAction::Flash(message) = action else {
+                panic!("nested run_command emitted an unexpected UI action");
+            };
+            message
+        })
+        .collect();
+    assert!(messages.iter().any(|message| message == "target|value"));
+    assert!(messages.iter().any(|message| message == "true|nil"));
+}
+
+#[test]
+fn nested_run_command_reports_recursion_limit() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        maki.api.register_command({
+            name = "/cycle",
+            tui_only = false,
+            handler = function()
+                local ok, err = maki.api.run_command("/cycle")
+                if not ok then
+                    maki.ui.flash(err)
+                end
+            end,
+        })
+        "#,
+    )
+    .unwrap();
+    let registry = host.command_registry();
+    let target = registry.bind_target(
+        maki_commands::TargetCapabilities::ALL,
+        Arc::new(FakeCommandHost),
+    );
+    let rx = host.ui_action_rx();
+
+    smol::block_on(registry.dispatch_input(&target, "/cycle".into()));
+
+    let action = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("recursive run_command did not report an error");
+    assert!(
+        matches!(action, maki_lua::UiAction::Flash(msg) if msg == "maximum command recursion depth exceeded")
+    );
+}
+
+#[test]
+fn nested_run_command_rejects_unknown_command() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        maki.api.register_command({
+            name = "/go",
+            tui_only = false,
+            handler = function()
+                local ok, err = maki.api.run_command("/bogus")
+                maki.ui.flash(tostring(ok) .. "|" .. tostring(err))
+            end,
+        })
+        "#,
+    )
+    .unwrap();
+    let registry = host.command_registry();
+    let target = registry.bind_target(
+        maki_commands::TargetCapabilities::ALL,
+        Arc::new(FakeCommandHost),
+    );
+    let rx = host.ui_action_rx();
+
+    smol::block_on(registry.dispatch_input(&target, "/go".into()));
+
+    let action = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("nested run_command did not flash its result");
+    assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == "nil|unknown command"));
 }
 #[test_case::test_case(
     r#"maki.api.register_command({ name = "", handler = function() end })"#,
@@ -5261,6 +5381,32 @@ fn test_splash_slot_default() {
 }
 
 #[test]
+fn test_splash_default_degrades_without_theme_colors() {
+    const LOGO: &str = "makima";
+    let (handle, _guard) = maki_lua::test_support::spawn_host_for_tests(&["splashes_default"]);
+    let frame = wait_for_splash_text(&handle, LOGO);
+    // The test host never seeds theme colors, so every semantic name is nil
+    // and the frame degrades to the host foreground instead of baking a
+    // fallback palette.
+    let rgba_rows: Vec<_> = frame
+        .rows
+        .iter()
+        .filter(|r| matches!(r.style, maki_lua::SplashStyle::Rgba { .. }))
+        .collect();
+    assert!(!rgba_rows.is_empty(), "frame has explicit-style rows");
+    assert!(
+        rgba_rows
+            .iter()
+            .all(|r| { matches!(r.style, maki_lua::SplashStyle::Rgba { fg: None, .. }) }),
+        "every explicit-style row degrades to the host foreground: {frame:?}"
+    );
+    assert!(
+        rgba_rows.iter().any(|r| r.glyphs.contains(LOGO)),
+        "logo row carries an explicit style"
+    );
+}
+
+#[test]
 fn test_splash_slot_override() {
     let (handle, guard) = maki_lua::test_support::spawn_host_for_tests(&["splashes_default"]);
     guard
@@ -5346,6 +5492,36 @@ maki.api.register_tool({
     handle.set_version("1.2.3", Some("9.9.9"));
     let out = exec_tool(&reg, "vprobe", json!({})).unwrap();
     assert_eq!(out, "1.2.3|9.9.9|true", "set store: {out}");
+}
+
+#[test]
+fn test_color_dim_is_identity_without_theme_colors() {
+    const PROBE_COLOR: &str = "#8899aa";
+    const DIM_FACTOR: &str = "0.5";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let source = format!(
+        r#"
+maki.api.register_tool({{
+  name = "dimprobe",
+  description = "probe maki.color.dim",
+  schema = {{ type = "object", properties = {{}}, additionalProperties = false }},
+  handler = function()
+    return require("maki.color").dim("{color}", {factor})
+  end,
+}})
+"#,
+        color = PROBE_COLOR,
+        factor = DIM_FACTOR,
+    );
+    host.load_source("dimprobe", &source).unwrap();
+    let out = exec_tool(&reg, "dimprobe", json!({})).unwrap();
+    // Unseeded host: the background name is nil, so dim degrades to identity
+    // instead of lerping toward a baked-in black.
+    assert_eq!(
+        out, PROBE_COLOR,
+        "dim without theme colors must be identity, got {out}"
+    );
 }
 
 const HOST_REPLY_TIMEOUT: Duration = Duration::from_secs(5);

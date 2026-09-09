@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use crate::clipboard::CopyResult;
 use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 
 use crate::repaint::Dirty;
 
@@ -12,8 +12,149 @@ use super::App;
 pub(super) const EDGE_SCROLL_LINES: i32 = 1;
 pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
 
+pub(super) const MIDDLE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
+const MIDDLE_SCROLL_DEAD_ZONE: i32 = 1;
+const MIDDLE_SCROLL_RATE: f64 = 2.0;
+const MIDDLE_SCROLL_EXPONENT: f64 = 1.5;
+const MIDDLE_SCROLL_MAX_RATE: f64 = 120.0;
+const MIDDLE_SCROLL_MAX_ELAPSED: Duration = Duration::from_millis(100);
+pub(super) const MIDDLE_SCROLL_ANCHOR: &str = "+";
+
+pub(super) struct MiddleScroll {
+    pub(super) origin: Position,
+    chat: usize,
+    chat_id: Option<String>,
+    area: Rect,
+    displacement: i32,
+    last_update: Instant,
+    fractional_lines: f64,
+}
+
+impl MiddleScroll {
+    fn rate(&self) -> f64 {
+        let distance = (self.displacement.abs() - MIDDLE_SCROLL_DEAD_ZONE).max(0);
+        -(self.displacement.signum() as f64)
+            * ((distance as f64).powf(MIDDLE_SCROLL_EXPONENT) * MIDDLE_SCROLL_RATE)
+                .min(MIDDLE_SCROLL_MAX_RATE)
+    }
+
+    pub(super) fn move_to(&mut self, row: u16, now: Instant) {
+        let old_rate = self.rate();
+        self.displacement = i32::from(row) - i32::from(self.origin.y);
+        if self.rate().signum() != old_rate.signum() || self.rate() == 0.0 {
+            self.fractional_lines = 0.0;
+        }
+        self.last_update = now;
+    }
+
+    pub(super) fn delta(&mut self, now: Instant) -> i32 {
+        let elapsed = now
+            .saturating_duration_since(self.last_update)
+            .min(MIDDLE_SCROLL_MAX_ELAPSED);
+        self.last_update = now;
+        self.fractional_lines += self.rate() * elapsed.as_secs_f64();
+        let delta = self.fractional_lines.trunc() as i32;
+        self.fractional_lines -= f64::from(delta);
+        delta
+    }
+}
+
 impl App {
+    pub(crate) fn cancel_middle_scroll(&mut self) -> Dirty {
+        self.middle_scroll.take().is_some().into()
+    }
+
+    fn middle_scroll_obstructed(&self) -> bool {
+        self.any_overlay_open()
+            || self.command_palette.is_active()
+            || self.file_completion.is_active()
+            || self.plan_form_active()
+    }
+
+    pub(super) fn validate_middle_scroll(&mut self) -> Dirty {
+        let invalid = self.middle_scroll.as_ref().is_some_and(|state| {
+            state.chat != self.active_chat
+                || self
+                    .chats
+                    .get(state.chat)
+                    .is_none_or(|chat| chat.subagent_id != state.chat_id)
+                || self.middle_scroll_obstructed()
+                || self.selection_state.is_some()
+                || self
+                    .zones
+                    .find(SelectionZone::Messages)
+                    .is_none_or(|zone| zone.area != state.area)
+                || self
+                    .zone_at(state.origin.y, state.origin.x)
+                    .is_none_or(|zone| zone.zone != SelectionZone::Messages)
+        });
+        if invalid {
+            self.cancel_middle_scroll()
+        } else {
+            Dirty::NO
+        }
+    }
+
+    pub(crate) fn tick_middle_scroll_at(&mut self, now: Instant) -> Dirty {
+        let dirty = self.validate_middle_scroll();
+        let Some(state) = self.middle_scroll.as_mut() else {
+            return dirty;
+        };
+        let delta = state.delta(now);
+        if delta == 0 {
+            return dirty;
+        }
+        let chat = &mut self.chats[state.chat];
+        let before = chat.scroll_top();
+        chat.scroll(delta);
+        let after = chat.scroll_top();
+        if u32::from(before.abs_diff(after)) < delta.unsigned_abs() {
+            state.fractional_lines = 0.0;
+        }
+        dirty | Dirty::from(before != after)
+    }
+
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) {
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Middle) => {
+                if self.middle_scroll.is_some() {
+                    let _ = self.cancel_middle_scroll();
+                } else if !self.middle_scroll_obstructed()
+                    && self.selection_state.is_none()
+                    && let Some(zone) = self.zone_at(event.row, event.column)
+                    && zone.zone == SelectionZone::Messages
+                {
+                    let top = self.chats[self.active_chat].scroll_top();
+                    self.chats[self.active_chat].set_scroll_top(top);
+                    self.middle_scroll = Some(MiddleScroll {
+                        origin: Position::new(event.column, event.row),
+                        chat: self.active_chat,
+                        chat_id: self.chats[self.active_chat].subagent_id.clone(),
+                        area: zone.area,
+                        displacement: 0,
+                        last_update: Instant::now(),
+                        fractional_lines: 0.0,
+                    });
+                }
+                return;
+            }
+            MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Middle) => {
+                let now = Instant::now();
+                let _ = self.tick_middle_scroll_at(now);
+                if let Some(state) = self.middle_scroll.as_mut() {
+                    state.move_to(event.row, now);
+                }
+                return;
+            }
+            MouseEventKind::Down(MouseButton::Left | MouseButton::Right)
+            | MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight => {
+                let _ = self.cancel_middle_scroll();
+            }
+            _ => {}
+        }
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(zone) = self.zone_at(event.row, event.column) {

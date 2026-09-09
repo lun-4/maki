@@ -3,10 +3,11 @@ use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use maki_commands::{
-    ArgumentKind, CommandArguments, CommandRegistry, CompletionCandidate, CompletionInput,
-    CompletionItem, CompletionItemNavigation, CompletionProviders, CompletionResult,
-    CompletionSession, CompletionSnapshot, CompletionSnapshotSink, PositionalArgument, QuoteStyle,
-    RegistrySnapshot, ResolvedCommand, TargetHandle, encode_completion_value, lex_tolerant,
+    ArgumentKind, CommandArguments, CommandId, CommandRegistry, CompletionCandidate,
+    CompletionInput, CompletionItem, CompletionItemNavigation, CompletionProviders,
+    CompletionResult, CompletionSession, CompletionSnapshot, CompletionSnapshotSink,
+    PositionalArgument, QuoteStyle, RegistrySnapshot, ResolvedCommand, SlashClass, TargetHandle,
+    classify_input, encode_completion_value, lex_tolerant,
 };
 use maki_match::{CompletionMatchOptions, completion_match};
 use nucleo::pattern::{CaseMatching, Normalization};
@@ -17,9 +18,11 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
-use crate::{repaint::Dirty, theme};
-
-const TICK_TIMEOUT_MS: u64 = 10;
+use crate::components::coherent_completion::{Publication, Published};
+use crate::{
+    repaint::{Cadence, Dirty},
+    theme,
+};
 /// Note appended to builtin alias rows: `(Alias for /new)`.
 const ALIAS_NOTE: &str = " (Alias for ";
 
@@ -76,6 +79,28 @@ pub struct CommandPalette {
     pending_arguments: Option<PendingArguments>,
     accepted_argument_input: Option<String>,
     dismissed_argument_input: Option<String>,
+    command_publication: Published<CommandRequest, ()>,
+    pending_command: Option<(u64, CommandRequest)>,
+    argument_publication: Published<ArgumentRequest, ()>,
+    latest_argument_context: Option<(String, usize, String)>,
+    command_matching: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CommandRequest {
+    query: String,
+    registry_generation: u64,
+    argument_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ArgumentRequest {
+    command_id: CommandId,
+    invoked_name: Arc<str>,
+    argument_index: usize,
+    query: String,
+    range: (usize, usize),
+    mode: String,
 }
 
 #[derive(Clone)]
@@ -98,8 +123,9 @@ struct PendingArguments {
     rx: flume::Receiver<CompletionResult>,
     snapshots: Option<Arc<std::sync::Mutex<Option<CompletionSnapshot>>>>,
     generation: u64,
-    query: String,
-    range: (usize, usize),
+    key: ArgumentRequest,
+    snapshot_applied: bool,
+    last_highlighted_item: Option<CompletionItem>,
 }
 
 impl CommandPalette {
@@ -146,11 +172,16 @@ impl CommandPalette {
             pending_arguments: None,
             accepted_argument_input: None,
             dismissed_argument_input: None,
+            command_publication: Published::default(),
+            pending_command: None,
+            argument_publication: Published::default(),
+            latest_argument_context: None,
+            command_matching: false,
         }
     }
 
     fn build_nucleo(snapshot: &RegistrySnapshot) -> Nucleo<CommandItem> {
-        let nucleo = Nucleo::new(Config::DEFAULT, Arc::new(|| {}), None, 1);
+        let mut nucleo = Nucleo::new(Config::DEFAULT, Arc::new(|| {}), None, 1);
         let injector = nucleo.injector();
         for (source_order, command) in snapshot.commands().iter().enumerate() {
             injector.push(
@@ -163,6 +194,7 @@ impl CommandPalette {
                 },
             );
         }
+        nucleo.tick(0);
         nucleo
     }
 
@@ -181,7 +213,9 @@ impl CommandPalette {
         }
         match key.code {
             KeyCode::Up => {
-                if !self.argument_items.is_empty() {
+                if self.argument_publication.is_pending() || self.command_publication.is_pending() {
+                    CommandAction::Consumed
+                } else if !self.argument_items.is_empty() {
                     self.argument_selected = if self.argument_selected == 0 {
                         self.argument_items.len() - 1
                     } else {
@@ -195,7 +229,9 @@ impl CommandPalette {
                 }
             }
             KeyCode::Down => {
-                if !self.argument_items.is_empty() {
+                if self.argument_publication.is_pending() || self.command_publication.is_pending() {
+                    CommandAction::Consumed
+                } else if !self.argument_items.is_empty() {
                     self.argument_selected =
                         if self.argument_selected == self.argument_items.len() - 1 {
                             0
@@ -223,6 +259,15 @@ impl CommandPalette {
                 CommandAction::Consumed
             }
             KeyCode::Enter => {
+                if self.command_publication.is_pending() || self.argument_publication.is_pending() {
+                    if self.argument_items.is_empty()
+                        && let Some(command) = self.confirm_exact(input)
+                    {
+                        self.close();
+                        return CommandAction::Execute(command);
+                    }
+                    return CommandAction::Consumed;
+                }
                 if let Some((range, item)) = self
                     .argument_range
                     .zip(self.argument_items.get(self.argument_selected).cloned())
@@ -239,6 +284,18 @@ impl CommandPalette {
                 self.confirm_close(input)
             }
             KeyCode::Tab => {
+                if self.command_publication.is_pending() || self.argument_publication.is_pending() {
+                    if self.argument_range.is_none()
+                        && let Some(command) = self.confirm_command_name(input)
+                    {
+                        let text = format!("{} ", command.command.invoked_name());
+                        return CommandAction::Complete {
+                            cursor: text.len(),
+                            text,
+                        };
+                    }
+                    return CommandAction::Consumed;
+                }
                 if self.typed_argument_owned && self.argument_items.is_empty() {
                     return CommandAction::Consumed;
                 }
@@ -278,7 +335,8 @@ impl CommandPalette {
     pub fn is_active(&self) -> bool {
         self.accepted_argument_input.is_none()
             && self.dismissed_argument_input.is_none()
-            && (!self.filtered.is_empty()
+            && (self.command_publication.is_pending()
+                || !self.filtered.is_empty()
                 || !self.argument_items.is_empty()
                 || self.completion_session.is_some())
     }
@@ -313,6 +371,9 @@ impl CommandPalette {
     }
 
     fn argument_command(&self, input: &str) -> Option<(ResolvedCommand, bool)> {
+        let SlashClass::Command(input) = classify_input(input) else {
+            return None;
+        };
         let command_name = input
             .strip_prefix('/')?
             .split_whitespace()
@@ -358,7 +419,7 @@ impl CommandPalette {
 
     #[cfg(test)]
     pub(crate) fn has_argument_selectable(&self) -> bool {
-        !self.argument_items.is_empty()
+        !self.argument_publication.is_pending() && !self.argument_items.is_empty()
     }
 
     #[cfg(test)]
@@ -384,6 +445,28 @@ impl CommandPalette {
         range: (usize, usize),
         items: Vec<maki_lua::CommandArgumentItem>,
     ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while self.command_publication.is_pending() {
+            let _ = self.tick_commands();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "command matcher did not settle"
+            );
+            std::thread::yield_now();
+        }
+        self.argument_publication.commit_sync(
+            ArgumentRequest {
+                command_id: self.filtered[self.command_selected].command.command_id(),
+                invoked_name: Arc::from(
+                    self.filtered[self.command_selected].command.invoked_name(),
+                ),
+                argument_index: 0,
+                query: String::new(),
+                range,
+                mode: String::new(),
+            },
+            (),
+        );
         self.argument_range = Some(range);
         self.typed_argument_owned = true;
         self.argument_items = items
@@ -418,8 +501,12 @@ impl CommandPalette {
     }
 
     pub fn sync_arguments(&mut self, input: &str, cursor: usize, mode: &str) -> bool {
+        self.latest_argument_context = Some((input.to_owned(), cursor, mode.to_owned()));
         self.argument_generation = self.argument_generation.wrapping_add(1);
-        self.reset_argument_state();
+        if self.command_publication.is_pending() {
+            self.cancel_arguments();
+            return false;
+        }
         if self.accepted_argument_input.as_deref() == Some(input)
             || self.dismissed_argument_input.as_deref() == Some(input)
         {
@@ -455,13 +542,22 @@ impl CommandPalette {
                 })
             })
             .flatten();
+        let request_key = ArgumentRequest {
+            command_id: command.command_id(),
+            invoked_name: Arc::from(command.invoked_name()),
+            argument_index: index,
+            query: argument.clone(),
+            range: (start, end),
+            mode: mode.to_owned(),
+        };
+        self.argument_generation = self.argument_publication.begin(request_key.clone());
         let same_session = self.completion_session.as_ref().is_some_and(|session| {
             session.command().command_id() == command.command_id()
                 && session.command().invoked_name() == command.invoked_name()
         });
         if !same_session {
-            self.cancel_arguments();
-            self.typed_argument_owned = typed;
+            self.notify_lifecycle(PaletteLifecycle::Cancel);
+            self.argument_revision = 0;
             self.completion_session = self
                 .registry
                 .open_completion_with_defaults(
@@ -473,7 +569,9 @@ impl CommandPalette {
                 .ok();
         }
         let Some(session) = self.completion_session.clone() else {
+            self.argument_publication.clear();
             self.argument_items.clear();
+            self.argument_range = None;
             return abandoned;
         };
         let (tx, rx) = flume::bounded(1);
@@ -501,55 +599,83 @@ impl CommandPalette {
             rx,
             snapshots: Some(latest_snapshot),
             generation: self.argument_generation,
-            query: argument,
-            range: (start, end),
+            key: request_key,
+            snapshot_applied: false,
+            last_highlighted_item: None,
         });
         abandoned
     }
 
-    pub fn poll_arguments(&mut self) -> Dirty {
-        let Some(pending) = self.pending_arguments.take() else {
+    fn poll_argument_response(&mut self) -> Dirty {
+        let Some(mut pending) = self.pending_arguments.take() else {
             return Dirty::NO;
         };
         if pending.generation != self.argument_generation {
-            self.cancel_arguments();
-            return Dirty::YES;
+            return Dirty::NO;
         }
         let mut dirty = Dirty::NO;
-        // The sink stores only the newest revision; apply at most the latest
-        // snapshot per poll instead of draining an unbounded queue.
         if let Some(latest) = pending.snapshots.as_deref().and_then(|slab| {
             slab.lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .take()
         }) && latest.revision >= self.argument_revision
         {
-            dirty |= self.apply_completion_items(
-                pending.query.as_str(),
-                pending.range,
-                latest.candidates,
-            );
-            self.argument_revision = latest.revision;
+            let publication = if self.argument_publication.is_pending() {
+                self.argument_publication
+                    .commit(pending.generation, pending.key.clone(), ())
+            } else {
+                self.argument_publication.stream(pending.key.clone(), ())
+            };
+            if publication != Publication::Wait {
+                dirty |= self.apply_completion_items(
+                    &pending.key.query,
+                    pending.key.range,
+                    latest.candidates,
+                    true,
+                    &mut pending.last_highlighted_item,
+                );
+                self.argument_revision = latest.revision;
+                pending.snapshot_applied = true;
+            }
         }
-        match pending.rx.try_recv() {
-            Ok(CompletionResult::Items(items)) => {
-                if self.argument_items.is_empty() {
-                    self.cancel_arguments();
-                    return Dirty::YES;
-                }
-                dirty |= self.apply_completion_items(pending.query.as_str(), pending.range, items);
-                dirty
+        let result = match pending.rx.try_recv() {
+            Ok(result) => result,
+            Err(flume::TryRecvError::Disconnected) => {
+                return if dirty == Dirty::YES {
+                    dirty
+                } else {
+                    self.finish_empty_arguments(pending);
+                    Dirty::YES
+                };
             }
-            Ok(
-                CompletionResult::Stale | CompletionResult::Cancelled | CompletionResult::Failed,
-            ) => {
-                self.cancel_arguments();
-                Dirty::YES
-            }
-            Err(flume::TryRecvError::Disconnected) => dirty,
             Err(flume::TryRecvError::Empty) => {
                 self.pending_arguments = Some(pending);
+                return dirty;
+            }
+        };
+        match result {
+            CompletionResult::Items(items) => {
+                let publication = if self.argument_publication.is_pending() {
+                    self.argument_publication
+                        .commit(pending.generation, pending.key.clone(), ())
+                } else {
+                    self.argument_publication.stream(pending.key.clone(), ())
+                };
+                if publication == Publication::Wait {
+                    return dirty;
+                }
+                dirty |= self.apply_completion_items(
+                    &pending.key.query,
+                    pending.key.range,
+                    items,
+                    !pending.snapshot_applied,
+                    &mut pending.last_highlighted_item,
+                );
                 dirty
+            }
+            CompletionResult::Stale | CompletionResult::Cancelled | CompletionResult::Failed => {
+                self.finish_empty_arguments(pending);
+                Dirty::YES
             }
         }
     }
@@ -559,10 +685,10 @@ impl CommandPalette {
         query: &str,
         range: (usize, usize),
         items: Vec<CompletionCandidate>,
+        highlight: bool,
+        last_highlighted_item: &mut Option<CompletionItem>,
     ) -> Dirty {
-        self.argument_items.clear();
-        self.argument_selected = 0;
-        self.argument_scroll_offset = 0;
+        let mut matches = Vec::new();
         for (order, candidate) in items.into_iter().enumerate() {
             let item = candidate.item().clone();
             let Some(matched) = completion_match(
@@ -575,7 +701,7 @@ impl CommandPalette {
             ) else {
                 continue;
             };
-            self.argument_items.push(ArgumentMatch {
+            matches.push(ArgumentMatch {
                 candidate: Some(candidate),
                 item,
                 indices: matched.indices,
@@ -583,7 +709,7 @@ impl CommandPalette {
                 order,
             });
         }
-        self.argument_items.sort_by(|a, b| {
+        matches.sort_by(|a, b| {
             maki_match::compare_completion_matches(
                 &maki_match::CompletionMatch {
                     indices: a.indices.clone(),
@@ -601,8 +727,16 @@ impl CommandPalette {
                 &b.item.label,
             )
         });
-        self.argument_range = Some(range);
-        if !self.argument_items.is_empty() {
+        self.argument_items = matches;
+        self.argument_range = (!self.argument_items.is_empty()).then_some(range);
+        self.argument_selected = 0;
+        self.argument_scroll_offset = 0;
+        let selected_item = self.argument_items.first().map(|item| item.item.clone());
+        if selected_item.is_none() {
+            *last_highlighted_item = None;
+            self.notify_lifecycle(PaletteLifecycle::Cancel);
+        } else if highlight && selected_item.as_ref() != last_highlighted_item.as_ref() {
+            *last_highlighted_item = selected_item;
             self.notify_lifecycle(PaletteLifecycle::Highlight);
         }
         Dirty::YES
@@ -676,6 +810,18 @@ impl CommandPalette {
         self.argument_kind.clone()
     }
 
+    fn finish_empty_arguments(&mut self, pending: PendingArguments) {
+        if self
+            .argument_publication
+            .commit(pending.generation, pending.key, ())
+            == Publication::Commit
+        {
+            self.argument_items.clear();
+            self.argument_range = None;
+            self.notify_lifecycle(PaletteLifecycle::Cancel);
+        }
+    }
+
     fn notify_lifecycle(&mut self, event: PaletteLifecycle) -> bool {
         let Some(session) = &self.completion_session else {
             return true;
@@ -715,6 +861,7 @@ impl CommandPalette {
         self.argument_kind = None;
         self.typed_argument_owned = false;
         self.pending_arguments = None;
+        self.argument_publication.clear();
         self.argument_selected = 0;
         self.argument_scroll_offset = 0;
     }
@@ -740,24 +887,32 @@ impl CommandPalette {
             self.close();
             return;
         };
-        if snapshot.generation() != self.snapshot.generation() {
+        let registry_changed = snapshot.generation() != self.snapshot.generation();
+        if registry_changed {
             self.snapshot = snapshot;
             self.nucleo = Self::build_nucleo(&self.snapshot);
         }
-        let Some(stripped) = input.strip_prefix('/') else {
+        let SlashClass::Command(trimmed) = classify_input(input) else {
             self.filtered.clear();
             self.current_arg_count = 0;
+            self.pending_command = None;
+            self.command_publication.clear();
             return;
         };
+        let stripped = &trimmed[1..]; // trimmed starts with exactly one '/'
 
         let parts: Vec<&str> = stripped.split_whitespace().collect();
         let cmd_word = parts.first().copied().unwrap_or(stripped);
         let trailing_space = stripped.ends_with(char::is_whitespace);
 
-        self.current_arg_count = if trailing_space {
-            parts.len()
-        } else {
-            parts.len().saturating_sub(1)
+        let request = CommandRequest {
+            query: cmd_word.to_owned(),
+            registry_generation: self.snapshot.generation(),
+            argument_count: if trailing_space {
+                parts.len()
+            } else {
+                parts.len().saturating_sub(1)
+            },
         };
         if let Some(command) = self
             .registry
@@ -769,6 +924,35 @@ impl CommandPalette {
             self.current_arg_count =
                 tokens.len() + usize::from(command_args(input).ends_with(char::is_whitespace));
         }
+        if !registry_changed
+            && self.command_publication.can_accept()
+            && self.command_query == request.query
+            && request.registry_generation == self.snapshot.generation()
+        {
+            if self.current_arg_count != request.argument_count {
+                self.current_arg_count = request.argument_count;
+                self.command_publication.commit_sync(request.clone(), ());
+                self.refresh_matches(&request.query);
+            }
+            return;
+        }
+
+        let pending_same_query = self
+            .pending_command
+            .as_ref()
+            .is_some_and(|(_, pending)| pending.query == request.query);
+        if pending_same_query
+            && self
+                .registry
+                .resolve_for(&self.target, &format!("/{cmd_word}"))
+                .is_ok()
+        {
+            self.pending_command = None;
+            self.command_publication.commit_sync(request.clone(), ());
+            self.current_arg_count = request.argument_count;
+            self.refresh_matches(&request.query);
+            return;
+        }
 
         self.nucleo.pattern.reparse(
             0,
@@ -777,20 +961,69 @@ impl CommandPalette {
             Normalization::Smart,
             false,
         );
+        self.notify_lifecycle(PaletteLifecycle::Cancel);
+        self.pending_arguments = None;
+        self.argument_publication.cancel();
 
-        self.tick(cmd_word);
+        let generation = self.command_publication.begin(request.clone());
+        self.pending_command = Some((generation, request));
+        let _ = self.tick_commands();
     }
 
-    fn tick(&mut self, query: &str) {
-        loop {
-            let status = self.nucleo.tick(TICK_TIMEOUT_MS);
-            if status.changed {
-                self.refresh_matches(query);
+    pub fn tick(&mut self) -> Dirty {
+        self.tick_commands() | self.poll_argument_response()
+    }
+
+    #[cfg(test)]
+    pub fn poll_arguments(&mut self) -> Dirty {
+        self.tick()
+    }
+
+    pub fn cadence(&self) -> Cadence {
+        Cadence::any([
+            self.command_publication.cadence(),
+            self.argument_publication.cadence(),
+            Cadence::when(self.command_matching, Cadence::PENDING),
+        ])
+    }
+
+    fn tick_commands(&mut self) -> Dirty {
+        let status = self.nucleo.tick(0);
+        self.command_matching = status.running;
+        let Some((generation, request)) = self.pending_command.clone() else {
+            if status.changed
+                && self.command_publication.can_accept()
+                && !self.command_query.is_empty()
+            {
+                let query = self.command_query.clone();
+                self.refresh_matches(&query);
+                return Dirty::YES;
             }
-            if !status.running {
-                break;
-            }
+            return Dirty::NO;
+        };
+        if !status.changed
+            || self.nucleo.snapshot().pattern().column_pattern(0).atoms
+                != self.nucleo.pattern.column_pattern(0).atoms
+        {
+            return Dirty::NO;
         }
+        if self
+            .command_publication
+            .commit(generation, request.clone(), ())
+            != Publication::Commit
+        {
+            return Dirty::NO;
+        }
+        self.pending_command = None;
+        self.current_arg_count = request.argument_count;
+        self.refresh_matches(&request.query);
+        self.command_query = request.query.clone();
+        if let Some((input, cursor, mode)) = self.latest_argument_context.clone() {
+            let _ = self.sync_arguments(&input, cursor, &mode);
+        } else {
+            self.cancel_arguments();
+        }
+        Dirty::YES
     }
 
     fn refresh_matches(&mut self, query: &str) {
@@ -868,6 +1101,10 @@ impl CommandPalette {
         self.pending_arguments = None;
         self.accepted_argument_input = None;
         self.current_arg_count = 0;
+        self.pending_command = None;
+        self.command_publication.clear();
+        self.latest_argument_context = None;
+        self.command_matching = false;
     }
 
     pub fn move_up(&mut self) {
@@ -879,6 +1116,7 @@ impl CommandPalette {
         } else {
             self.command_selected - 1
         };
+        self.resync_selected_arguments();
     }
 
     pub fn move_down(&mut self) {
@@ -890,6 +1128,16 @@ impl CommandPalette {
         } else {
             self.command_selected + 1
         };
+        self.resync_selected_arguments();
+    }
+
+    fn resync_selected_arguments(&mut self) {
+        if !self.command_publication.can_accept() {
+            return;
+        }
+        if let Some((input, cursor, mode)) = self.latest_argument_context.clone() {
+            let _ = self.sync_arguments(&input, cursor, &mode);
+        }
     }
 
     fn item_has_args(&self, item: &Match) -> bool {
@@ -933,9 +1181,36 @@ impl CommandPalette {
     }
 
     pub fn confirm(&self, input: &str) -> Option<ConfirmedCommand> {
+        if !self.command_publication.can_accept() || self.argument_publication.is_pending() {
+            return None;
+        }
         let (command, _) = self.argument_command(input)?;
         let args = command_args(input).trim().to_owned();
         Some(ConfirmedCommand { command, args })
+    }
+
+    fn confirm_exact(&self, input: &str) -> Option<ConfirmedCommand> {
+        let resolved = self.registry.resolve_input_for(&self.target, input).ok()?;
+        Some(ConfirmedCommand {
+            command: resolved.command,
+            args: resolved.arguments.trim().to_owned(),
+        })
+    }
+
+    fn confirm_command_name(&self, input: &str) -> Option<ConfirmedCommand> {
+        let SlashClass::Command(input) = classify_input(input) else {
+            return None;
+        };
+        let name_end = input.find(char::is_whitespace).unwrap_or(input.len());
+        if name_end != input.len() {
+            return None;
+        }
+        let name = &input[..name_end];
+        let command = self.registry.resolve_for(&self.target, name).ok()?;
+        Some(ConfirmedCommand {
+            command,
+            args: String::new(),
+        })
     }
 
     /// Confirm the input as a command and close the palette; consume the key
@@ -1174,7 +1449,10 @@ fn argument_visible_rows(
 }
 
 fn command_args(input: &str) -> &str {
-    let input = input.strip_prefix('/').unwrap_or("");
+    let SlashClass::Command(input) = classify_input(input) else {
+        return "";
+    };
+    let input = &input[1..];
     input
         .char_indices()
         .find(|(_, ch)| ch.is_whitespace())
@@ -1242,26 +1520,31 @@ fn typed_argument_at_cursor(
 }
 
 fn argument_at_cursor(input: &str, cursor: usize) -> Option<(usize, usize, String, usize)> {
-    let slash = input.strip_prefix('/')?;
+    let SlashClass::Command(command_input) = classify_input(input) else {
+        return None;
+    };
+    let offset = input.len() - command_input.len();
+    let cursor = cursor.checked_sub(offset)?;
+    let slash = &command_input[1..];
     let command_end = slash
         .char_indices()
         .find(|(_, ch)| ch.is_whitespace())
         .map(|(index, ch)| 1 + index + ch.len_utf8())?;
-    if cursor < command_end || !input.is_char_boundary(cursor) {
+    if cursor < command_end || !command_input.is_char_boundary(cursor) {
         return None;
     }
-    let start = input[..cursor]
+    let start = command_input[..cursor]
         .char_indices()
         .rev()
         .find(|(_, ch)| ch.is_whitespace())
         .map_or(command_end, |(index, ch)| index + ch.len_utf8());
-    let end = input[cursor..]
+    let end = command_input[cursor..]
         .char_indices()
         .find(|(_, ch)| ch.is_whitespace())
-        .map_or(input.len(), |(index, _)| cursor + index);
-    let arg = input[start..end].to_string();
-    let index = input[command_end..start].split_whitespace().count();
-    Some((start, end, arg, index))
+        .map_or(command_input.len(), |(index, _)| cursor + index);
+    let arg = command_input[start..end].to_string();
+    let index = command_input[command_end..start].split_whitespace().count();
+    Some((offset + start, offset + end, arg, index))
 }
 
 #[cfg(test)]
@@ -1280,10 +1563,12 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
+    use test_case::test_case;
 
     use super::{
-        ArgumentMatch, CaseMatching, CommandPalette, CompletionMatchOptions, Normalization,
-        argument_at_cursor, argument_visible_rows, command_args, completion_match,
+        ArgumentMatch, CaseMatching, CommandAction, CommandPalette, CommandRequest,
+        CompletionMatchOptions, Normalization, argument_at_cursor, argument_visible_rows,
+        command_args, completion_match,
     };
 
     struct Noop;
@@ -1341,6 +1626,18 @@ mod tests {
             _request: maki_commands::HostRequest,
         ) -> CommandFuture<Result<HostResponse, CommandError>> {
             Box::pin(async { Ok(HostResponse::Completed) })
+        }
+    }
+
+    fn settle(palette: &mut CommandPalette) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while palette.command_publication.is_pending() {
+            let _ = palette.tick();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "command matcher did not settle"
+            );
+            std::thread::yield_now();
         }
     }
 
@@ -1428,9 +1725,91 @@ mod tests {
         let mut palette = CommandPalette::new(registry, target);
 
         palette.sync("/");
+        settle(&mut palette);
 
         assert_eq!(palette.filtered.len(), 1);
         assert_eq!(palette.filtered[0].command.invoked_name(), "/dynamic");
+    }
+
+    #[test]
+    fn escaped_input_never_matches_commands() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        producer
+            .replace(vec![registration("/model", "Switch model")])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
+        let mut palette = CommandPalette::new(registry, target);
+
+        palette.sync("/model");
+        settle(&mut palette);
+        assert!(palette.is_active());
+
+        palette.sync("//model");
+        assert!(!palette.is_active());
+        assert!(palette.filtered.is_empty());
+    }
+
+    #[test_case(KeyCode::Enter ; "enter")]
+    #[test_case(KeyCode::Tab ; "tab")]
+    fn pending_command_without_published_rows_consumes_submission(key_code: KeyCode) {
+        let registry = CommandRegistry::new();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
+        let mut palette = CommandPalette::new(registry, target);
+        let request = CommandRequest {
+            query: "model".into(),
+            registry_generation: palette.snapshot.generation(),
+            argument_count: 0,
+        };
+        let generation = palette.command_publication.begin(request.clone());
+        palette.pending_command = Some((generation, request));
+
+        assert!(matches!(
+            palette.handle_key(KeyEvent::new(key_code, KeyModifiers::NONE), "/model"),
+            CommandAction::Consumed
+        ));
+    }
+
+    #[test_case(true ; "dismissed")]
+    #[test_case(false ; "leading_slash_removed")]
+    fn late_matcher_refresh_does_not_reopen_cleared_palette(close: bool) {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        producer
+            .replace(vec![registration("/model", "Switch model")])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
+        let mut palette = CommandPalette::new(registry, target);
+
+        palette.sync("/model");
+        settle(&mut palette);
+        assert!(palette.is_active());
+        palette
+            .nucleo
+            .pattern
+            .reparse(0, "mod", CaseMatching::Ignore, Normalization::Smart, false);
+        palette.command_matching = true;
+        if close {
+            palette.close();
+        } else {
+            palette.sync("model");
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while palette.command_matching
+            || palette.nucleo.snapshot().pattern().column_pattern(0).atoms
+                != palette.nucleo.pattern.column_pattern(0).atoms
+        {
+            let _ = palette.tick();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "command matcher did not settle"
+            );
+            std::thread::yield_now();
+        }
+
+        assert!(!palette.is_active());
+        assert!(palette.filtered.is_empty());
     }
 
     #[test]
@@ -1442,8 +1821,9 @@ mod tests {
             .unwrap();
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
         let mut palette = CommandPalette::new(registry, target);
-        palette.sync("/dynamic arg");
-        let confirmed = palette.confirm("/dynamic arg").unwrap();
+        palette.sync("  /dynamic arg");
+        settle(&mut palette);
+        let confirmed = palette.confirm("  /dynamic arg").unwrap();
 
         producer
             .replace(vec![registration("/dynamic", "Second")])
@@ -1451,6 +1831,85 @@ mod tests {
 
         assert_eq!(confirmed.command.spec().docs.summary.as_ref(), "First");
         assert_eq!(confirmed.args, "arg");
+    }
+
+    #[test]
+    fn registry_refresh_replaces_same_query_projection() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        producer
+            .replace(vec![registration("/dynamic", "First")])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
+        let mut palette = CommandPalette::new(registry, target);
+        palette.sync("/dynamic");
+        settle(&mut palette);
+        assert_eq!(
+            palette.filtered[0].command.spec().docs.summary.as_ref(),
+            "First"
+        );
+
+        producer
+            .replace(vec![registration("/dynamic", "Second")])
+            .unwrap();
+        palette.sync("/dynamic");
+        settle(&mut palette);
+
+        assert_eq!(palette.filtered.len(), 1);
+        assert_eq!(
+            palette.filtered[0].command.spec().docs.summary.as_ref(),
+            "Second"
+        );
+        assert_eq!(
+            palette
+                .confirm("/dynamic")
+                .unwrap()
+                .command
+                .spec()
+                .docs
+                .summary
+                .as_ref(),
+            "Second"
+        );
+    }
+
+    #[test]
+    fn settled_command_without_argument_context_clears_stale_rows() {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        producer
+            .replace(vec![
+                registration("/deploy", "Deploy"),
+                registration("/plain", "Plain"),
+            ])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
+        let mut palette = CommandPalette::new(registry, target);
+
+        palette.sync("/deploy a");
+        settle(&mut palette);
+        palette.set_argument_completion(
+            (8, 9),
+            maki_lua::CommandArgumentItem {
+                label: "old-result".into(),
+                insertion: "old-result".into(),
+                description: None,
+            },
+        );
+        assert!(!palette.argument_items.is_empty());
+
+        palette.sync("/plain value");
+        settle(&mut palette);
+
+        assert!(palette.argument_items.is_empty());
+        assert!(palette.argument_range.is_none());
+        assert!(matches!(
+            palette.handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                "/plain value"
+            ),
+            CommandAction::Execute(confirmed) if confirmed.command.invoked_name() == "/plain"
+        ));
     }
 
     #[test]
@@ -1467,6 +1926,7 @@ mod tests {
         let mut palette = CommandPalette::new(registry, target);
 
         palette.sync("/mo");
+        settle(&mut palette);
 
         let names: Vec<&str> = palette
             .filtered
@@ -1549,6 +2009,7 @@ mod tests {
         let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
         let mut palette = CommandPalette::new(registry, target);
         palette.sync("/");
+        settle(&mut palette);
 
         palette.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), "/");
         assert_eq!(palette.command_selected, 1);
@@ -1581,6 +2042,17 @@ mod tests {
         assert_eq!(command_args(input), "alpha\u{3000}beta");
         assert_eq!(
             argument_at_cursor(input, input.find("alpha").unwrap() + "alpha".len()),
+            Some((8, 13, "alpha".into(), 0))
+        );
+    }
+
+    #[test]
+    fn argument_parser_uses_trimmed_command_slice() {
+        let input = "  /test alpha";
+
+        assert_eq!(command_args(input), "alpha");
+        assert_eq!(
+            argument_at_cursor(input, input.len()),
             Some((8, 13, "alpha".into(), 0))
         );
     }

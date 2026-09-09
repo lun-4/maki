@@ -19,8 +19,7 @@ pub enum SplashStyle {
     Field,
     Hex(u8, u8, u8),
     Rgba {
-        fg: (u8, u8, u8),
-        bg: (u8, u8, u8),
+        fg: Option<(u8, u8, u8)>,
         bold: bool,
     },
 }
@@ -116,21 +115,21 @@ fn parse_style(value: Value) -> LuaResult<SplashStyle> {
                 .ok_or_else(|| mlua::Error::runtime(format!("unknown splash style '{s}'")))
         }
         Value::Table(t) => {
-            let fg = t
-                .get::<Option<String>>("fg")?
-                .ok_or_else(|| mlua::Error::runtime("splash style table missing fg"))?;
-            let bg = t
-                .get::<Option<String>>("bg")?
-                .ok_or_else(|| mlua::Error::runtime("splash style table missing bg"))?;
             let bold: bool = t.get::<bool>("bold").unwrap_or(false);
-            let fg = parse_hex(&fg)
-                .ok_or_else(|| mlua::Error::runtime(format!("bad splash fg color '{fg}'")))?;
-            let bg = parse_hex(&bg)
-                .ok_or_else(|| mlua::Error::runtime(format!("bad splash bg color '{bg}'")))?;
-            Ok(SplashStyle::Rgba { fg, bg, bold })
+            // `fg` is optional: an absent foreground degrades to the host
+            // theme's foreground. A stale `bg` key is ignored (the host
+            // always paints its own background).
+            let fg =
+                match t.get::<Option<String>>("fg")? {
+                    Some(fg) => Some(parse_hex(&fg).ok_or_else(|| {
+                        mlua::Error::runtime(format!("bad splash fg color '{fg}'"))
+                    })?),
+                    None => None,
+                };
+            Ok(SplashStyle::Rgba { fg, bold })
         }
         _ => Err(mlua::Error::runtime(
-            "splash segment style must be a string or a {fg,bg,bold} table",
+            "splash segment style must be a string or a {fg,bold} table",
         )),
     }
 }
@@ -241,3 +240,71 @@ pub(crate) const version__doc: FnDoc = FnDoc {
     example: "local v = maki.version()\nif v.update_available then\n  print(\"run makima update to get v\" .. v.latest)\nend",
     guard: None,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BAD_FG_MSG: &str = "bad splash fg color 'red'";
+    const MISSING_STYLE_MSG: &str = "splash segment missing style";
+
+    fn style_from_lua(source: &str) -> LuaResult<SplashStyle> {
+        let lua = Lua::new();
+        let value: Value = lua.load(source).eval()?;
+        parse_style(value)
+    }
+
+    fn segment_from_lua(source: &str) -> LuaResult<SplashRow> {
+        let lua = Lua::new();
+        let value: Value = lua.load(source).eval()?;
+        parse_segment(value)
+    }
+
+    #[test]
+    fn parse_style_empty_table_degrades_to_host_fg() {
+        let style = style_from_lua("{}").unwrap();
+        assert_eq!(
+            style,
+            SplashStyle::Rgba {
+                fg: None,
+                bold: false
+            }
+        );
+    }
+
+    #[test]
+    fn parse_style_fg_hex_and_bold() {
+        let style = style_from_lua("{ fg = \"#112233\", bold = true }").unwrap();
+        assert_eq!(
+            style,
+            SplashStyle::Rgba {
+                fg: Some((0x11, 0x22, 0x33)),
+                bold: true
+            }
+        );
+    }
+
+    #[test]
+    fn parse_style_ignores_bg_key() {
+        let style = style_from_lua("{ fg = \"#112233\", bg = \"#ff0000\" }").unwrap();
+        assert_eq!(
+            style,
+            SplashStyle::Rgba {
+                fg: Some((0x11, 0x22, 0x33)),
+                bold: false
+            }
+        );
+    }
+
+    #[test]
+    fn parse_style_rejects_bad_fg() {
+        let err = style_from_lua("{ fg = \"red\" }").unwrap_err();
+        assert!(err.to_string().contains(BAD_FG_MSG));
+    }
+
+    #[test]
+    fn parse_segment_missing_style_errors() {
+        let err = segment_from_lua("{ glyphs = \"x\" }").unwrap_err();
+        assert!(err.to_string().contains(MISSING_STYLE_MSG));
+    }
+}

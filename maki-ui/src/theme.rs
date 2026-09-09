@@ -11,7 +11,7 @@ use syntect::highlighting::{
     Color as SynColor, FontStyle, ScopeSelectors, StyleModifier, ThemeItem, ThemeSettings,
 };
 
-const DEFAULT_THEME: &str = "dracula";
+const DEFAULT_THEME: &str = "makima";
 const RESERVED_KEYS: &[&str] = &["palette", "ui", "inherits"];
 
 const HELIX_TO_TEXTMATE: &[(&str, &str)] = &[
@@ -974,15 +974,17 @@ impl Theme {
     }
 
     fn load_or_bundled() -> Self {
-        // Test builds pin the initial palette to the first bundled theme:
-        // deterministic and zero I/O, so no test reads the real state dir.
         #[cfg(not(test))]
         if let Some(name) = default_provider().persisted_name()
             && let Ok(theme) = default_provider().load(&name)
         {
             return theme;
         }
-        Self::from_toml(BUNDLED_THEMES[0].toml).expect("bundled theme must parse")
+        // First-run fallback (always taken in test builds): the default theme,
+        // read from the in-memory catalog, so tests stay deterministic with
+        // zero I/O and never read the real state dir.
+        load_bundled(DEFAULT_THEME)
+            .unwrap_or_else(|e| panic!("default theme must be a bundled theme: {e}"))
     }
 }
 
@@ -1016,6 +1018,8 @@ fn brighten_toward(style: Style, from: Color, to: Color, t: f32) -> Style {
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    const MAKIMA_BG: Color = Color::Rgb(0x12, 0x0c, 0x0c);
 
     fn dracula_toml() -> &'static str {
         BUNDLED_THEMES
@@ -1291,6 +1295,23 @@ orange = "#ffb86c"
                 .load("nonexistent")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn default_theme_is_bundled() {
+        let theme = load_bundled(DEFAULT_THEME).expect("default theme must load");
+        assert_eq!(theme.background, MAKIMA_BG);
+    }
+
+    #[test]
+    fn initial_theme_falls_back_to_default() {
+        assert_eq!(Theme::load_or_bundled().background, MAKIMA_BG);
+    }
+
+    #[test]
+    fn current_theme_name_falls_back_to_default() {
+        let provider = InMemoryThemesProvider::bundled();
+        assert_eq!(provider.current_theme_name(), DEFAULT_THEME);
     }
 
     #[test]

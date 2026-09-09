@@ -100,7 +100,9 @@ local function apply_grep_highlights(hl_tasks, view)
   end
 end
 
-local function build_grep_view(entries, ctx)
+-- {trailer} is whatever followed the entries in the output (the host's
+-- truncation marker), shown as-is so the view ends where the model's did.
+local function build_grep_view(entries, ctx, trailer)
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, grep_view_opts(ctx))
 
@@ -146,6 +148,9 @@ local function build_grep_view(entries, ctx)
     }
   end
 
+  for _, line in ipairs(trailer or {}) do
+    view:append({ { line, "dim" } })
+  end
   view:finish()
 
   apply_grep_highlights(hl_tasks, view)
@@ -157,34 +162,37 @@ local function build_grep_view(entries, ctx)
   return buf
 end
 
+-- Inverse of format_llm_output. Returns the entries and, as a second
+-- value, the non-blank lines after them that are not part of any entry.
 local function parse_llm_output(text)
   local entries = {}
+  local trailer = {}
   local current
   for _, line in ipairs(maki.split(text, "\n")) do
-    local path = line:match("^(%S.+):$")
+    local path = line:match("^(%S.*):$")
     if path then
       current = { path = path, groups = { { lines = {} } } }
       entries[#entries + 1] = current
-    elseif current then
-      if line == "  --" then
-        current.groups[#current.groups + 1] = { lines = {} }
-      else
-        local nr, sep, content = line:match("^%s+(%d+)([:]) (.*)$")
-        if not nr then
-          nr, sep, content = line:match("^%s+(%d+)( ) (.*)$")
-        end
-        if nr then
-          local group = current.groups[#current.groups]
-          group.lines[#group.lines + 1] = {
-            line_nr = tonumber(nr),
-            text = content or "",
-            is_match = sep == ":",
-          }
-        end
+    elseif line == "  --" and current then
+      current.groups[#current.groups + 1] = { lines = {} }
+    else
+      local nr, sep, content = line:match("^%s+(%d+)([:]) (.*)$")
+      if not nr then
+        nr, sep, content = line:match("^%s+(%d+)( ) (.*)$")
+      end
+      if nr and current then
+        local group = current.groups[#current.groups]
+        group.lines[#group.lines + 1] = {
+          line_nr = tonumber(nr),
+          text = content or "",
+          is_match = sep == ":",
+        }
+      elseif line ~= "" then
+        trailer[#trailer + 1] = line
       end
     end
   end
-  return entries
+  return entries, trailer
 end
 
 maki.api.register_prompt_hint({
@@ -234,11 +242,11 @@ maki.api.register_tool({
   end,
 
   restore = function(_input, output, _is_error, ctx)
-    local entries = parse_llm_output(output)
+    local entries, trailer = parse_llm_output(output)
     if #entries == 0 then
       return nil
     end
-    return ToolView.restore(output, grep_view_opts(ctx))
+    return build_grep_view(entries, ctx, trailer)
   end,
 
   handler = function(input, ctx)
@@ -278,9 +286,12 @@ maki.api.register_tool({
     local llm_output = format_llm_output(entries)
     llm_output = maki.text.truncate_file(llm_output, max_lines, max_bytes, nil)
 
+    -- Built from the truncated output rather than `entries`, so the view
+    -- shows exactly what the model got and restore renders the same way.
+    local shown, trailer = parse_llm_output(llm_output)
     return {
       llm_output = llm_output,
-      body = ToolView.restore(llm_output, grep_view_opts(ctx)),
+      body = build_grep_view(shown, ctx, trailer),
       annotation = count_matches(entries),
     }
   end,

@@ -35,7 +35,7 @@ The `style` is one of:
 
 - `"field"` reuse the fixed `" .:+*"` wave-intensity LUT. Use one `"field"` segment per background row; the blitter colors each glyph from the accent palette.
 - `"#rrggbb"` a foreground hex color.
-- `{ fg = "#rrggbb", bg = "#rrggbb", bold = false }` an explicit cell style. Use this for text rows so the opaque background keeps the starfield behind it as `[field lead, text, field tail]`.
+- `{ fg = "#rrggbb", bold = false }` an explicit cell style. `fg` is optional: an omitted foreground renders with the host theme's foreground, and the cell background is always the host's theme background. Use this for text rows so the themed background keeps the starfield behind it as `[field lead, text, field tail]`.
 
 A still splash is never animated: the cadence is `IDLE` after the entry fade, so `splash.render` stops being called. `ui.splash_animation = false` means a fading-in still splash that settles, not a frozen starfield. With it on, the starfield drifts at full frame rate.
 
@@ -157,7 +157,6 @@ This is a complete `init.lua` override. It ignores `prev` because it replaces th
 
 ```lua
 local GLYPHS = "!<>-_\\/[]{}=+*^?#"
-local BG = "#000000"
 
 local state = { cols = {}, last_t = 0 }
 
@@ -207,21 +206,21 @@ local function matrix_frame(w, h, t, fade)
     for x = 1, w do
       if grid[y][x] and (y ~= h - 4) and x ~= (w - #vs) then
         if #buf > 0 then
-          segs[#segs + 1] = { glyphs = table.concat(buf), style = { fg = BG, bg = BG, bold = false } }
+          segs[#segs + 1] = { glyphs = table.concat(buf), style = { bold = false } }
           buf = {}
         end
-        segs[#segs + 1] = { glyphs = grid[y][x].ch, style = { fg = grid[y][x].fg, bg = BG, bold = false } }
+        segs[#segs + 1] = { glyphs = grid[y][x].ch, style = { fg = grid[y][x].fg, bold = false } }
       else
         buf[#buf + 1] = " "
       end
     end
-    segs[#segs + 1] = { glyphs = table.concat(buf), style = { fg = BG, bg = BG, bold = false } }
+    segs[#segs + 1] = { glyphs = table.concat(buf), style = { bold = false } }
     if y == h - 4 then
-      segs[1] = { glyphs = string.rep(" ", math.floor((w - #title) / 2)), style = { fg = BG, bg = BG, bold = false } }
-      segs[2] = { glyphs = title, style = { fg = "#00ff41", bg = BG, bold = true } }
+      segs[1] = { glyphs = string.rep(" ", math.floor((w - #title) / 2)), style = { bold = false } }
+      segs[2] = { glyphs = title, style = { fg = "#00ff41", bold = true } }
     elseif y == 1 then
-      segs[1] = { glyphs = string.rep(" ", w - #vs - 1), style = { fg = BG, bg = BG, bold = false } }
-      segs[2] = { glyphs = vs, style = { fg = "#00ff41", bg = BG, bold = false } }
+      segs[1] = { glyphs = string.rep(" ", w - #vs - 1), style = { bold = false } }
+      segs[2] = { glyphs = vs, style = { fg = "#00ff41", bold = false } }
     end
     rows[y] = segs
   end

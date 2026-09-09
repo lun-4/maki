@@ -21,8 +21,8 @@ use maki_agent::{
     TextOutput, ToolOutput,
 };
 use maki_commands::{
-    ArgumentArity, ArgumentKind, CommandContent, CompletionPolicy, InputDispatch,
-    PositionalArgument,
+    ArgumentArity, ArgumentKind, CommandContent, CommandError, CommandOutcome, CompletionPolicy,
+    InputDispatch, PositionalArgument,
 };
 use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
@@ -944,12 +944,31 @@ fn register_permission_rule(
 ///   end,
 /// })
 /// -- `/copy "input file.txt" "build output" overwrite` records decoded values.
+///
+/// -- Legacy commands can still provide dynamic completion:
+/// maki.api.register_command({
+///   name = "/hello",
+///   description = "Say hello",
+///   tui_only = false,
+///   nargs = 1,
+///   completion = {
+///     get_items = function(ctx)
+///       return { { label = "world", insertion = "world", description = ctx.mode } }
+///     end,
+///   },
+///   handler = function(opts)
+///     recorded = opts.args
+///   end,
+/// })
 #[lua_fn]
 fn register_command(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> {
     register_command_from_lua(lua, &spec, plugin)
 }
 
-/// Runs a slash command by name, exactly as typing it in the input would.
+/// Runs a slash command by name, as the explicit name-based executor: the
+/// leading slash is optional, extra leading slashes are stripped, and the
+/// name must resolve to a registered command (unknown names error, and the
+/// `//` input escape does not apply to this API).
 /// Works for built-ins, custom `/project:` and `/user:` commands, MCP
 /// prompts, and commands other plugins registered.
 ///
@@ -973,6 +992,7 @@ fn register_command(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResul
 /// maki.api.register_command({
 ///   name = "/resume",
 ///   description = "Alias for /sessions",
+///   tui_only = false,
 ///   handler = function()
 ///     local ok, err = maki.api.run_command("/sessions")
 ///     if not ok then
@@ -987,15 +1007,13 @@ async fn run_command(
     cmdline: String,
 ) -> LuaResult<Pair<bool>> {
     let depth = command_depth(&lua).saturating_add(1);
+    let cmdline = format!("/{}", cmdline.trim().trim_start_matches('/'));
     if let Some(invocation) = command_invocation(&lua) {
         let result = invocation
             .invocation
             .dispatch(CommandContent::from(cmdline.as_str()))
             .await;
-        try_pair!(match result {
-            InputDispatch::Dispatched(_) => Ok(()),
-            InputDispatch::LiteralInput(_) => Err("unknown command".to_owned()),
-        });
+        try_pair!(nested_dispatch_result(result));
     } else {
         let reply = try_pair!(
             ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::RunCommand {
@@ -1008,6 +1026,17 @@ async fn run_command(
         try_pair!(reply);
     }
     Ok((Some(true), None))
+}
+
+fn nested_dispatch_result(result: InputDispatch) -> Result<(), String> {
+    match result {
+        InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::UnknownCommand(_))) => {
+            Err("unknown command".to_owned())
+        }
+        InputDispatch::Dispatched(CommandOutcome::Failed(error)) => Err(error.to_string()),
+        InputDispatch::Dispatched(_) => Ok(()),
+        InputDispatch::LiteralInput(_) => Err("unknown command".to_owned()),
+    }
 }
 
 /// Add a piece of text to an aggregate prompt slot. Multiple plugins can each
@@ -2665,5 +2694,26 @@ mod tests {
         };
         let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
         smol::block_on(inv.start(&ctx));
+    }
+
+    #[test_case::test_case(
+        InputDispatch::Dispatched(CommandOutcome::Failed(CommandError::UnknownCommand(
+            Arc::from("/bogus")
+        ))),
+        Err("unknown command".to_owned()) ;
+        "unknown command is rejected"
+    )]
+    #[test_case::test_case(
+        InputDispatch::Dispatched(CommandOutcome::Completed),
+        Ok(()) ;
+        "dispatched command succeeds"
+    )]
+    #[test_case::test_case(
+        InputDispatch::LiteralInput(CommandContent::from("prose")),
+        Err("unknown command".to_owned()) ;
+        "literal input is not a command"
+    )]
+    fn nested_dispatch_result_maps_outcomes(result: InputDispatch, expected: Result<(), String>) {
+        assert_eq!(nested_dispatch_result(result), expected);
     }
 }

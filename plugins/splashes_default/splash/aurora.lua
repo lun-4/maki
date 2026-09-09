@@ -9,26 +9,23 @@ local SAMPLE_STEP = 2
 local M = {}
 M.description = "Drifting northern lights over a dark gradient."
 
-local function theme_or(name, fallback)
+local function theme_rgb(name)
   local c = maki.ui.theme_color(name)
-  if c then
-    return {
-      tonumber(string.sub(c, 2, 3), 16),
-      tonumber(string.sub(c, 4, 5), 16),
-      tonumber(string.sub(c, 6, 7), 16),
-    }
+  if not c then
+    return nil
   end
-  return fallback
+  return {
+    tonumber(string.sub(c, 2, 3), 16),
+    tonumber(string.sub(c, 4, 5), 16),
+    tonumber(string.sub(c, 6, 7), 16),
+  }
 end
 
-local BG, FG, ACCENT, BG_HEX
+local FG
 local style_cache = {}
 
 local function refresh_colors()
-  BG = theme_or("background", { 40, 42, 54 })
-  FG = theme_or("foreground", { 248, 248, 242 })
-  ACCENT = theme_or("accent", { 255, 184, 108 })
-  BG_HEX = string.format("#%02x%02x%02x", BG[1], BG[2], BG[3])
+  FG = theme_rgb("foreground")
   style_cache = {}
 end
 
@@ -44,7 +41,7 @@ end
 local function color(hex)
   local s = style_cache[hex]
   if not s then
-    s = { fg = hex, bg = BG_HEX, bold = false }
+    s = { fg = hex, bold = false }
     style_cache[hex] = s
   end
   return s
@@ -87,7 +84,6 @@ local function cell_style(r, g, b, f)
         math.floor(qg * 255 / 31 + 0.5),
         math.floor(qb * 255 / 31 + 0.5)
       ),
-      bg = BG_HEX,
       bold = false,
     }
     style_cache[key] = st
@@ -169,11 +165,11 @@ function M.render(w, h, t, fade)
   refresh_colors()
   local f = fade or 1.0
   if w < 8 or h < 6 then
-    return flat_rows(w, h, color(BG_HEX))
+    return flat_rows(w, h, { bold = false })
   end
   local version = "v" .. maki.version().current
   local version_x = w - #version + 1
-  local version_style = color(rgb_to_hex(FG, 0.4 * f))
+  local version_style = FG and color(rgb_to_hex(FG, 0.4 * f)) or { bold = false }
   local sample_columns = math.floor((w - 1) / SAMPLE_STEP) + 2
   local sample_rows = math.floor((h - 1) / SAMPLE_STEP) + 2
   local band_cache = {}
