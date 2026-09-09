@@ -929,16 +929,17 @@ mod tests {
         assert!(meta.models[0].thinking_fields.is_none());
     }
 
-    #[cfg(unix)]
     /// A cache file of this test's own. `discover_in` skips directories, so a
     /// nested one keeps the cache out of the scanned set, and out of the
     /// developer's real state directory where every test used to share it.
+    #[cfg(unix)]
     fn cache_in(dir: &Path) -> PathBuf {
         let cache = dir.join("cache");
         fs::create_dir_all(&cache).unwrap();
         cache.join("provider-scripts.json")
     }
 
+    #[cfg(unix)]
     fn write_script(dir: &Path, name: &str, info_json: &str) -> PathBuf {
         let path = dir.join(name);
         let script = format!(
