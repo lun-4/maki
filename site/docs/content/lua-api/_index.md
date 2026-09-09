@@ -1102,7 +1102,9 @@ through optional callbacks while the tool runs.
   - `on_usage` (`function?`) called with a formatted cumulative token usage
     string. Must not yield.
 
-**Returns:** (`string?`, `string?`) Tool output text, or `(nil, err)` on failure.
+**Returns:** (`string?`, `string?`, `any`) Tool output text, or `(nil, err)` on
+  failure. The third value is the tool's `state` (see `register_tool`),
+  for callers that hand it back to the tool's `restore` later.
 
 **Example:**
 
