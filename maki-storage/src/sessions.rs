@@ -3006,10 +3006,13 @@ mod tests {
         write_legacy_jsonl(&path, &s);
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
         // The crash happened between the record's closing brace and the
-        // newline the writer emits after it.
-        let record =
-            serde_json::to_string(&serde_json::json!({"t":"msg","d":{"role":"user"}})).unwrap();
-        file.write_all(record.as_bytes()).unwrap();
+        // newline the writer emits after it. Written literally, because the
+        // scan matches MSG_PREFIX against the head of the line: a `json!`
+        // round-trip orders keys by whether serde_json has `preserve_order`,
+        // which is a workspace-wide feature this crate does not ask for, so
+        // building the record that way passes or fails with the build graph.
+        file.write_all(br#"{"t":"msg","d":{"role":"user"}}"#)
+            .unwrap();
         drop(file);
 
         let list = TestSession::list_in("/project", dir).unwrap();
