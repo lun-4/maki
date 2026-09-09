@@ -115,6 +115,7 @@ mod tests {
     struct Captured {
         messages: Vec<Message>,
         tools: Value,
+        system: String,
     }
 
     enum ProviderOutcome {
@@ -133,7 +134,7 @@ mod tests {
             &'a self,
             _model: &'a Model,
             messages: &'a [Message],
-            _system: &'a str,
+            system: &'a str,
             tools: &'a Value,
             events: &'a flume::Sender<ProviderEvent>,
             _opts: RequestOptions,
@@ -142,6 +143,7 @@ mod tests {
             let mut captured = self.captured.lock().unwrap();
             captured.messages = messages.to_vec();
             captured.tools = tools.clone();
+            captured.system = system.to_owned();
             drop(captured);
             match self.outcome {
                 ProviderOutcome::Success => {
@@ -178,12 +180,15 @@ mod tests {
         }
     }
 
+    /// The request owns its history (`IsolatedTurnRequest.history: Vec<Message>`),
+    /// so an isolated turn cannot reach the caller's primary history at all --
+    /// that guarantee is enforced by the signature, not by an assertion here.
+    /// What these tests pin is the content of the copy the provider is handed.
     async fn run_with_outcome(
         outcome: ProviderOutcome,
         cancel: CancelToken,
     ) -> Vec<IsolatedTurnEvent> {
         let original = vec![Message::user("primary".into())];
-        let before = serde_json::to_value(&original).unwrap();
         let provider = Arc::new(CapturingProvider {
             captured: Arc::new(Mutex::new(Captured::default())),
             outcome,
@@ -203,7 +208,6 @@ mod tests {
             tx,
         )
         .await;
-        assert_eq!(serde_json::to_value(&original).unwrap(), before);
         rx.iter().collect()
     }
 
@@ -225,11 +229,65 @@ mod tests {
         });
     }
 
+    /// A history that ends on an unanswered tool call is not a valid request.
+    /// The isolated turn closes those in its own copy; the primary history keeps
+    /// the call open, because the real turn may still be answering it.
+    #[test]
+    fn isolated_turn_closes_dangling_tool_calls_in_its_copy() {
+        smol::block_on(async {
+            let dangling = Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-1".into(),
+                    name: "read".into(),
+                    input: serde_json::json!({}),
+                    thought_signature: None,
+                }],
+                ..Default::default()
+            };
+            let original = vec![Message::user("primary".into()), dangling];
+            let captured = Arc::new(Mutex::new(Captured::default()));
+            let provider = Arc::new(CapturingProvider {
+                captured: Arc::clone(&captured),
+                outcome: ProviderOutcome::Success,
+            });
+            let (tx, _rx) = flume::unbounded();
+            run_isolated_turn(
+                IsolatedTurnRequest {
+                    provider,
+                    model: Model::from_spec("openai/gpt-4o").unwrap(),
+                    history: original.clone(),
+                    system: "system".into(),
+                    question: "why?".into(),
+                    images: Vec::new(),
+                    session_id: None,
+                    cancel: CancelToken::none(),
+                },
+                tx,
+            )
+            .await;
+
+            let captured = captured.lock().unwrap();
+            let closed = captured.messages.iter().any(|message| {
+                message.content.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::ToolResult { tool_use_id, content, .. }
+                            if tool_use_id == "call-1" && content == UNAVAILABLE_RESULT
+                    )
+                })
+            });
+            assert!(
+                closed,
+                "the dangling call must be closed before the copy reaches the provider"
+            );
+        });
+    }
+
     #[test]
     fn isolated_turn_uses_copy_and_empty_tools() {
         smol::block_on(async {
             let original = vec![Message::user("primary".into())];
-            let before = serde_json::to_value(&original).unwrap();
             let captured = Arc::new(Mutex::new(Captured::default()));
             let provider = Arc::new(CapturingProvider {
                 captured: Arc::clone(&captured),
@@ -251,10 +309,13 @@ mod tests {
             )
             .await;
 
-            assert_eq!(serde_json::to_value(&original).unwrap(), before);
             let captured = captured.lock().unwrap();
             assert_eq!(captured.tools, Value::Array(Vec::new()));
             assert_eq!(captured.messages.len(), original.len() + 1);
+            assert_eq!(
+                captured.system, "system",
+                "the isolated turn must send the caller's Build system text"
+            );
             assert!(rx.iter().any(|event| event == IsolatedTurnEvent::Done));
         });
     }
