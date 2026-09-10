@@ -1,10 +1,15 @@
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::components::file_completion::PathDiscovery;
 use crate::theme::{ThemesProvider, apply_theme};
 use arc_swap::ArcSwapOption;
 use maki_commands::{
     CancellationToken, CommandCompletion, CommandFuture, CompletionContext, CompletionError,
-    CompletionItem, CompletionLifecycleEvent, CompletionSessionId, InvocationTargetId,
+    CompletionItem, CompletionItemNavigation, CompletionLifecycleEvent, CompletionSessionId,
+    InvocationTargetId,
 };
 
 pub(crate) struct ModelArgSource {
@@ -14,6 +19,84 @@ pub(crate) struct ModelArgSource {
 impl ModelArgSource {
     pub(crate) fn new(models: Arc<ArcSwapOption<Vec<String>>>) -> Self {
         Self { models }
+    }
+}
+
+pub(crate) struct PathArgSource {
+    discovery: PathDiscovery,
+}
+
+impl PathArgSource {
+    pub(crate) fn new(home: Option<PathBuf>) -> Self {
+        Self {
+            discovery: PathDiscovery::new(home),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_discovery(discovery: PathDiscovery) -> Self {
+        Self { discovery }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn typed_items(
+        &self,
+        cwd: &str,
+        value: &str,
+        directory_only: bool,
+    ) -> std::io::Result<Vec<(String, bool)>> {
+        self.discovery
+            .typed_candidates(Path::new(cwd), value, directory_only)
+    }
+}
+
+impl CommandCompletion for PathArgSource {
+    fn navigation(
+        &self,
+        _context: &CompletionContext,
+        item: &CompletionItem,
+    ) -> CompletionItemNavigation {
+        if item.insertion.ends_with(['/', '\\']) {
+            CompletionItemNavigation::Directory
+        } else {
+            CompletionItemNavigation::Terminal
+        }
+    }
+
+    fn complete(
+        &self,
+        context: CompletionContext,
+        cancellation: CancellationToken,
+    ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
+        let cwd = PathBuf::from(context.cwd.as_ref());
+        let discovery = self.discovery.clone();
+        let query = context.argument.to_string();
+        let directory_only = matches!(
+            context.argument_kind,
+            Some(maki_commands::ArgumentKind::Directory)
+        );
+        Box::pin(async move {
+            if cancellation.is_cancelled() {
+                return Ok(Vec::new());
+            }
+            let entries =
+                smol::unblock(move || discovery.typed_candidates(&cwd, &query, directory_only))
+                    .await
+                    .map_err(|_| CompletionError::Unavailable)?;
+            Ok(entries
+                .into_iter()
+                .map(|(mut insertion, is_directory)| {
+                    if is_directory {
+                        insertion.push(std::path::MAIN_SEPARATOR);
+                    }
+                    CompletionItem {
+                        label: Arc::from(insertion.as_str()),
+                        insertion: Arc::from(insertion),
+                        description: None,
+                    }
+                })
+                .collect())
+        })
     }
 }
 
@@ -170,14 +253,16 @@ impl CommandCompletion for ThemeArgSource {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Arc;
 
     use maki_commands::{
-        ArgumentArity, CommandBehavior, CommandDocs, CommandError, CommandFuture,
+        CommandArguments, CommandBehavior, CommandDocs, CommandError, CommandFuture,
         CommandInvocation, CommandOutcome, CommandRegistry, CommandSpec, CompletionResult,
         HostResponse, ProducerPrecedence, Registration, TargetCapabilities,
     };
 
+    use crate::components::file_completion::{FileCandidate, FileResolver, PathDiscovery};
     use crate::theme::InMemoryThemesProvider;
 
     use super::*;
@@ -212,7 +297,13 @@ mod tests {
                 spec: CommandSpec {
                     name: Arc::from("/theme"),
                     aliases: Vec::new().into(),
-                    arguments: ArgumentArity::unbounded(0),
+                    arguments: CommandArguments::Positional(Arc::from([
+                        maki_commands::PositionalArgument::optional(
+                            "theme",
+                            maki_commands::ArgumentKind::String,
+                        )
+                        .with_completion(maki_commands::CompletionPolicy::Replace),
+                    ])),
                     docs: CommandDocs {
                         summary: Arc::from("test"),
                         argument_hint: None,
@@ -220,7 +311,7 @@ mod tests {
                     required_capabilities: TargetCapabilities::default(),
                 },
                 behavior: Arc::new(NoBehavior),
-                completion: Some(source.clone()),
+                argument_completions: vec![Some(source.clone())],
             }])
             .unwrap();
         (source, registry)
@@ -272,5 +363,200 @@ mod tests {
 
         source.finish(target, true);
         assert_eq!(source.provider.current_theme_name(), SELECTED_THEME);
+    }
+
+    struct FixtureResolver {
+        reads: std::sync::Mutex<Vec<PathBuf>>,
+        entries: Vec<FileCandidate>,
+    }
+
+    impl FileResolver for FixtureResolver {
+        fn read_dir(&self, path: &Path) -> std::io::Result<Vec<FileCandidate>> {
+            self.reads.lock().unwrap().push(path.to_path_buf());
+            Ok(self.entries.clone())
+        }
+    }
+
+    fn fixture_source(
+        entries: Vec<FileCandidate>,
+        home: Option<PathBuf>,
+    ) -> (Arc<FixtureResolver>, PathArgSource) {
+        let resolver = Arc::new(FixtureResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries,
+        });
+        let source = PathArgSource::with_discovery(PathDiscovery::with_resolver(
+            Arc::clone(&resolver) as Arc<dyn FileResolver>,
+            home,
+        ));
+        (resolver, source)
+    }
+
+    fn file(name: &str) -> FileCandidate {
+        FileCandidate {
+            path: name.into(),
+            is_directory: false,
+        }
+    }
+
+    fn directory(name: &str) -> FileCandidate {
+        FileCandidate {
+            path: name.into(),
+            is_directory: true,
+        }
+    }
+
+    fn session_fixture(source: Arc<PathArgSource>, cwd: &str) -> maki_commands::CompletionSession {
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Application);
+        producer
+            .replace(vec![Registration {
+                spec: CommandSpec {
+                    name: Arc::from("/cd"),
+                    aliases: Vec::new().into(),
+                    arguments: maki_commands::CommandArguments::Positional(Arc::from([
+                        maki_commands::PositionalArgument::optional(
+                            "path",
+                            maki_commands::ArgumentKind::Directory,
+                        ),
+                    ])),
+                    docs: CommandDocs {
+                        summary: Arc::from("Change working directory."),
+                        argument_hint: None,
+                    },
+                    required_capabilities: TargetCapabilities::default(),
+                },
+                behavior: Arc::new(NoBehavior),
+                argument_completions: vec![None],
+            }])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(NoBehavior));
+        let command = registry.resolve_for(&target, "/cd").unwrap();
+        let defaults = maki_commands::CompletionProviders::default()
+            .with(
+                maki_commands::CompletionKind::Directory,
+                Arc::clone(&source) as Arc<dyn maki_commands::CommandCompletion>,
+            )
+            .with(
+                maki_commands::CompletionKind::File,
+                source as Arc<dyn maki_commands::CommandCompletion>,
+            );
+        registry
+            .open_completion_with_defaults(command, target.id(), defaults, Arc::from(cwd))
+            .unwrap()
+    }
+
+    fn candidates(
+        session: &maki_commands::CompletionSession,
+        argument: &str,
+    ) -> Vec<CompletionItem> {
+        match smol::block_on(session.complete(
+            Arc::from(argument),
+            Arc::from(argument),
+            0,
+            Arc::from("default"),
+        )) {
+            maki_commands::CompletionResult::Items(items) => items
+                .into_iter()
+                .map(|candidate| candidate.item().clone())
+                .collect(),
+            other => panic!("unexpected completion result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_path_prefix_filters_relative_and_marks_directories() {
+        let tmp = Arc::new(tempfile::tempdir().unwrap());
+        let cwd = tmp.path().to_string_lossy().to_string();
+        std::fs::create_dir_all(tmp.path().join("release apple")).unwrap();
+        std::fs::write(tmp.path().join("release.txt"), b"x").unwrap();
+        let source = Arc::new(PathArgSource::new(None));
+        let session = session_fixture(source, &cwd);
+
+        let mut items = candidates(&session, "./release ");
+        let names: Vec<&str> = items
+            .iter_mut()
+            .map(|item| item.insertion.as_ref())
+            .collect();
+        assert!(names.contains(&"./release apple/"));
+        assert!(!names.contains(&"./release.txt"));
+    }
+
+    #[test]
+    fn typed_path_uses_shared_resolver_and_excludes_files_for_directories() {
+        let cwd = PathBuf::from("/workspace/project");
+        let (resolver, source) = fixture_source(
+            vec![
+                file("alpha.txt"),
+                file("archive"),
+                directory("archive"),
+                directory("beta"),
+            ],
+            None,
+        );
+        let session = session_fixture(source.into(), "/workspace/project");
+
+        let mut items = candidates(&session, "ar");
+        let names: Vec<&str> = items
+            .iter_mut()
+            .map(|item| item.insertion.as_ref())
+            .collect();
+        assert_eq!(names, vec!["archive/"]);
+        assert_eq!(resolver.reads.lock().unwrap().as_slice(), &[cwd]);
+
+        let _ = candidates(&session, "other");
+        assert!(resolver.reads.lock().unwrap().len() == 2);
+    }
+
+    #[test]
+    fn typed_path_home_and_absolute_namespaces_use_shared_resolution() {
+        let home = PathBuf::from("/home/tester");
+        let resolver = Arc::new(FixtureResolver {
+            reads: std::sync::Mutex::new(Vec::new()),
+            entries: vec![file("notes.txt")],
+        });
+        let source = Arc::new(PathArgSource::with_discovery(PathDiscovery::with_resolver(
+            Arc::clone(&resolver) as Arc<dyn FileResolver>,
+            Some(home.clone()),
+        )));
+
+        let items = source
+            .typed_items("/workspace/project", "~/not", false)
+            .expect("home discovery must not fail");
+        assert_eq!(
+            items[0].0, "~/notes.txt",
+            "tilde namespace must be preserved"
+        );
+        assert_eq!(resolver.reads.lock().unwrap().as_slice(), &[home]);
+
+        let items = source
+            .typed_items("/workspace/project", "/tmp/not", false)
+            .expect("absolute discovery must not fail");
+        assert_eq!(items[0].0, "/tmp/notes.txt");
+        assert_eq!(
+            resolver.reads.lock().unwrap().last().unwrap(),
+            &PathBuf::from("/tmp")
+        );
+    }
+
+    #[test]
+    fn cancelled_typed_path_request_returns_empty_without_io() {
+        let (resolver, source) = fixture_source(vec![file("alpha.txt")], None);
+        let session = session_fixture(source.into(), "/workspace/project");
+        session.cancel().unwrap();
+
+        let result = smol::block_on(session.complete(
+            Arc::from("al"),
+            Arc::from("al"),
+            0,
+            Arc::from("default"),
+        ));
+        assert!(matches!(
+            result,
+            maki_commands::CompletionResult::Cancelled
+                | maki_commands::CompletionResult::Failed
+                | maki_commands::CompletionResult::Stale
+        ));
+        assert!(resolver.reads.lock().unwrap().is_empty());
     }
 }

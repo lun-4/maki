@@ -16,12 +16,15 @@ use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
 use serde::Deserialize;
 
-use crate::api::util::command::{CommandArgumentItem, CommandHandlerMap};
+use crate::api::util::command::{
+    CommandArgumentItem, CommandCompletionCallbacks, CommandHandlerMap,
+};
 use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::pair::Pair;
 use crate::runtime::{
     CommandArgumentContext, CommandArgumentLifecycle, CommandArgumentLifecycleRequest,
 };
+use maki_commands::parse_completion_prefix_arguments;
 
 const TRAILING_PUNCTUATION: &[char] = &[
     ',', '.', '!', '?', ')', ']', '}', '"', '\'', '\u{ff0c}', '\u{ff0e}', '\u{3002}', '\u{ff01}',
@@ -548,7 +551,11 @@ pub(crate) async fn collect_completion_items(lua: &Lua, ctx: &CompletionCtx) -> 
     out
 }
 
-fn command_argument_ctx(lua: &Lua, context: &CommandArgumentContext) -> LuaResult<Table> {
+fn command_argument_ctx(
+    lua: &Lua,
+    context: &CommandArgumentContext,
+    schema: Option<&[maki_commands::PositionalArgument]>,
+) -> LuaResult<Table> {
     let ctx = lua.create_table()?;
     ctx.set("command", context.command.as_ref())?;
     ctx.set("args", context.args.as_str())?;
@@ -557,29 +564,77 @@ fn command_argument_ctx(lua: &Lua, context: &CommandArgumentContext) -> LuaResul
     ctx.set("mode", context.mode.as_str())?;
     ctx.set("session", context.session)?;
     ctx.set("generation", context.generation)?;
+    if let Some(name) = &context.argument_name {
+        ctx.set("argument", name.as_ref())?;
+    }
+    if let Some(kind) = &context.argument_kind {
+        ctx.set("type", kind.as_str())?;
+    }
+    let values = lua.create_table()?;
+    let preceding_arguments = schema
+        .map(|schema| parse_completion_prefix_arguments(&context.args, schema, context.index))
+        .unwrap_or_default();
+    for argument in preceding_arguments.iter() {
+        let value = |value: &maki_commands::ArgumentValue| -> LuaResult<Value> {
+            Ok(match value {
+                maki_commands::ArgumentValue::String(value)
+                | maki_commands::ArgumentValue::Enum(value) => {
+                    Value::String(lua.create_string(value.as_ref())?)
+                }
+                maki_commands::ArgumentValue::Integer(value) => Value::Integer(*value),
+                maki_commands::ArgumentValue::File(value)
+                | maki_commands::ArgumentValue::Directory(value) => {
+                    Value::String(lua.create_string(value.to_string_lossy().as_ref())?)
+                }
+            })
+        };
+        if argument.variadic {
+            let sequence = lua.create_table()?;
+            for (index, item) in argument.values.iter().enumerate() {
+                sequence.set(index + 1, value(item)?)?;
+            }
+            values.set(argument.name.as_ref(), sequence)?;
+        } else if let Some(item) = argument.values.first() {
+            values.set(argument.name.as_ref(), value(item)?)?;
+        }
+    }
+    ctx.set("values", values)?;
     Ok(ctx)
 }
 
 pub(crate) async fn collect_command_argument_items(
     lua: &Lua,
     context: &CommandArgumentContext,
+    callbacks: Option<&CommandCompletionCallbacks>,
 ) -> Vec<CommandArgumentItem> {
-    let value = lua.app_data_ref::<CommandHandlerMap>().and_then(|map| {
-        map.get(&context.plugin).and_then(|commands| {
-            commands.get(&context.command).and_then(|entry| {
-                entry
-                    .argument_completion
-                    .as_ref()
-                    .and_then(|key| lua.registry_value::<Value>(key).ok())
+    let (value, schema) = if let Some(callbacks) = callbacks {
+        (
+            lua.registry_value::<Value>(&callbacks.completion).ok(),
+            callbacks.argument_schema.clone(),
+        )
+    } else if let Some((value, schema)) = lua.app_data_ref::<CommandHandlerMap>().and_then(|map| {
+        map.get(&context.plugin)
+            .and_then(|commands| commands.get(&context.command))
+            .filter(|entry| entry.generation == context.command_generation)
+            .and_then(|entry| {
+                let schema = entry.arguments.positional()?.to_vec().into();
+                let completion = entry.argument_completions.get(context.index)?.as_ref()?;
+                Some((
+                    lua.registry_value::<Value>(&completion.completion).ok()?,
+                    Some(schema),
+                ))
             })
-        })
-    });
+    }) {
+        (Some(value), schema)
+    } else {
+        (None, None)
+    };
     let Some(value) = value else {
         return Vec::new();
     };
     let result = match value {
         Value::Table(items) => Ok(items),
-        Value::Function(function) => match command_argument_ctx(lua, context) {
+        Value::Function(function) => match command_argument_ctx(lua, context, schema.as_deref()) {
             Ok(ctx) => function
                 .call_async::<Value>(ctx)
                 .await
@@ -627,38 +682,53 @@ pub(crate) async fn collect_command_argument_items(
 
 fn lifecycle_function(
     lua: &Lua,
+    callbacks: Option<&CommandCompletionCallbacks>,
     commands: Option<&HashMap<Arc<str>, crate::api::util::command::CommandEntry>>,
     request: &CommandArgumentLifecycleRequest,
 ) -> Option<Function> {
-    let entry = commands?.get(&request.context.command)?;
+    if let Some(callbacks) = callbacks {
+        let key = match request.event {
+            CommandArgumentLifecycle::Highlight => callbacks.on_highlight.as_ref(),
+            CommandArgumentLifecycle::Accept => callbacks.on_accept.as_ref(),
+            CommandArgumentLifecycle::Cancel => callbacks.on_cancel.as_ref(),
+        }?;
+        return lua.registry_value::<Function>(key).ok();
+    }
+    let entry = commands?
+        .get(&request.context.command)
+        .filter(|entry| entry.generation == request.context.command_generation)?;
+    let completion = entry
+        .argument_completions
+        .get(request.context.index)?
+        .as_ref()?;
     let key = match request.event {
-        CommandArgumentLifecycle::Highlight => &entry.completion_on_highlight,
-        CommandArgumentLifecycle::Accept => &entry.completion_on_accept,
-        CommandArgumentLifecycle::Cancel => &entry.completion_on_cancel,
-    };
-    key.as_ref()
-        .and_then(|key| lua.registry_value::<Function>(key).ok())
+        CommandArgumentLifecycle::Highlight => completion.on_highlight.as_ref(),
+        CommandArgumentLifecycle::Accept => completion.on_accept.as_ref(),
+        CommandArgumentLifecycle::Cancel => completion.on_cancel.as_ref(),
+    }?;
+    lua.registry_value::<Function>(key).ok()
 }
 
 pub(crate) async fn run_command_argument_lifecycle(
     lua: &Lua,
     request: &CommandArgumentLifecycleRequest,
 ) {
-    let function = lua
-        .app_data_ref::<CommandHandlerMap>()
-        .and_then(|map| lifecycle_function(lua, map.get(&request.context.plugin), request))
-        .or_else(|| {
-            lua.app_data_ref::<crate::api::util::command::RetiredCommandHandlerMap>()
-                .and_then(|retired| {
-                    retired
-                        .iter()
-                        .rev()
-                        .find(|(plugin, _)| plugin == &request.context.plugin)
-                        .and_then(|(_, commands)| lifecycle_function(lua, Some(commands), request))
-                })
-        });
+    let function = if let Some(callbacks) = request.callbacks.as_deref() {
+        lifecycle_function(lua, Some(callbacks), None, request)
+    } else {
+        lua.app_data_ref::<CommandHandlerMap>().and_then(|map| {
+            lifecycle_function(lua, None, map.get(&request.context.plugin), request)
+        })
+    };
     let Some(function) = function else { return };
-    let ctx = match command_argument_ctx(lua, &request.context) {
+    let ctx = match command_argument_ctx(
+        lua,
+        &request.context,
+        request
+            .callbacks
+            .as_deref()
+            .and_then(|callbacks| callbacks.argument_schema.as_deref()),
+    ) {
         Ok(ctx) => ctx,
         Err(error) => {
             tracing::warn!(plugin = %request.context.plugin, command = %request.context.command, hook = ?request.event, error = %error, "command completion hook context failed");
@@ -1059,17 +1129,28 @@ mod tests {
             HashMap::from([(
                 Arc::from("/deploy"),
                 crate::api::util::command::CommandEntry {
+                    generation: 0,
                     handler: lua
                         .create_registry_value(lua.create_function(|_, ()| Ok(())).unwrap())
                         .unwrap(),
                     description: Arc::from("deploy"),
                     argument_hint: None,
-                    arguments: maki_commands::ArgumentArity::ONE,
+                    arguments: maki_commands::CommandArguments::Positional(Arc::from([
+                        maki_commands::PositionalArgument::required(
+                            "environment",
+                            maki_commands::ArgumentKind::String,
+                        ),
+                    ])),
                     tui_only: false,
-                    argument_completion: Some(key),
-                    completion_on_highlight: None,
-                    completion_on_accept: None,
-                    completion_on_cancel: None,
+                    argument_completions: vec![Some(
+                        crate::api::util::command::ArgumentCompletion {
+                            completion: key,
+                            on_highlight: None,
+                            on_accept: None,
+                            on_cancel: None,
+                            navigation: None,
+                        },
+                    )],
                 },
             )]),
         )]));
@@ -1085,7 +1166,12 @@ mod tests {
                 mode: "build".into(),
                 session: 7,
                 generation: 9,
+                command_generation: 0,
+                argument_name: None,
+                argument_kind: None,
+                preceding_values: Arc::from([]),
             },
+            None,
         ));
 
         assert!(items.is_empty());

@@ -34,7 +34,8 @@ use crate::components::btw_modal::BtwModal;
 use crate::components::command::ParsedCommand;
 use crate::components::command::{CommandAction, CommandPalette, ConfirmedCommand};
 use crate::components::file_completion::{
-    CompletionAction, CompletionItem, FileCompletionMenu, at_token_query, at_token_range,
+    CompletionAction, CompletionItem, CompletionMode, FileCompletionMenu, at_token_query,
+    at_token_range,
 };
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
@@ -59,6 +60,7 @@ use crate::components::{
 use crate::image;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
+use crate::text_buffer::is_newline_key;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
 use maki_agent::permissions::PermissionManager;
@@ -440,7 +442,27 @@ impl App {
             input_box,
             command_runtime: Arc::clone(&command_runtime),
             command_target: command_target.clone(),
-            command_palette: CommandPalette::new(command_runtime.registry.clone(), command_target),
+            command_palette: CommandPalette::with_defaults(
+                command_runtime.registry.clone(),
+                command_target,
+                maki_commands::CompletionProviders::default()
+                    .with(
+                        maki_commands::CompletionKind::File,
+                        Arc::clone(&command_runtime.path_completion)
+                            as Arc<dyn maki_commands::CommandCompletion>,
+                    )
+                    .with(
+                        maki_commands::CompletionKind::Directory,
+                        Arc::clone(&command_runtime.path_completion)
+                            as Arc<dyn maki_commands::CommandCompletion>,
+                    )
+                    .with(
+                        maki_commands::CompletionKind::Directory,
+                        Arc::clone(&command_runtime.path_completion)
+                            as Arc<dyn maki_commands::CommandCompletion>,
+                    ),
+                Arc::from(state.session.cwd.as_str()),
+            ),
             task_picker: ListPicker::new(),
             task_picker_original: None,
             lua_picker: LuaPicker::new(lua_event_handle.clone()),
@@ -821,6 +843,8 @@ impl App {
     }
 
     fn sync_command_arguments(&mut self, input: &str, cursor: usize) {
+        self.command_palette
+            .set_cwd(Arc::from(self.state.session.cwd.as_str()));
         if self
             .command_palette
             .sync_arguments(input, cursor, &self.state.mode.id_key())
@@ -843,9 +867,26 @@ impl App {
             .finish_theme_preview(self.command_target.id(), false);
         self.command_palette.close();
         self.command_target = self.command_runtime.bind_target();
-        self.command_palette = CommandPalette::new(
+        self.command_palette = CommandPalette::with_defaults(
             self.command_runtime.registry.clone(),
             self.command_target.clone(),
+            maki_commands::CompletionProviders::default()
+                .with(
+                    maki_commands::CompletionKind::File,
+                    Arc::clone(&self.command_runtime.path_completion)
+                        as Arc<dyn maki_commands::CommandCompletion>,
+                )
+                .with(
+                    maki_commands::CompletionKind::Directory,
+                    Arc::clone(&self.command_runtime.path_completion)
+                        as Arc<dyn maki_commands::CommandCompletion>,
+                )
+                .with(
+                    maki_commands::CompletionKind::Directory,
+                    Arc::clone(&self.command_runtime.path_completion)
+                        as Arc<dyn maki_commands::CommandCompletion>,
+                ),
+            Arc::from(self.state.session.cwd.as_str()),
         );
     }
 
@@ -1258,18 +1299,24 @@ impl App {
                 return self.run_builtin(BuiltinAction::FilePicker);
             } else if key.code == KeyCode::Char('v') && self.image_paste_rx.is_empty() {
                 self.start_image_paste();
-            } else if let InputAction::PaletteSync(val) = self.input_box.handle_key(key) {
-                self.command_palette.sync(&val);
-                self.sync_command_arguments(&val, self.input_box.buffer.cursor_byte_offset());
-                self.sync_file_completion();
+            } else {
+                let action = self.input_box.handle_key(key);
+                return self.handle_input_action(action);
             }
             return vec![];
         }
 
-        match self
+        if self.status == Status::Streaming {
+            self.file_completion.close();
+        }
+        if is_newline_key(&key) && self.typed_path_completion_context().is_some() {
+            let action = self.input_box.handle_key(key);
+            return self.handle_input_action(action);
+        }
+        let command_action = self
             .command_palette
-            .handle_key(key, &self.input_box.buffer.value())
-        {
+            .handle_key(key, &self.input_box.buffer.value());
+        match command_action {
             CommandAction::Consumed => {
                 if key.code == KeyCode::Esc {
                     self.sync_file_completion();
@@ -1312,6 +1359,7 @@ impl App {
                 self.refresh_at_ref_labels(&text);
                 self.input_box.set_input(text.clone());
                 self.input_box.buffer.set_cursor_byte_offset(cursor);
+                self.sync_file_completion();
                 return vec![];
             }
             CommandAction::Complete { text, cursor } => {
@@ -1320,32 +1368,36 @@ impl App {
                 self.input_box.set_input(text.clone());
                 self.input_box.buffer.set_cursor_byte_offset(cursor);
                 self.sync_command_arguments(&text, cursor);
+                self.sync_file_completion();
                 return vec![];
             }
             CommandAction::Passthrough => {}
         }
 
-        if self.file_completion.is_active() {
-            match self.file_completion.handle_key(key) {
-                CompletionAction::Consumed => return vec![],
-                CompletionAction::Close => {
-                    self.file_completion.close();
-                    return vec![];
-                }
-                CompletionAction::Select(item) => {
-                    self.insert_completion(item);
-                    return vec![];
-                }
-                CompletionAction::Advance(item) => {
-                    self.advance_completion(item);
-                    return vec![];
-                }
-                CompletionAction::Passthrough => {}
-            }
+        if self.file_completion.mode() == Some(CompletionMode::Reference)
+            && self.handle_completion_key(key)
+        {
+            return vec![];
         }
 
+        let action = self.input_box.handle_key(key);
+        self.handle_input_action(action)
+    }
+
+    fn handle_completion_key(&mut self, key: KeyEvent) -> bool {
+        match self.file_completion.handle_key(key) {
+            CompletionAction::Consumed => {}
+            CompletionAction::Close => self.file_completion.close(),
+            CompletionAction::Select(item) => self.insert_completion(item),
+            CompletionAction::Advance(item) => self.advance_completion(item),
+            CompletionAction::Passthrough => return false,
+        }
+        true
+    }
+
+    fn handle_input_action(&mut self, action: InputAction) -> Vec<Action> {
         let streaming = self.status == Status::Streaming;
-        match self.input_box.handle_key(key) {
+        match action {
             InputAction::Submit(sub) => {
                 self.file_completion.close();
                 self.handle_submit(sub)
@@ -1356,13 +1408,9 @@ impl App {
                 self.sync_file_completion();
                 vec![]
             }
-            InputAction::CursorMoved => {
+            InputAction::CursorMoved | InputAction::ContinueLine => {
                 let val = self.input_box.buffer.value();
-                self.command_palette.sync_arguments(
-                    &val,
-                    self.input_box.buffer.cursor_byte_offset(),
-                    &self.state.mode.id_key(),
-                );
+                self.sync_command_arguments(&val, self.input_box.buffer.cursor_byte_offset());
                 self.sync_file_completion();
                 vec![]
             }
@@ -1405,7 +1453,7 @@ impl App {
                     _ => vec![],
                 }
             }
-            InputAction::ContinueLine | InputAction::None => vec![],
+            InputAction::None => vec![],
         }
     }
 
@@ -1447,19 +1495,30 @@ impl App {
         self.store_at_ref_labels(&items);
     }
 
-    /// Opens, refreshes, or closes the `@` completion popup to match the token
-    /// under the input cursor. Suppressed while the command palette or an
-    /// overlay owns the screen.
+    fn typed_path_completion_context(
+        &self,
+    ) -> Option<(maki_commands::ArgumentKind, String, (usize, usize))> {
+        if self.input_box.buffer.y() != 0 {
+            return None;
+        }
+        let (kind, range, _) = self.command_palette.typed_path_argument(
+            &self.input_box.buffer.lines()[0],
+            self.input_box.buffer.cursor_byte_offset(),
+        )?;
+        let query_end = self.input_box.buffer.cursor_byte_offset().min(range.1);
+        let query = self.input_box.buffer.lines()[0][range.0..query_end].to_owned();
+        Some((kind, query, range))
+    }
+
     fn sync_file_completion(&mut self) {
-        if self.status == Status::Streaming {
+        self.command_palette
+            .set_cwd(Arc::from(self.state.session.cwd.as_str()));
+        if self.status == Status::Streaming || self.typed_path_completion_context().is_some() {
             self.file_completion.close();
             return;
         }
-        let range = {
-            let buf = &self.input_box.buffer;
-            at_token_range(&buf.lines()[buf.y()], buf.x())
-        };
-        let Some((start, end)) = range else {
+        let buf = &self.input_box.buffer;
+        let Some(range) = at_token_range(&buf.lines()[buf.y()], buf.x()) else {
             self.file_completion.close();
             return;
         };
@@ -1467,32 +1526,46 @@ impl App {
             self.file_completion.close();
             return;
         }
-
+        let query = at_token_query(&buf.lines()[buf.y()], buf.x()).unwrap_or_default();
         let cwd = self.state.session.cwd.clone();
-        let query = {
-            let buffer = &self.input_box.buffer;
-            at_token_query(&buffer.lines()[buffer.y()], buffer.x()).unwrap_or_default()
-        };
-        self.file_completion.set_token_byte_range((start, end));
-        if self.file_completion.is_active() {
+        self.file_completion.set_token_byte_range(range);
+        if self.file_completion.is_active()
+            && !self
+                .file_completion
+                .needs_reopen(&cwd, CompletionMode::Reference)
+        {
             self.file_completion.sync_query(&query);
-        } else {
-            let items = self
-                .lua_event_handle
-                .collect_completion_items(&self.completion_ctx());
-            self.store_at_ref_labels(&items);
-            self.file_completion.open(&cwd, items, &query, (start, end));
+            return;
         }
+        let items = self
+            .lua_event_handle
+            .collect_completion_items(&self.completion_ctx());
+        self.store_at_ref_labels(&items);
+        self.file_completion.open(&cwd, items, &query, range);
     }
 
     /// Replaces the `@` token with a final completion and closes the popup.
     fn insert_completion(&mut self, item: CompletionItem) {
-        self.apply_completion(item, true);
+        if matches!(
+            self.file_completion.mode(),
+            Some(CompletionMode::File | CompletionMode::Directory)
+        ) {
+            self.apply_completion_replacement(item.insertion, true);
+        } else {
+            self.apply_completion(item, true);
+        }
     }
 
     /// Replaces the `@` token with an explicit directory and refreshes its children.
     fn advance_completion(&mut self, item: CompletionItem) {
-        let replacement = item.advance_replacement();
+        let replacement = if matches!(
+            self.file_completion.mode(),
+            Some(CompletionMode::File | CompletionMode::Directory)
+        ) {
+            item.insertion
+        } else {
+            item.advance_replacement()
+        };
         self.apply_completion_replacement(replacement, false);
         self.sync_file_completion();
     }
@@ -2346,6 +2419,9 @@ impl App {
                     .session_mut()
                     .set_cwd(path.to_string_lossy().into_owned());
                 self.status_bar.set_cwd(path.clone());
+                if self.file_completion.is_active() {
+                    self.sync_file_completion();
+                }
                 self.flash(format!("cd {}", path.display()))
             }
             Err(error) => self.flash(format!("cd: {error}")),
@@ -2892,6 +2968,23 @@ impl App {
         actions.extend(self.start_from_queue(&msg));
         actions
     }
+}
+
+#[cfg(test)]
+fn directory_argument_range_for_test(
+    line: &str,
+    cursor: usize,
+) -> Option<(String, (usize, usize))> {
+    let remainder = line.strip_prefix("/cd")?;
+    let separator = remainder.chars().next().filter(|c| c.is_whitespace())?;
+    let command_end = line.len() - remainder.len() + separator.len_utf8();
+    if cursor < command_end || !line.is_char_boundary(cursor) {
+        return None;
+    }
+    let start = line.len() - remainder.trim_start().len();
+    let end = line.trim_end().len().max(start);
+    let query_end = cursor.clamp(start, end);
+    Some((line[start..query_end].to_owned(), (start, end)))
 }
 
 fn is_streaming_stop_key(key: KeyEvent) -> bool {

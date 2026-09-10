@@ -9,11 +9,12 @@ use std::{
 };
 
 use maki_commands::{
-    AgentTurn, ArgumentArity, BUILTIN_COMMANDS, BuiltinOperation, CommandBehavior,
-    CommandCompletion, CommandContent, CommandError, CommandFuture, CommandInvocation,
-    CommandOutcome, CommandRegistry, CompletionKey, HostContextRequest, HostContextResponse,
-    HostRequest, HostResponse, Producer, ProducerPrecedence, Registration, RegistrationError,
-    TargetCapabilities, TargetCapability,
+    AgentTurn, ArgumentValue, BUILTIN_COMMANDS, BuiltinOperation, CancellationToken,
+    CommandBehavior, CommandCompletion, CommandContent, CommandError, CommandFuture,
+    CommandInvocation, CommandOutcome, CommandRegistry, CompletionContext, CompletionError,
+    CompletionItem, HostContextRequest, HostContextResponse, HostRequest, HostResponse, Producer,
+    ProducerPrecedence, Registration, RegistrationError, TargetCapabilities, TargetCapability,
+    resolve_path,
 };
 use maki_config::ModelPolicy;
 use maki_match::{MatchCandidate, Resolution, fuzzy_resolve, fuzzy_resolve_candidates};
@@ -469,23 +470,21 @@ impl CommandBehavior for BuiltinBehavior {
                             "working-directory resolution is unavailable",
                         )));
                     };
-                    let path = if arguments.is_empty() {
-                        maki_storage::paths::home().unwrap_or_default()
-                    } else if let Some(rest) = arguments.strip_prefix('~') {
-                        let home = maki_storage::paths::home().unwrap_or_default();
-                        if rest.is_empty() {
-                            home
-                        } else {
-                            home.join(rest.trim_start_matches('/'))
-                        }
-                    } else {
-                        let path = PathBuf::from(&arguments);
-                        if path.is_relative() {
-                            cwd.join(path)
-                        } else {
-                            path
-                        }
-                    };
+                    let path = invocation
+                        .parsed_arguments
+                        .as_ref()
+                        .and_then(|arguments| arguments.get("path"))
+                        .map(|value| match value {
+                            ArgumentValue::Directory(path) => path.to_string_lossy().into_owned(),
+                            _ => String::new(),
+                        })
+                        .filter(|path| !path.is_empty())
+                        .map(|path| {
+                            resolve_path(&cwd, maki_storage::paths::home().as_deref(), &path)
+                        })
+                        .transpose()
+                        .map_err(|error| CommandError::Producer(Arc::from(error.to_string())))?
+                        .unwrap_or_else(|| maki_storage::paths::home().unwrap_or_default());
                     BuiltinOperation::ChangeDirectory { path }
                 }
                 maki_commands::BuiltinId::Btw => BuiltinOperation::QuickQuestion {
@@ -516,6 +515,18 @@ impl CommandBehavior for BuiltinBehavior {
                 ))),
             }
         })
+    }
+}
+
+struct EmptyCompletion;
+
+impl CommandCompletion for EmptyCompletion {
+    fn complete(
+        &self,
+        _context: CompletionContext,
+        _cancellation: CancellationToken,
+    ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
+        Box::pin(async { Ok(Vec::new()) })
     }
 }
 
@@ -555,14 +566,35 @@ impl StandardCommands {
             .replace(
                 BUILTIN_COMMANDS
                     .iter()
-                    .map(|command| Registration {
-                        spec: command.spec(),
-                        behavior: Arc::new(BuiltinBehavior { id: command.id }),
-                        completion: match command.completion {
-                            Some(CompletionKey::Model) => completions.model.clone(),
-                            Some(CompletionKey::Theme) => completions.theme.clone(),
-                            None => None,
-                        },
+                    .map(|command| {
+                        let spec = command.spec();
+                        let argument_completions = command
+                            .argument_completions
+                            .iter()
+                            .map(|completion| {
+                                completion
+                                    .as_ref()
+                                    .and_then(|completion| match completion.key {
+                                        maki_commands::CompletionKey::Model => {
+                                            completions.model.clone().or_else(|| {
+                                                Some(Arc::new(EmptyCompletion)
+                                                    as Arc<dyn CommandCompletion>)
+                                            })
+                                        }
+                                        maki_commands::CompletionKey::Theme => {
+                                            completions.theme.clone().or_else(|| {
+                                                Some(Arc::new(EmptyCompletion)
+                                                    as Arc<dyn CommandCompletion>)
+                                            })
+                                        }
+                                    })
+                            })
+                            .collect();
+                        Registration {
+                            spec,
+                            behavior: Arc::new(BuiltinBehavior { id: command.id }),
+                            argument_completions,
+                        }
                     })
                     .collect(),
             )
@@ -614,9 +646,9 @@ pub fn register_commands(
                     name: Arc::from(command.display_name()),
                     aliases: Arc::from([]),
                     arguments: if command.has_args() {
-                        ArgumentArity::ANY
+                        maki_commands::CommandArguments::Raw { required: false }
                     } else {
-                        ArgumentArity::NONE
+                        maki_commands::CommandArguments::Positional(Arc::from([]))
                     },
                     docs: maki_commands::CommandDocs {
                         summary: Arc::from(command.description.clone()),
@@ -625,7 +657,7 @@ pub fn register_commands(
                     required_capabilities: Default::default(),
                 },
                 behavior: Arc::new(CustomCommandBehavior { command }),
-                completion: None,
+                argument_completions: Vec::new(),
             })
             .collect(),
     )
