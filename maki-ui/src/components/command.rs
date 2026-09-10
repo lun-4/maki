@@ -19,6 +19,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
 use crate::components::coherent_completion::{Publication, Published};
+use crate::components::file_completion::{
+    CompletionGridItem, CompletionGridState, render_completion_grid,
+};
 use crate::{
     repaint::{Cadence, Dirty},
     theme,
@@ -61,6 +64,7 @@ pub struct CommandPalette {
     command_query: String,
     argument_selected: usize,
     argument_scroll_offset: usize,
+    argument_grid: CompletionGridState,
     filtered: Vec<Match>,
     registry: CommandRegistry,
     target: TargetHandle,
@@ -154,6 +158,7 @@ impl CommandPalette {
             command_query: String::new(),
             argument_selected: 0,
             argument_scroll_offset: 0,
+            argument_grid: CompletionGridState::default(),
             filtered: Vec::new(),
             registry,
             target,
@@ -210,6 +215,15 @@ impl CommandPalette {
         }
         if !self.is_active() {
             return CommandAction::Passthrough;
+        }
+        if self.is_typed_path_grid()
+            && self.argument_grid.handle_key(
+                &key,
+                self.argument_items.len(),
+                self.argument_publication.is_pending(),
+            )
+        {
+            return CommandAction::Consumed;
         }
         match key.code {
             KeyCode::Up => {
@@ -270,7 +284,7 @@ impl CommandPalette {
                 }
                 if let Some((range, item)) = self
                     .argument_range
-                    .zip(self.argument_items.get(self.argument_selected).cloned())
+                    .zip(self.argument_items.get(self.argument_selection()).cloned())
                 {
                     if item.candidate.as_ref().is_some_and(|candidate| {
                         candidate.navigation() == CompletionItemNavigation::Directory
@@ -302,7 +316,7 @@ impl CommandPalette {
                 if self.argument_range.is_some() {
                     let Some((range, item)) = self
                         .argument_range
-                        .zip(self.argument_items.get(self.argument_selected).cloned())
+                        .zip(self.argument_items.get(self.argument_selection()).cloned())
                     else {
                         return CommandAction::Consumed;
                     };
@@ -403,7 +417,38 @@ impl CommandPalette {
 
     #[cfg(test)]
     pub(crate) fn argument_selected_for_test(&self) -> usize {
-        self.argument_selected
+        self.argument_selection()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_typed_path_grid_for_test(&mut self, kind: ArgumentKind, count: usize) {
+        self.typed_argument_owned = true;
+        self.argument_kind = Some(kind);
+        self.argument_range = Some((0, 1));
+        self.argument_items = (0..count)
+            .map(|index| ArgumentMatch {
+                candidate: None,
+                item: CompletionItem {
+                    label: format!("item-{index}").into(),
+                    insertion: format!("item-{index}").into(),
+                    description: None,
+                },
+                indices: Vec::new(),
+                ranking: completion_match(
+                    "",
+                    &format!("item-{index}"),
+                    CompletionMatchOptions {
+                        case_matching: CaseMatching::Ignore,
+                        normalization: Normalization::Smart,
+                    },
+                )
+                .unwrap()
+                .ranking,
+                order: index,
+            })
+            .collect();
+        self.argument_selected = 0;
+        self.argument_grid.reset();
     }
 
     /// Select a specific argument item (test seam; `argument_items` are
@@ -498,6 +543,7 @@ impl CommandPalette {
             .collect();
         self.argument_selected = 0;
         self.argument_scroll_offset = 0;
+        self.argument_grid.reset();
     }
 
     pub fn sync_arguments(&mut self, input: &str, cursor: usize, mode: &str) -> bool {
@@ -572,6 +618,7 @@ impl CommandPalette {
             self.argument_publication.clear();
             self.argument_items.clear();
             self.argument_range = None;
+            self.argument_grid.reset();
             return abandoned;
         };
         let (tx, rx) = flume::bounded(1);
@@ -731,6 +778,7 @@ impl CommandPalette {
         self.argument_range = (!self.argument_items.is_empty()).then_some(range);
         self.argument_selected = 0;
         self.argument_scroll_offset = 0;
+        self.argument_grid.reset();
         let selected_item = self.argument_items.first().map(|item| item.item.clone());
         if selected_item.is_none() {
             *last_highlighted_item = None;
@@ -799,7 +847,6 @@ impl CommandPalette {
             argument_quote_style(input, range),
         );
         let text = self.replace_argument(input, &edit.text);
-        self.reset_argument_state();
         CommandAction::Complete {
             text,
             cursor: edit.cursor,
@@ -810,6 +857,22 @@ impl CommandPalette {
         self.argument_kind.clone()
     }
 
+    fn is_typed_path_grid(&self) -> bool {
+        self.typed_argument_owned
+            && matches!(
+                self.argument_kind,
+                Some(ArgumentKind::File | ArgumentKind::Directory)
+            )
+    }
+
+    fn argument_selection(&self) -> usize {
+        if self.is_typed_path_grid() {
+            self.argument_grid.selected()
+        } else {
+            self.argument_selected
+        }
+    }
+
     fn finish_empty_arguments(&mut self, pending: PendingArguments) {
         if self
             .argument_publication
@@ -818,6 +881,7 @@ impl CommandPalette {
         {
             self.argument_items.clear();
             self.argument_range = None;
+            self.argument_grid.reset();
             self.notify_lifecycle(PaletteLifecycle::Cancel);
         }
     }
@@ -826,11 +890,12 @@ impl CommandPalette {
         let Some(session) = &self.completion_session else {
             return true;
         };
+        let selected = self.argument_selection();
         match event {
             PaletteLifecycle::Highlight => {
                 if let Some(candidate) = self
                     .argument_items
-                    .get(self.argument_selected)
+                    .get(selected)
                     .and_then(|item| item.candidate.as_ref())
                 {
                     let _ = session.highlight(candidate);
@@ -839,7 +904,7 @@ impl CommandPalette {
             PaletteLifecycle::Accept => {
                 if let Some(candidate) = self
                     .argument_items
-                    .get_mut(self.argument_selected)
+                    .get_mut(selected)
                     .and_then(|item| item.candidate.take())
                     && session.accept(candidate).is_err()
                 {
@@ -864,6 +929,7 @@ impl CommandPalette {
         self.argument_publication.clear();
         self.argument_selected = 0;
         self.argument_scroll_offset = 0;
+        self.argument_grid.reset();
     }
 
     pub fn cancel_arguments(&mut self) {
@@ -1317,6 +1383,19 @@ impl CommandPalette {
         if input_area.y == 0 {
             return None;
         }
+        if !self.is_typed_path_grid() {
+            self.argument_selected = self
+                .argument_selected
+                .min(self.argument_items.len().saturating_sub(1));
+        }
+        if self.typed_argument_owned
+            && matches!(
+                self.argument_kind,
+                Some(ArgumentKind::File | ArgumentKind::Directory)
+            )
+        {
+            return self.view_typed_path_arguments(frame, input_area);
+        }
         let visible_rows = argument_visible_rows(
             self.argument_items.len(),
             input_area.y,
@@ -1326,9 +1405,6 @@ impl CommandPalette {
         if visible_rows == 0 {
             return None;
         }
-        self.argument_selected = self
-            .argument_selected
-            .min(self.argument_items.len().saturating_sub(1));
         self.ensure_argument_visible(visible_rows);
         let height = visible_rows as u16;
         let width = self
@@ -1368,6 +1444,24 @@ impl CommandPalette {
             popup,
         );
         Some(popup)
+    }
+
+    fn view_typed_path_arguments(&mut self, frame: &mut Frame, input_area: Rect) -> Option<Rect> {
+        let items: Vec<_> = self
+            .argument_items
+            .iter()
+            .map(|item| CompletionGridItem {
+                label: &item.item.label,
+                description: item.item.description.as_deref(),
+                indices: &item.indices,
+                kind: if matches!(self.argument_kind, Some(ArgumentKind::Directory)) {
+                    "directory"
+                } else {
+                    "file"
+                },
+            })
+            .collect();
+        render_completion_grid(frame, input_area, &items, &mut self.argument_grid)
     }
 
     fn ensure_argument_visible(&mut self, visible_rows: usize) {
@@ -1570,7 +1664,6 @@ mod tests {
         CompletionMatchOptions, Normalization, argument_at_cursor, argument_visible_rows,
         command_args, completion_match,
     };
-
     struct Noop;
 
     struct GatedDirectoryCompletion {
@@ -1711,6 +1804,86 @@ mod tests {
             super::CommandAction::Consumed
         ));
         assert_eq!(input, "/cd old");
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn directory_descent_retains_rows_but_blocks_old_selection() {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(2);
+        let provider = Arc::new(GatedDirectoryCompletion {
+            started: started_tx,
+            release: Arc::new(Mutex::new(release_rx)),
+        });
+        let registry = CommandRegistry::new();
+        let producer = registry.create_producer(ProducerPrecedence::Plugin);
+        producer
+            .replace(vec![Registration {
+                spec: CommandSpec {
+                    name: Arc::from("/cd"),
+                    aliases: Arc::from([]),
+                    arguments: CommandArguments::Positional(Arc::from([
+                        PositionalArgument::optional("path", ArgumentKind::Directory)
+                            .with_completion(CompletionPolicy::Replace),
+                    ])),
+                    docs: CommandDocs {
+                        summary: Arc::from("Change directory"),
+                        argument_hint: None,
+                    },
+                    required_capabilities: TargetCapabilities::default(),
+                },
+                behavior: Arc::new(Noop),
+                completion: None,
+                argument_completions: vec![Some(provider)],
+            }])
+            .unwrap();
+        let target = registry.bind_target(TargetCapabilities::default(), Arc::new(Noop));
+        let mut palette = CommandPalette::new(registry, target);
+        let input = "/cd old";
+        palette.sync_arguments(input, input.len(), "insert");
+        let publisher = started_rx.recv().unwrap();
+        publisher
+            .publish(vec![CompletionItem {
+                label: Arc::from("old/"),
+                insertion: Arc::from("old/"),
+                description: None,
+            }])
+            .unwrap();
+        let _ = palette.poll_arguments();
+        release_tx.send(()).unwrap();
+        while palette.pending_arguments.is_some() {
+            let _ = palette.poll_arguments();
+            std::thread::yield_now();
+        }
+
+        let CommandAction::Complete { text, cursor } =
+            palette.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), input)
+        else {
+            panic!("directory Tab should start descent");
+        };
+        palette.sync_arguments(&text, cursor, "insert");
+        let _child_publisher = started_rx.recv().unwrap();
+
+        assert!(palette.argument_publication.is_pending());
+        assert_eq!(
+            palette
+                .argument_match_items()
+                .into_iter()
+                .map(|item| item.label.to_string())
+                .collect::<Vec<_>>(),
+            vec!["old/"]
+        );
+        assert!(
+            palette
+                .view_in_test(20, 7, DEFAULT_AUTOCOMPLETE_HEIGHT)
+                .is_some()
+        );
+        for key_code in [KeyCode::Tab, KeyCode::Enter] {
+            assert!(matches!(
+                palette.handle_key(KeyEvent::new(key_code, KeyModifiers::NONE), &text),
+                CommandAction::Consumed
+            ));
+        }
         release_tx.send(()).unwrap();
     }
 
@@ -2067,6 +2240,27 @@ mod tests {
         assert_eq!(palette.argument_selected, 0);
     }
 
+    #[test_case(KeyCode::Right, 1; "right")]
+    #[test_case(KeyCode::Down, 4; "down_to_partial_last_row")]
+    #[test_case(KeyCode::Left, 0; "left_clamps")]
+    #[test_case(KeyCode::Up, 0; "up_clamps")]
+    fn typed_path_grid_navigation_matches_shared_at_grid(key: KeyCode, expected: usize) {
+        let mut palette = argument_palette(5);
+        palette.set_typed_path_grid_for_test(ArgumentKind::Directory, 5);
+        palette.argument_grid.set_layout(5, 2, 10);
+        palette
+            .argument_grid
+            .set_selected(if key == KeyCode::Down { 2 } else { 0 });
+        palette.handle_key(KeyEvent::new(key, KeyModifiers::NONE), "/test ");
+        assert_eq!(palette.argument_selection(), expected);
+
+        let mut at_grid = super::super::file_completion::CompletionGridState::default();
+        at_grid.set_layout(5, 2, 10);
+        at_grid.set_selected(if key == KeyCode::Down { 2 } else { 0 });
+        assert!(at_grid.handle_key(&KeyEvent::new(key, KeyModifiers::NONE), 5, false));
+        assert_eq!(palette.argument_selection(), at_grid.selected());
+    }
+
     #[test]
     fn argument_completion_tab_clears_the_popup() {
         let mut palette = argument_palette(3);
@@ -2080,6 +2274,21 @@ mod tests {
         ));
         assert!(palette.argument_items.is_empty());
         assert!(!palette.is_active());
+    }
+
+    #[test]
+    fn typed_path_arguments_reuse_full_width_grid() {
+        let mut palette = argument_palette(3);
+        palette.typed_argument_owned = true;
+        palette.argument_kind = Some(ArgumentKind::Directory);
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        let mut popup = None;
+        terminal
+            .draw(|frame| {
+                popup = palette.view(frame, Rect::new(0, 10, 40, 1), DEFAULT_AUTOCOMPLETE_HEIGHT);
+            })
+            .unwrap();
+        assert_eq!(popup.unwrap().width, 40);
     }
 
     #[test]

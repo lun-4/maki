@@ -7388,6 +7388,60 @@ fn cd_completion_keeps_paths_raw(directory: &str, query: &str) {
     assert_eq!(app.state.session.cwd, path.to_string_lossy());
 }
 
+#[test_case(KeyCode::Right, 1 ; "right")]
+#[test_case(KeyCode::Down, 2 ; "down")]
+#[test_case(KeyCode::Left, 0 ; "left")]
+#[test_case(KeyCode::Up, 0 ; "up")]
+fn completion_grid_arrows_match_for_typed_paths_and_at(
+    key_code: KeyCode,
+    expected_selection: usize,
+) {
+    let mut selections = Vec::new();
+    for input in ["/cd ", "@"] {
+        let (tmp, mut app, _backend) = completion_app();
+        for index in 0..7 {
+            std::fs::create_dir(tmp.path().join(format!("entry-{index}"))).unwrap();
+        }
+        app.update(Msg::Paste(input.into()));
+        converge_completion(&mut app);
+        let deadline = Instant::now() + WALK_TIMEOUT;
+        loop {
+            let _ = app.file_completion.tick();
+            let _ = app.command_palette.poll_arguments();
+            let count = if input.starts_with("/cd") {
+                app.command_palette.argument_match_items().len()
+            } else {
+                app.file_completion.match_items().len()
+            };
+            if count >= 7 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "completion rows did not settle");
+            std::thread::yield_now();
+        }
+        let before = (
+            app.input_box.buffer.value(),
+            app.input_box.buffer.cursor_byte_offset(),
+        );
+        let _ = rendered(&mut app);
+        app.update(Msg::Key(key(key_code)));
+        selections.push(if input.starts_with("/cd") {
+            app.command_palette.argument_selected_for_test()
+        } else {
+            app.file_completion.selected_for_test()
+        });
+        assert_eq!(
+            (
+                app.input_box.buffer.value(),
+                app.input_box.buffer.cursor_byte_offset()
+            ),
+            before,
+            "{key_code:?} must not move the prompt cursor"
+        );
+    }
+    assert_eq!(selections, vec![expected_selection; 2]);
+}
+
 #[test]
 fn cd_completion_tab_descends_and_renders_instead_of_slash_rows() {
     let (tmp, mut app, _backend) = completion_app();

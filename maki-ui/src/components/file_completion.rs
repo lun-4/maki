@@ -36,6 +36,125 @@ const FILE_KIND: &str = "file";
 const DIRECTORY_KIND: &str = "directory";
 const DIRECTORY_SUFFIX: char = std::path::MAIN_SEPARATOR;
 
+pub(crate) struct CompletionGridItem<'a> {
+    pub(crate) label: &'a str,
+    pub(crate) description: Option<&'a str>,
+    pub(crate) indices: &'a [u32],
+    pub(crate) kind: &'a str,
+}
+
+#[derive(Default)]
+pub(crate) struct CompletionGridState {
+    selected: usize,
+    cols: usize,
+    scroll_offset: usize,
+    viewport_height: usize,
+}
+
+impl CompletionGridState {
+    pub(crate) fn selected(&self) -> usize {
+        self.selected
+    }
+
+    pub(crate) fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.selected = 0;
+        self.scroll_offset = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_selected(&mut self, selected: usize) {
+        self.selected = selected;
+    }
+
+    #[cfg(test)]
+    fn set_scroll_offset(&mut self, scroll_offset: usize) {
+        self.scroll_offset = scroll_offset;
+    }
+
+    pub(crate) fn handle_key(&mut self, key: &KeyEvent, item_count: usize, pending: bool) -> bool {
+        let horizontal = matches!(key.code, KeyCode::Left | KeyCode::Right);
+        if !matches!(
+            key.code,
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+        ) || (horizontal && super::menu_navigation_blocked(key))
+        {
+            return false;
+        }
+        if pending || item_count == 0 {
+            return true;
+        }
+        match key.code {
+            KeyCode::Up => self.move_selection(item_count, -1),
+            KeyCode::Down => self.move_selection(item_count, 1),
+            KeyCode::Left => self.move_column(item_count, -1),
+            KeyCode::Right => self.move_column(item_count, 1),
+            _ => unreachable!(),
+        }
+        true
+    }
+
+    pub(crate) fn set_layout(&mut self, item_count: usize, cols: usize, viewport_height: usize) {
+        self.cols = cols.max(1);
+        self.viewport_height = viewport_height;
+        self.selected = self.selected.min(item_count.saturating_sub(1));
+        self.ensure_visible(item_count);
+    }
+
+    fn move_selection(&mut self, item_count: usize, rows: isize) {
+        let cols = self.cols.max(1);
+        let last = item_count - 1;
+        let col = (self.selected % cols).min(last);
+        let last_row = last / cols;
+        let row = ((self.selected / cols) as isize + rows).clamp(0, last_row as isize) as usize;
+        self.selected = (row * cols + col).min(last);
+        self.ensure_visible(item_count);
+    }
+
+    fn move_column(&mut self, item_count: usize, delta: isize) {
+        if self.cols < 2 {
+            return;
+        }
+        let last = item_count - 1;
+        let row = self.selected / self.cols;
+        let col = self.selected % self.cols;
+        let last_col = (last - row * self.cols).min(self.cols - 1);
+        let new_col = (col as isize + delta).clamp(0, last_col as isize) as usize;
+        self.selected = row * self.cols + new_col;
+        self.ensure_visible(item_count);
+    }
+
+    pub(crate) fn clamp_selection(&mut self, item_count: usize) {
+        self.selected = self.selected.min(item_count.saturating_sub(1));
+        self.ensure_visible(item_count);
+    }
+
+    fn ensure_visible(&mut self, item_count: usize) {
+        if item_count == 0 {
+            self.selected = 0;
+            self.scroll_offset = 0;
+            return;
+        }
+        let cols = self.cols.max(1);
+        let total_rows = item_count.div_ceil(cols);
+        let viewport_height = self.viewport_height.max(1);
+        if total_rows > viewport_height {
+            self.scroll_offset = self.scroll_offset.min(total_rows - viewport_height);
+        } else {
+            self.scroll_offset = 0;
+        }
+        let row = self.selected / cols;
+        if row < self.scroll_offset {
+            self.scroll_offset = row;
+        } else if row >= self.scroll_offset + viewport_height {
+            self.scroll_offset = row + 1 - viewport_height;
+        }
+    }
+}
+
 /// Byte range of the `@`-token under the cursor (including its leading `@`),
 /// or `None` when the most recent `@` does not begin a token.
 pub fn at_token_range(line: &str, cursor_chars: usize) -> Option<(usize, usize)> {
@@ -90,13 +209,6 @@ impl CompletionItem {
             .strip_suffix(quote)
             .unwrap_or(&replacement)
             .to_string()
-    }
-
-    fn display(&self) -> String {
-        match &self.description {
-            Some(d) if !d.is_empty() => format!("{}  {}", self.label, d),
-            _ => self.label.clone(),
-        }
     }
 
     fn file(path: String) -> Self {
@@ -254,11 +366,7 @@ struct Session {
     final_match_count: u32,
     truncated: bool,
 
-    selected: usize,
-    /// Grid layout: columns used, and scroll/viewport in whole rows.
-    cols: usize,
-    scroll_offset: usize,
-    viewport_height: usize,
+    grid: CompletionGridState,
 
     started_at: Instant,
 
@@ -581,10 +689,7 @@ impl FileCompletionMenu {
             materialized_count: 0,
             final_match_count: 0,
             truncated: false,
-            selected: 0,
-            cols: 1,
-            scroll_offset: 0,
-            viewport_height: 0,
+            grid: CompletionGridState::default(),
             started_at: Instant::now(),
             walking,
             root,
@@ -618,6 +723,11 @@ impl FileCompletionMenu {
             .as_ref()
             .map(|s| s.matches.iter().map(|c| c.item.clone()).collect())
             .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_for_test(&self) -> usize {
+        self.session.as_ref().map_or(0, |s| s.grid.selected())
     }
 
     pub fn mode(&self) -> Option<CompletionMode> {
@@ -742,8 +852,7 @@ impl FileCompletionMenu {
         }
         session.query = query.to_string();
         if explicit || session.publication.ready() {
-            session.selected = 0;
-            session.scroll_offset = 0;
+            session.grid.reset();
             session.coarse_match_count = 0;
             session.materialized_count = 0;
             session.final_match_count = 0;
@@ -773,7 +882,7 @@ impl FileCompletionMenu {
                         CompletionAction::Passthrough
                     };
                 }
-                return match s.matches.get(s.selected) {
+                return match s.matches.get(s.grid.selected()) {
                     Some(candidate)
                         if candidate.descendable
                             && (s.mode == CompletionMode::Reference
@@ -788,10 +897,9 @@ impl FileCompletionMenu {
                     None => CompletionAction::Passthrough,
                 };
             }
-            KeyCode::Up => move_selection(s, -1),
-            KeyCode::Down => move_selection(s, 1),
-            KeyCode::Left if !super::menu_navigation_blocked(&key) => move_column(s, -1),
-            KeyCode::Right if !super::menu_navigation_blocked(&key) => move_column(s, 1),
+            _ if s
+                .grid
+                .handle_key(&key, s.matches.len(), !s.publication.ready()) => {}
             _ => return CompletionAction::Passthrough,
         }
         CompletionAction::Consumed
@@ -869,8 +977,7 @@ impl FileCompletionMenu {
                 if let Some(ref_matches) = s.pending_ref_matches.take() {
                     s.ref_matches = ref_matches;
                 }
-                s.selected = 0;
-                s.scroll_offset = 0;
+                s.grid.reset();
             }
             if publication != Publication::Wait || refresh_finished {
                 rebuild_combined(s);
@@ -893,62 +1000,17 @@ impl FileCompletionMenu {
             _ => return None,
         };
 
-        let len = s.matches.len();
-        // Cap taken from the screen height: the popup is a compact overlay, not
-        // a full-height list.
-        let max_height = ((frame.area().height as u32 * 30 / 100) as u16).max(2);
-        let avail = max_height.saturating_sub(1) as usize;
-        if avail == 0 || input_area.y == 0 {
-            return None;
-        }
-
-        let cols = if len <= avail {
-            1
-        } else if len <= avail.saturating_mul(2) {
-            2
-        } else {
-            len.min(3)
-        };
-        s.cols = cols;
-        let total_rows = len.div_ceil(cols);
-        let view_rows = avail.min(total_rows);
-        s.viewport_height = view_rows;
-        ensure_visible(s);
-
-        let budget = (input_area.width as usize).saturating_sub(COL_GAP * (cols - 1)) / cols;
-        let col_widths: Vec<usize> = (0..cols)
-            .map(|j| {
-                s.matches
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| i % cols == j)
-                    .map(|(_, c)| c.item.display().chars().count())
-                    .max()
-                    .unwrap_or(0)
-                    .min(budget)
+        let items: Vec<_> = s
+            .matches
+            .iter()
+            .map(|candidate| CompletionGridItem {
+                label: &candidate.item.label,
+                description: candidate.item.description.as_deref(),
+                indices: &candidate.matching.indices,
+                kind: &candidate.item.kind,
             })
             .collect();
-        let total_width = col_widths.iter().sum::<usize>() + COL_GAP * (cols - 1);
-        let popup_height = (view_rows as u16 + 1).min(max_height);
-        let popup = Rect {
-            x: input_area.x,
-            y: input_area.y.saturating_sub(popup_height),
-            width: total_width.clamp(1, input_area.width.max(1) as usize) as u16,
-            height: popup_height,
-        };
-
-        let t = theme::current();
-        let lines = build_grid(s, view_rows, cols, &col_widths, &t);
-
-        frame.render_widget(Clear, popup);
-        let block = Block::default()
-            .borders(Borders::TOP)
-            .style(Style::new().bg(t.background));
-        let inner = block.inner(popup);
-        frame.render_widget(block, popup);
-        frame.render_widget(Paragraph::new(lines), inner);
-
-        Some(popup)
+        render_completion_grid(frame, input_area, &items, &mut s.grid)
     }
 }
 
@@ -1172,85 +1234,111 @@ fn highlight_indices(label: &str, query: &str) -> Option<Vec<u32>> {
     completion_match_default(query, label).map(|matching| matching.indices)
 }
 
-fn move_selection(s: &mut Session, rows: isize) {
-    if s.matches.is_empty() {
-        return;
-    }
-    let cols = s.cols.max(1);
-    let last = s.matches.len() - 1;
-    let col = (s.selected % cols).min(last);
-    let last_row = last / cols;
-    let row = ((s.selected / cols) as isize + rows).clamp(0, last_row as isize) as usize;
-    s.selected = (row * cols + col).min(last);
-    ensure_visible(s);
-}
-
-/// Moves one column left or right within the same grid row, clamped at the
-/// row's boundaries. The final row may hold fewer than `cols` items.
-fn move_column(s: &mut Session, delta: isize) {
-    if s.matches.is_empty() || s.cols < 2 {
-        return;
-    }
-    let cols = s.cols;
-    let last = s.matches.len() - 1;
-    let row = s.selected / cols;
-    let col = s.selected % cols;
-    let last_col = (last - row * cols).min(cols - 1);
-    let new_col = (col as isize + delta).clamp(0, last_col as isize) as usize;
-    s.selected = row * cols + new_col;
-    ensure_visible(s);
-}
-
 fn clamp_selection(s: &mut Session) {
-    if s.matches.is_empty() {
-        s.selected = 0;
-        s.scroll_offset = 0;
-    } else {
-        s.selected = s.selected.min(s.matches.len() - 1);
-        ensure_visible(s);
-    }
+    s.grid.clamp_selection(s.matches.len());
 }
 
-fn ensure_visible(s: &mut Session) {
-    let cols = s.cols.max(1);
-    let total_rows = s.matches.len().div_ceil(cols);
-    let vh = s.viewport_height.max(1);
+pub(crate) fn render_completion_grid(
+    frame: &mut Frame,
+    input_area: Rect,
+    items: &[CompletionGridItem<'_>],
+    grid: &mut CompletionGridState,
+) -> Option<Rect> {
+    if items.is_empty() || input_area.y == 0 {
+        return None;
+    }
 
-    if total_rows > vh {
-        s.scroll_offset = s.scroll_offset.min(total_rows - vh);
+    let max_height = ((frame.area().height as u32 * 30 / 100) as u16).max(2);
+    let avail = max_height.saturating_sub(1) as usize;
+    if avail == 0 {
+        return None;
+    }
+
+    let len = items.len();
+    let cols = if len <= avail {
+        1
+    } else if len <= avail.saturating_mul(2) {
+        2
     } else {
-        s.scroll_offset = 0;
-    }
+        len.min(3)
+    };
+    let total_rows = len.div_ceil(cols);
+    let view_rows = avail.min(total_rows);
+    grid.set_layout(len, cols, view_rows);
+    let selected = grid.selected();
 
-    let row = s.selected / cols;
-    if row < s.scroll_offset {
-        s.scroll_offset = row;
-    } else if row >= s.scroll_offset + vh {
-        s.scroll_offset = row + 1 - vh;
-    }
+    let budget = (input_area.width as usize).saturating_sub(COL_GAP * (cols - 1)) / cols;
+    let col_widths: Vec<usize> = (0..cols)
+        .map(|column| {
+            items
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| index % cols == column)
+                .map(|(_, item)| completion_item_width(item))
+                .max()
+                .unwrap_or(0)
+                .min(budget)
+        })
+        .collect();
+    let popup_height = (view_rows as u16 + 1).min(max_height);
+    let popup = Rect {
+        x: input_area.x,
+        y: input_area.y.saturating_sub(popup_height),
+        width: input_area.width.max(1),
+        height: popup_height,
+    };
+
+    let t = theme::current();
+    let lines = build_grid(
+        items,
+        view_rows,
+        cols,
+        &col_widths,
+        grid.scroll_offset(),
+        selected,
+        &t,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .style(Style::new().bg(t.background));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    Some(popup)
+}
+
+fn completion_item_width(item: &CompletionGridItem<'_>) -> usize {
+    item.label.chars().count()
+        + item
+            .description
+            .filter(|description| !description.is_empty())
+            .map_or(0, |description| description.chars().count() + 2)
 }
 
 fn build_grid<'a>(
-    s: &Session,
+    items: &[CompletionGridItem<'_>],
     view_rows: usize,
     cols: usize,
     col_widths: &[usize],
+    scroll_offset: usize,
+    selected: usize,
     t: &'a theme::Theme,
 ) -> Vec<Line<'a>> {
-    let len = s.matches.len();
     let mut lines = Vec::with_capacity(view_rows);
 
-    for r in 0..view_rows {
-        let row = s.scroll_offset + r;
+    for row_offset in 0..view_rows {
+        let row = scroll_offset + row_offset;
         let mut spans = Vec::new();
-        for (j, width) in col_widths.iter().enumerate() {
-            let idx = row * cols + j;
-            if idx < len {
-                spans.extend(cell_line(&s.matches[idx], *width, idx == s.selected, t).spans);
+        for (column, width) in col_widths.iter().enumerate() {
+            let index = row * cols + column;
+            if let Some(item) = items.get(index) {
+                spans.extend(cell_line(item, *width, index == selected, t).spans);
             } else {
                 spans.push(Span::raw(" ".repeat(*width)));
             }
-            if j + 1 < cols {
+            if column + 1 < cols {
                 spans.push(Span::raw(" ".repeat(COL_GAP)));
             }
         }
@@ -1259,13 +1347,14 @@ fn build_grid<'a>(
     lines
 }
 
-fn cell_line<'a>(c: &Candidate, width: usize, selected: bool, t: &'a theme::Theme) -> Line<'a> {
+fn cell_line<'a>(
+    item: &CompletionGridItem<'_>,
+    width: usize,
+    selected: bool,
+    t: &'a theme::Theme,
+) -> Line<'a> {
     let base = if selected { t.item_selected } else { t.item };
-    let kind_style = t
-        .completion_kinds
-        .get(&c.item.kind)
-        .copied()
-        .unwrap_or(base);
+    let kind_style = t.completion_kinds.get(item.kind).copied().unwrap_or(base);
     // Matched characters keep the kind foreground but also carry the
     // selection background, so the highlight is not cut out of the selected
     // row.
@@ -1277,19 +1366,24 @@ fn cell_line<'a>(c: &Candidate, width: usize, selected: bool, t: &'a theme::Them
     } else {
         kind_style
     };
-    let text = c.item.display();
+    let text = match item.description {
+        Some(description) if !description.is_empty() => {
+            format!("{}  {}", item.label, description)
+        }
+        _ => item.label.to_owned(),
+    };
     let mut spans: Vec<Span<'a>> = Vec::new();
     let mut used = 0usize;
     let mut in_match = false;
     let mut run = String::new();
 
-    for (i, ch) in text.chars().enumerate() {
+    for (index, ch) in text.chars().enumerate() {
         let cw = ch.width().unwrap_or(0);
         if used + cw > width {
             break;
         }
         used += cw;
-        let is_match = c.matching.indices.binary_search(&(i as u32)).is_ok();
+        let is_match = item.indices.binary_search(&(index as u32)).is_ok();
         if is_match != in_match && !run.is_empty() {
             spans.push(Span::styled(
                 mem::take(&mut run),
@@ -1404,10 +1498,7 @@ mod tests {
             materialized_count: 0,
             final_match_count: 0,
             truncated: false,
-            selected: 0,
-            cols: 1,
-            scroll_offset: 0,
-            viewport_height: 0,
+            grid: CompletionGridState::default(),
             started_at: Instant::now(),
             walking: true,
             root: PathBuf::new(),
@@ -2202,33 +2293,50 @@ mod tests {
         menu
     }
 
-    #[test_case(0, -5, 0    ; "clamps_at_start")]
-    #[test_case(4, 5, 4     ; "clamps_at_end")]
-    #[test_case(2, 1, 3     ; "moves_down")]
-    #[test_case(2, -1, 1    ; "moves_up")]
-    fn move_selection_behavior(start: usize, delta: isize, expected: usize) {
-        let mut menu = menu_with_matches(5);
-        let s = menu.session.as_mut().unwrap();
-        s.viewport_height = 10;
-        s.selected = start;
-        move_selection(s, delta);
-        assert_eq!(s.selected, expected);
+    #[test_case(0, KeyCode::Up, 0     ; "up_clamps_at_start")]
+    #[test_case(4, KeyCode::Down, 4   ; "down_clamps_at_end")]
+    #[test_case(2, KeyCode::Down, 3   ; "moves_down")]
+    #[test_case(2, KeyCode::Up, 1     ; "moves_up")]
+    fn grid_vertical_behavior(start: usize, key_code: KeyCode, expected: usize) {
+        let mut grid = CompletionGridState::default();
+        grid.set_layout(5, 1, 10);
+        grid.set_selected(start);
+        assert!(grid.handle_key(&key(key_code), 5, false));
+        assert_eq!(grid.selected(), expected);
     }
 
-    #[test_case(1, -1, 0   ; "left_steps_to_prev_column")]
-    #[test_case(0, -1, 0   ; "left_clamps_at_first_column")]
-    #[test_case(0, 1, 1    ; "right_steps_to_next_column")]
-    #[test_case(1, 1, 1    ; "right_clamps_at_row_end")]
-    #[test_case(4, 1, 4    ; "partial_last_row_clamps")]
-    fn move_column_behavior(start: usize, delta: isize, expected: usize) {
+    #[test_case(1, KeyCode::Left, 0   ; "left_steps_to_prev_column")]
+    #[test_case(0, KeyCode::Left, 0   ; "left_clamps_at_first_column")]
+    #[test_case(0, KeyCode::Right, 1  ; "right_steps_to_next_column")]
+    #[test_case(1, KeyCode::Right, 1  ; "right_clamps_at_row_end")]
+    #[test_case(4, KeyCode::Right, 4  ; "partial_last_row_clamps")]
+    fn grid_horizontal_behavior(start: usize, key_code: KeyCode, expected: usize) {
         // 5 items in 2 columns: row 0 = 0,1; row 1 = 2,3; row 2 = 4.
-        let mut menu = menu_with_matches(5);
-        let s = menu.session.as_mut().unwrap();
-        s.cols = 2;
-        s.viewport_height = 10;
-        s.selected = start;
-        move_column(s, delta);
-        assert_eq!(s.selected, expected);
+        let mut grid = CompletionGridState::default();
+        grid.set_layout(5, 2, 10);
+        grid.set_selected(start);
+        assert!(grid.handle_key(&key(key_code), 5, false));
+        assert_eq!(grid.selected(), expected);
+    }
+
+    #[test_case(0, KeyCode::Down, 2, 0, 0 ; "down_one_row")]
+    #[test_case(2, KeyCode::Down, 4, 1, 0 ; "down_scrolls")]
+    #[test_case(6, KeyCode::Down, 6, 2, 0 ; "down_clamps_last_row")]
+    #[test_case(4, KeyCode::Up, 2, 1, 1 ; "up_keeps_viewport")]
+    fn grid_navigation_updates_selection_and_scroll(
+        start: usize,
+        key_code: KeyCode,
+        expected_selection: usize,
+        expected_scroll: usize,
+        initial_scroll: usize,
+    ) {
+        let mut grid = CompletionGridState::default();
+        grid.set_layout(7, 2, 2);
+        grid.set_selected(start);
+        grid.set_scroll_offset(initial_scroll);
+        assert!(grid.handle_key(&key(key_code), 7, false));
+        assert_eq!(grid.selected(), expected_selection);
+        assert_eq!(grid.scroll_offset(), expected_scroll);
     }
 
     #[test]
@@ -2236,23 +2344,23 @@ mod tests {
         let mut menu = menu_with_matches(5);
         let s = menu.session.as_mut().unwrap();
         s.visible = true;
-        s.cols = 2;
+        s.grid.set_layout(s.matches.len(), 2, 10);
         assert!(matches!(
             menu.handle_key(key(KeyCode::Right)),
             CompletionAction::Consumed
         ));
-        assert_eq!(menu.session.as_ref().unwrap().selected, 1);
+        assert_eq!(menu.session.as_ref().unwrap().grid.selected(), 1);
         // Row 0 is full (0,1); a further Right clamps in place.
         assert!(matches!(
             menu.handle_key(key(KeyCode::Right)),
             CompletionAction::Consumed
         ));
-        assert_eq!(menu.session.as_ref().unwrap().selected, 1);
+        assert_eq!(menu.session.as_ref().unwrap().grid.selected(), 1);
         assert!(matches!(
             menu.handle_key(key(KeyCode::Left)),
             CompletionAction::Consumed
         ));
-        assert_eq!(menu.session.as_ref().unwrap().selected, 0);
+        assert_eq!(menu.session.as_ref().unwrap().grid.selected(), 0);
     }
 
     #[test]
@@ -2266,7 +2374,7 @@ mod tests {
             let mut menu = menu_with_matches(5);
             let s = menu.session.as_mut().unwrap();
             s.visible = true;
-            s.cols = 2;
+            s.grid.set_layout(s.matches.len(), 2, 10);
             for code in [KeyCode::Left, KeyCode::Right] {
                 assert!(
                     matches!(
@@ -2275,7 +2383,7 @@ mod tests {
                     ),
                     "{mods:?}+{code:?} should reach the prompt buffer"
                 );
-                assert_eq!(menu.session.as_ref().unwrap().selected, 0);
+                assert_eq!(menu.session.as_ref().unwrap().grid.selected(), 0);
             }
         }
     }
@@ -2308,12 +2416,12 @@ mod tests {
             menu.handle_key(key(KeyCode::Char('a'))),
             CompletionAction::Passthrough
         ));
-        let sel = menu.session.as_ref().unwrap().selected;
+        let sel = menu.session.as_ref().unwrap().grid.selected();
         assert!(matches!(
             menu.handle_key(key(KeyCode::Down)),
             CompletionAction::Consumed
         ));
-        assert_eq!(menu.session.as_ref().unwrap().selected, sel + 1);
+        assert_eq!(menu.session.as_ref().unwrap().grid.selected(), sel + 1);
     }
 
     #[test]
@@ -2353,7 +2461,13 @@ mod tests {
         let t = theme::InMemoryThemesProvider::bundled()
             .load("makima")
             .unwrap();
-        let line = cell_line(&c, 40, true, &t);
+        let item = CompletionGridItem {
+            label: &c.item.label,
+            description: c.item.description.as_deref(),
+            indices: &c.matching.indices,
+            kind: &c.item.kind,
+        };
+        let line = cell_line(&item, 40, true, &t);
         let kind = t.completion_kinds.get("skill").copied().unwrap_or(t.item);
         let expected_match = Style {
             bg: t.item_selected.bg,
@@ -2799,7 +2913,7 @@ mod tests {
             |menu| menu.session.as_ref().unwrap().file_matches.len() == 2,
             "initial directory matcher did not settle",
         );
-        menu.session.as_mut().unwrap().selected = 1;
+        menu.session.as_mut().unwrap().grid.set_selected(1);
         menu.sync_query("alpha");
         assert!(menu.session.as_ref().unwrap().query_refresh_pending);
         assert_eq!(labels(&menu), vec!["alpha/", "beta/"]);
@@ -2814,7 +2928,7 @@ mod tests {
             |menu| !menu.session.as_ref().unwrap().query_refresh_pending,
             "filtered directory matcher did not settle",
         );
-        assert_eq!(menu.session.as_ref().unwrap().selected, 0);
+        assert_eq!(menu.session.as_ref().unwrap().grid.selected(), 0);
         assert_eq!(labels(&menu), vec!["alpha/"]);
         let selected = match menu.handle_key(key(code)) {
             CompletionAction::Select(item) | CompletionAction::Advance(item) => item,
@@ -2862,7 +2976,7 @@ mod tests {
                 columns[0] = Utf32String::from("needle-file");
             });
         session.walking = false;
-        session.selected = 99;
+        session.grid.set_selected(99);
         project_nucleo_mut(session).tick(0);
         menu.sync_query("needle");
         wait_for_matcher(
@@ -2870,7 +2984,7 @@ mod tests {
             |menu| menu.session.as_ref().unwrap().publication.ready(),
             "file matcher did not settle",
         );
-        assert_eq!(menu.session.as_ref().unwrap().selected, 0);
+        assert_eq!(menu.session.as_ref().unwrap().grid.selected(), 0);
     }
 
     #[test]
@@ -2941,15 +3055,15 @@ mod tests {
         let before_rect = rendered_rect.get();
         {
             let session = menu.session.as_mut().unwrap();
-            session.selected = 2;
-            session.scroll_offset = 1;
+            session.grid.set_selected(2);
+            session.grid.set_scroll_offset(1);
         }
 
         menu.sync_query("gamma");
         let session = menu.session.as_ref().unwrap();
         assert!(session.publication.pending());
-        assert_eq!(session.selected, 2);
-        assert_eq!(session.scroll_offset, 1);
+        assert_eq!(session.grid.selected(), 2);
+        assert_eq!(session.grid.scroll_offset(), 1);
         assert_eq!(labels(&menu), before);
         terminal
             .draw(|frame| rendered_rect.set(menu.view(frame, input_area).unwrap()))
@@ -2972,8 +3086,8 @@ mod tests {
         );
         assert_eq!(labels(&menu), vec!["gamma-file", "gamma-file-plugin"]);
         let session = menu.session.as_ref().unwrap();
-        assert_eq!(session.selected, 0);
-        assert_eq!(session.scroll_offset, 0);
+        assert_eq!(session.grid.selected(), 0);
+        assert_eq!(session.grid.scroll_offset(), 0);
     }
 
     #[test]
@@ -3034,7 +3148,7 @@ mod tests {
     }
 
     #[test]
-    fn view_popup_above_input_area() {
+    fn view_grid_uses_full_input_width() {
         let mut menu = menu_with_matches(3);
         let s = menu.session.as_mut().unwrap();
         s.visible = true;
@@ -3052,6 +3166,7 @@ mod tests {
             .draw(|frame| {
                 let rect = menu.view(frame, input_area).unwrap();
                 assert_eq!(rect.y, 10 - rect.height);
+                assert_eq!(rect.width, input_area.width);
             })
             .unwrap();
     }
