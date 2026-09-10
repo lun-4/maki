@@ -25,8 +25,8 @@ pub struct StaticPositionalArgument {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaticCommandArguments {
-    Legacy(crate::spec::ArgumentArity),
     Positional(&'static [StaticPositionalArgument]),
+    Raw { required: bool },
 }
 
 impl StaticPositionalArgument {
@@ -190,36 +190,30 @@ impl PositionalArgument {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandArguments {
-    Legacy(crate::spec::ArgumentArity),
     Positional(Arc<[PositionalArgument]>),
+    Raw { required: bool },
 }
 
 impl CommandArguments {
-    pub fn arity(&self) -> crate::spec::ArgumentArity {
-        match self {
-            Self::Legacy(arity) => *arity,
-            Self::Positional(arguments) => {
-                let mut min = 0;
-                let mut max = Some(0usize);
-                for argument in arguments.iter() {
-                    if !argument.optional {
-                        min += 1;
-                    }
-                    max = if argument.variadic {
-                        None
-                    } else {
-                        max.map(|value| value + 1)
-                    };
-                }
-                crate::spec::ArgumentArity { min, max }
-            }
-        }
-    }
-
     pub fn positional(&self) -> Option<&[PositionalArgument]> {
         match self {
             Self::Positional(arguments) => Some(arguments),
-            Self::Legacy(_) => None,
+            Self::Raw { .. } => None,
+        }
+    }
+
+    pub fn parse_invocation(
+        &self,
+        input: &str,
+    ) -> Result<Option<ParsedArguments>, ArgumentParseError> {
+        match self {
+            Self::Positional(schema) => parse_positional(input, Arc::clone(schema)).map(Some),
+            Self::Raw { required } => {
+                if *required && input.trim().is_empty() {
+                    return Err(ArgumentParseError::MissingRaw);
+                }
+                Ok(None)
+            }
         }
     }
 
@@ -251,10 +245,6 @@ impl CommandArguments {
             }
         }
         Some(Arc::from(hint))
-    }
-
-    pub fn accepts(&self, count: usize) -> bool {
-        self.arity().accepts(count)
     }
 }
 
@@ -464,11 +454,29 @@ pub enum ArgumentParseError {
     },
     #[error("expected {expected} arguments, got {actual}")]
     Count {
-        expected: crate::spec::ArgumentArity,
+        expected: CountExpectation,
         actual: usize,
     },
+    #[error("raw arguments are required")]
+    MissingRaw,
     #[error("{0}")]
     Lex(#[from] LexError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CountExpectation {
+    pub min: usize,
+    pub max: Option<usize>,
+}
+
+impl fmt::Display for CountExpectation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.max {
+            Some(max) if max == self.min => write!(formatter, "{}", self.min),
+            Some(max) => write!(formatter, "{}..={max}", self.min),
+            None => write!(formatter, "{} or more", self.min),
+        }
+    }
 }
 
 pub fn parse_completion_prefix(
@@ -552,7 +560,7 @@ pub fn parse_positional(
         };
         if count == 0 && !argument.optional {
             return Err(ArgumentParseError::Count {
-                expected: CommandArguments::Positional(Arc::clone(&schema)).arity(),
+                expected: positional_count_expectation(&schema),
                 actual: tokens.len(),
             });
         }
@@ -592,11 +600,27 @@ pub fn parse_positional(
     }
     if token_index != tokens.len() {
         return Err(ArgumentParseError::Count {
-            expected: CommandArguments::Positional(Arc::clone(&schema)).arity(),
+            expected: positional_count_expectation(&schema),
             actual: tokens.len(),
         });
     }
     Ok(ParsedArguments::new(tokens, arguments))
+}
+
+fn positional_count_expectation(schema: &[PositionalArgument]) -> CountExpectation {
+    let mut min = 0;
+    let mut max = Some(0usize);
+    for argument in schema {
+        if !argument.optional {
+            min += 1;
+        }
+        max = if argument.variadic {
+            None
+        } else {
+            max.map(|value| value + 1)
+        };
+    }
+    CountExpectation { min, max }
 }
 
 fn parse_value(
@@ -753,6 +777,19 @@ mod tests {
             Arc::from([PositionalArgument::required("n", ArgumentKind::Integer)]);
         assert!(parse_positional("9007199254740991", schema.clone()).is_ok());
         assert!(parse_positional("9007199254740992", schema).is_err());
+    }
+
+    #[test]
+    fn raw_invocation_checks_trimmed_presence() {
+        let required = CommandArguments::Raw { required: true };
+        assert!(matches!(
+            required.parse_invocation(" \t\n"),
+            Err(ArgumentParseError::MissingRaw)
+        ));
+        assert_eq!(required.parse_invocation("  hello  ").unwrap(), None);
+
+        let optional = CommandArguments::Raw { required: false };
+        assert_eq!(optional.parse_invocation(" \t\n").unwrap(), None);
     }
 
     #[test]

@@ -3,13 +3,13 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::arguments::{ArgumentParseError, CommandArguments, ParsedArguments, parse_positional};
+use crate::arguments::{ArgumentParseError, ParsedArguments};
 use crate::completion::CommandCompletion;
 use crate::registry::{
     CommandRegistry, RegistrationRecord, TargetHandle, normalize, target_record,
 };
 use crate::spec::{
-    ArgumentArity, BuiltinOperation, CommandFuture, CommandId, CommandSpec, HostContextRequest,
+    BuiltinOperation, CommandFuture, CommandId, CommandSpec, HostContextRequest,
     HostContextResponse, InvocationTargetId, MAX_COMMAND_DEPTH, ProducerId, RegistryId,
     TargetCapabilities, TargetCapability,
 };
@@ -152,28 +152,13 @@ impl CommandRegistry {
                     &command.spec().name,
                 )));
             }
-            let parsed_arguments = match &command.spec().arguments {
-                CommandArguments::Legacy(arity) => {
-                    let count = arguments.split_whitespace().count();
-                    if !arity.accepts(count) {
-                        return CommandOutcome::Failed(CommandError::InvalidArguments {
-                            command: Arc::clone(&command.spec().name),
-                            expected: *arity,
-                            actual: count,
-                        });
-                    }
-                    None
-                }
-                CommandArguments::Positional(schema) => {
-                    match parse_positional(&arguments, Arc::clone(schema)) {
-                        Ok(parsed) => Some(parsed),
-                        Err(error) => {
-                            return CommandOutcome::Failed(CommandError::TypedArguments {
-                                command: Arc::clone(&command.spec().name),
-                                error,
-                            });
-                        }
-                    }
+            let parsed_arguments = match command.spec().arguments.parse_invocation(&arguments) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return CommandOutcome::Failed(CommandError::TypedArguments {
+                        command: Arc::clone(&command.spec().name),
+                        error,
+                    });
                 }
             };
             let invocation = CommandInvocation {
@@ -266,10 +251,6 @@ impl ResolvedCommand {
 
     pub fn behavior(&self) -> Arc<dyn CommandBehavior> {
         Arc::clone(&self.record.registration.behavior)
-    }
-
-    pub fn completion(&self) -> Option<Arc<dyn CommandCompletion>> {
-        self.record.registration.completion.clone()
     }
 
     pub fn argument_completions(&self) -> Vec<Option<Arc<dyn CommandCompletion>>> {
@@ -432,8 +413,6 @@ pub enum RegistrationError {
     InvalidName(Arc<str>),
     #[error("command alias is invalid: {0}")]
     InvalidAlias(Arc<str>),
-    #[error("command argument arity is invalid")]
-    InvalidArgumentArity { min: usize, max: usize },
     #[error("invalid positional argument schema: {0}")]
     InvalidArgumentSchema(Arc<str>),
     #[error("optional positional argument precedes required argument: {0}")]
@@ -458,12 +437,6 @@ pub enum ResolutionError {
 pub enum CommandError {
     #[error("unknown command {0}")]
     UnknownCommand(Arc<str>),
-    #[error("invalid arguments for {command}: expected {expected}")]
-    InvalidArguments {
-        command: Arc<str>,
-        expected: ArgumentArity,
-        actual: usize,
-    },
     #[error("invalid typed arguments for {command}: {error}")]
     TypedArguments {
         command: Arc<str>,
@@ -479,14 +452,4 @@ pub enum CommandError {
     MaximumDepth,
     #[error("command failed: {0}")]
     Producer(Arc<str>),
-}
-
-impl fmt::Display for ArgumentArity {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.max {
-            Some(max) if max == self.min => write!(formatter, "{}", self.min),
-            Some(max) => write!(formatter, "{}..={max}", self.min),
-            None => write!(formatter, "{} or more", self.min),
-        }
-    }
 }

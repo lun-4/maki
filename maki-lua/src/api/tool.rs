@@ -21,7 +21,7 @@ use maki_agent::{
     TextOutput, ToolOutput,
 };
 use maki_commands::{
-    ArgumentArity, ArgumentKind, CommandContent, CommandError, CommandOutcome, CompletionPolicy,
+    ArgumentKind, CommandArguments, CommandContent, CommandError, CommandOutcome, CompletionPolicy,
     InputDispatch, PositionalArgument,
 };
 use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
@@ -51,7 +51,6 @@ const TOOL_NAME_MAX: usize = 64;
 const TOOL_HANDLER_RETURN_ERR: &str =
     "tool handler must return string or {output=string, is_error?=bool}";
 const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
-const NARGS_ERR: &str = r#"register_command: 'nargs' must be 0, 1, "?", "*", or "+""#;
 const TUI_ONLY_ERR: &str = "register_command: 'tui_only' must be a boolean";
 const ARGUMENT_HINT_ERR: &str = "register_command: 'argument_hint' must be a string";
 const ARGUMENTS_ERR: &str = "register_command: 'arguments' must be an array of argument tables";
@@ -61,13 +60,7 @@ const ARGUMENT_TYPE_ERR: &str =
 const ARGUMENT_ENUM_ERR: &str =
     "register_command: enum argument 'choices' must be a non-empty array of strings";
 const ARGUMENT_OPTIONAL_ERR: &str = "register_command: argument 'optional' must be a boolean";
-const ARGUMENT_COMPLETIONS_ERR: &str =
-    "register_command: argument completions must be a dense positional array";
-const ARGUMENT_COMPLETIONS_CONFLICT_ERR: &str =
-    "register_command: use either descriptor completions or argument_completion, not both";
 const ARGUMENT_VARIADIC_ERR: &str = "register_command: argument 'variadic' must be a boolean";
-const ARGUMENTS_NARGS_ERR: &str =
-    "register_command: 'arguments' and 'nargs' cannot be used together";
 const PERMISSION_RULE_KEYS: &[&str] = &["tool", "scope", "effect"];
 const MAX_HINT_CONTENT_SIZE: usize = 1024 * 1024;
 const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -836,9 +829,8 @@ fn register_permission_rule(
 ///                            An optional variadic consumes zero or more values.
 ///                            Optional descriptors follow required descriptors.
 ///                            A variadic descriptor is last and consumes the
-///                            remaining values. Typed arguments cannot be used
-///                            with `nargs` or command-wide `completion`.
-///                            Typed input uses one quote-aware grammar. Unicode
+///                            remaining values. Typed input uses one quote-aware
+///                            grammar. Unicode
 ///                            whitespace separates tokens outside quotes. Single
 ///                            and double quotes group text, adjacent quoted and
 ///                            unquoted fragments concatenate, and empty quotes
@@ -852,13 +844,9 @@ fn register_permission_rule(
 ///                            quotes, newlines inside quotes, and decoded values
 ///                            remain significant. Newlines separate tokens only
 ///                            outside quotes.
-///   nargs       (integer|string) Optional. How many untyped arguments the
-///                          command takes, spelled like nvim's nargs: 0 (default),
-///                          1, "?" (zero or one), "*" (zero or more), or "+"
-///                          (one or more). Legacy arguments use whitespace-
-///                          separated words and retain legacy handler fields.
-///                          Invalid legacy counts leave the input as ordinary
-///                          model text.
+///   arguments   (table)    Use `{ raw = true }` for an unparsed argument
+///                          remainder. Add `required = true` to reject empty
+///                          input. Raw handlers receive `opts.args` only.
 ///   handler     (function) Required. Called with one opts table after the
 ///                          command arguments pass validation. `opts.args` is
 ///                          the outer-trimmed original argument remainder. It
@@ -871,61 +859,22 @@ fn register_permission_rule(
 ///                          empty array. A variadic value is always an array.
 ///                          File and directory values retain their decoded,
 ///                          non-empty, NUL-free spelling and are not expanded
-///                          or checked for existence by type validation. For
-///                          legacy commands, `opts.fargs` remains the existing
-///                          whitespace-split list and `opts.values` is absent.
+///                          or checked for existence by type validation. Raw
+///                          commands do not set `opts.fargs` or `opts.values`.
 ///                          Typed integers are signed decimal values with no
 ///                          separators or alternate bases. The inclusive exact
 ///                          range is `-9007199254740991` to
 ///                          `9007199254740991`.
-///   completion  (table)    Optional for legacy commands. Use `items = {...}`
-///                          for a static list or `get_items = function(ctx) ->
-///                          {...}` for dynamic candidates. Typed commands use
-///                          per-argument providers instead.
-///                            A typed descriptor omits `completion` for the
-///                            `default` policy. Defaults are enum choices in
-///                            the core and file or directory discovery in the
-///                            TUI. String and integer defaults are empty.
-///                            Set `completion = false` or
-///                            `completion = "disabled"` to disable completion.
-///                            Set `completion = "replace"` or provide a table
-///                            with `mode = "replace"` to use only the custom
-///                            provider. Set `completion = "extend"` or
-///                            `mode = "extend"` to combine defaults and custom
-///                            candidates. Custom candidates replace duplicate
-///                            default insertions. A provider table contains
-///                            exactly one of `items` and `get_items`.
-///                            Each candidate has `label`, decoded `insertion`,
-///                            optional `description`, and optional
-///                            `navigation = "directory"`. Providers return
-///                            values without command-line quotes. The command
-///                            UI encodes values with balanced quotes when it
-///                            inserts them. The compatibility
-///                            `argument_completion` array may provide the
-///                            per-argument tables.
-///                            The callback context retains `command`, `args`,
-///                            `arg`, `index`, `mode`, `session`, and
-///                            `generation`. `args` is the argument remainder,
-///                            not the full slash input. Typed contexts add
-///                            `argument`, `type`, and `values`. `index` is
-///                            zero-based. `values` contains successfully parsed
-///                            preceding values, with variadic values as arrays.
-///                            `on_highlight(ctx, item)`,
-///                            `on_accept(ctx, item)`, and `on_cancel(ctx)` are
-///                            lifecycle callbacks for the provider that owns
-///                            the candidate. Highlight and accept callbacks
-///                            never run for another provider's candidate.
-///                            Session cancellation calls `on_cancel` once for
-///                            each participating provider that has not
-///                            terminated. Accept calls `on_accept` for the
-///                            winning provider and cancels non-winning providers
-///                            that have not terminated. A final result does not
-///                            release lifecycle state. Callbacks stay bound to
-///                            the command registration generation that created
-///                            the session. A replacement or unload cannot route
-///                            an old candidate to a new registration. The
-///                            registration owns callback cleanup after old
-///                            sessions terminate.
+///   Completion is declared on each typed descriptor with `completion = false`,
+///                            `completion = "disabled"`, `completion = "replace"`,
+///                            `completion = "extend"`, or a provider table.
+///                            A provider table contains exactly one of `items` and
+///                            `get_items`. Defaults are enum choices in the core
+///                            and file or directory discovery in the TUI. String
+///                            and integer defaults are empty. Provider callbacks
+///                            receive the typed argument name, type, parsed
+///                            preceding values, and the command completion context.
+///                            Raw commands do not have argument completion providers.
 /// @return
 /// @example
 /// -- Documentation and test example. It is not bundled and never copies files.
@@ -945,17 +894,12 @@ fn register_permission_rule(
 /// })
 /// -- `/copy "input file.txt" "build output" overwrite` records decoded values.
 ///
-/// -- Legacy commands can still provide dynamic completion:
+/// -- Raw commands preserve the complete argument remainder:
 /// maki.api.register_command({
 ///   name = "/hello",
 ///   description = "Say hello",
 ///   tui_only = false,
-///   nargs = 1,
-///   completion = {
-///     get_items = function(ctx)
-///       return { { label = "world", insertion = "world", description = ctx.mode } }
-///     end,
-///   },
+///   arguments = { raw = true, required = true },
 ///   handler = function(opts)
 ///     recorded = opts.args
 ///   end,
@@ -1566,18 +1510,101 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
     Ok(())
 }
 
-fn parse_nargs(spec: &Table) -> LuaResult<ArgumentArity> {
-    match spec.get::<LuaValue>("nargs")? {
-        LuaValue::Nil | LuaValue::Integer(0) | LuaValue::Number(0.0) => Ok(ArgumentArity::NONE),
-        LuaValue::Integer(1) | LuaValue::Number(1.0) => Ok(ArgumentArity::ONE),
-        LuaValue::String(s) => match s.to_string_lossy().as_ref() {
-            "?" => Ok(ArgumentArity::OPTIONAL),
-            "*" => Ok(ArgumentArity::ANY),
-            "+" => Ok(ArgumentArity::ONE_OR_MORE),
-            _ => Err(mlua::Error::runtime(NARGS_ERR)),
-        },
-        _ => Err(mlua::Error::runtime(NARGS_ERR)),
+fn parse_arguments(
+    lua: &Lua,
+    spec: &Table,
+) -> LuaResult<(CommandArguments, Vec<Option<ArgumentCompletion>>)> {
+    let value = spec.get::<LuaValue>("arguments")?;
+    let Some(value) = (!matches!(value, LuaValue::Nil)).then_some(value) else {
+        return Ok((CommandArguments::Positional(Arc::from([])), Vec::new()));
+    };
+    let LuaValue::Table(arguments) = value else {
+        return Err(mlua::Error::runtime(ARGUMENTS_ERR));
+    };
+    if arguments.get::<Option<bool>>("raw")? == Some(true) {
+        let required_value = arguments.get::<Option<LuaValue>>("required")?;
+        let required = match required_value {
+            None => false,
+            Some(LuaValue::Boolean(value)) => value,
+            Some(_) => return Err(mlua::Error::runtime(ARGUMENTS_ERR)),
+        };
+        if arguments.raw_len() != 0
+            || arguments.pairs::<LuaValue, LuaValue>().count()
+                != 1 + usize::from(required_value.is_some())
+        {
+            return Err(mlua::Error::runtime(ARGUMENTS_ERR));
+        }
+        return Ok((CommandArguments::Raw { required }, Vec::new()));
     }
+    let mut parsed = Vec::new();
+    let mut completions = Vec::new();
+    let result = (|| {
+        for argument in dense_sequence_values::<LuaValue>(&arguments, ARGUMENTS_ERR)? {
+            let argument = match argument {
+                LuaValue::Table(argument) => argument,
+                _ => return Err(mlua::Error::runtime(ARGUMENTS_ERR)),
+            };
+            let name: String = argument
+                .get("name")
+                .map_err(|_| mlua::Error::runtime(ARGUMENT_NAME_ERR))?;
+            if name.is_empty()
+                || parsed
+                    .iter()
+                    .any(|item: &PositionalArgument| item.name.as_ref() == name)
+            {
+                return Err(mlua::Error::runtime(ARGUMENT_NAME_ERR));
+            }
+            let optional = match argument.get::<LuaValue>("optional")? {
+                LuaValue::Nil => false,
+                LuaValue::Boolean(value) => value,
+                _ => return Err(mlua::Error::runtime(ARGUMENT_OPTIONAL_ERR)),
+            };
+            let variadic = match argument.get::<LuaValue>("variadic")? {
+                LuaValue::Nil => false,
+                LuaValue::Boolean(value) => value,
+                _ => return Err(mlua::Error::runtime(ARGUMENT_VARIADIC_ERR)),
+            };
+            let completion_value = argument.get::<LuaValue>("completion")?;
+            let completion = match &completion_value {
+                LuaValue::Table(table) => Some(parse_argument_completion(lua, table)?),
+                LuaValue::Nil | LuaValue::Boolean(false) | LuaValue::String(_) => None,
+                _ => {
+                    return Err(mlua::Error::runtime(
+                        "register_command: argument 'completion' must be false, a policy string, or a table",
+                    ));
+                }
+            };
+            let policy = if let LuaValue::Table(table) = &completion_value {
+                let mode = table.get::<Option<LuaValue>>("mode")?;
+                let policy = table.get::<Option<LuaValue>>("policy")?;
+                if mode.is_some() && policy.is_some() {
+                    return Err(mlua::Error::runtime(
+                        "register_command: argument completion accepts only one of 'mode' or 'policy'",
+                    ));
+                }
+                mode.or(policy)
+                    .map_or(Ok(CompletionPolicy::Replace), parse_completion_policy)?
+            } else {
+                parse_completion_policy(completion_value)?
+            };
+            parsed.push(PositionalArgument {
+                name: Arc::from(name),
+                kind: parse_argument_kind(&argument)?,
+                optional,
+                variadic,
+                completion: policy,
+            });
+            completions.push(completion);
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        for completion in completions.into_iter().flatten() {
+            remove_argument_completion(lua, completion);
+        }
+        return Err(error);
+    }
+    Ok((CommandArguments::Positional(parsed.into()), completions))
 }
 
 fn dense_sequence_values<T: mlua::FromLua>(
@@ -1678,112 +1705,29 @@ fn parse_completion_policy(value: LuaValue) -> LuaResult<CompletionPolicy> {
     }
 }
 
-type ParsedTypedArguments = (Arc<[PositionalArgument]>, Vec<Option<ArgumentCompletion>>);
-
-fn parse_typed_arguments(lua: &Lua, spec: &Table) -> LuaResult<Option<ParsedTypedArguments>> {
-    let value = spec.get::<LuaValue>("arguments")?;
-    let LuaValue::Table(arguments) = value else {
-        return if matches!(value, LuaValue::Nil) {
-            Ok(None)
-        } else {
-            Err(mlua::Error::runtime(ARGUMENTS_ERR))
-        };
-    };
-
-    let mut parsed = Vec::new();
-    let mut completions: Vec<Option<ArgumentCompletion>> = Vec::new();
-    let arguments = dense_sequence_values::<LuaValue>(&arguments, ARGUMENTS_ERR)?;
-    for argument in arguments {
-        let argument = match argument {
-            LuaValue::Table(argument) => argument,
-            _ => return Err(mlua::Error::runtime(ARGUMENTS_ERR)),
-        };
-        let name: String = argument
-            .get("name")
-            .map_err(|_| mlua::Error::runtime(ARGUMENT_NAME_ERR))?;
-        if name.is_empty() {
-            return Err(mlua::Error::runtime(ARGUMENT_NAME_ERR));
-        }
-        if parsed
-            .iter()
-            .any(|argument: &PositionalArgument| argument.name.as_ref() == name)
-        {
-            return Err(mlua::Error::runtime(ARGUMENT_NAME_ERR));
-        }
-        let optional = match argument.get::<LuaValue>("optional")? {
-            LuaValue::Nil => false,
-            LuaValue::Boolean(value) => value,
-            _ => return Err(mlua::Error::runtime(ARGUMENT_OPTIONAL_ERR)),
-        };
-        let variadic = match argument.get::<LuaValue>("variadic")? {
-            LuaValue::Nil => false,
-            LuaValue::Boolean(value) => value,
-            _ => return Err(mlua::Error::runtime(ARGUMENT_VARIADIC_ERR)),
-        };
-        let completion_value = argument.get::<LuaValue>("completion")?;
-        let completion = match &completion_value {
-            LuaValue::Table(table) => Some(parse_argument_completion(lua, table)?),
-            LuaValue::Nil | LuaValue::Boolean(false) | LuaValue::String(_) => None,
-            _ => {
-                return Err(mlua::Error::runtime(
-                    "register_command: argument 'completion' must be false, a policy string, or a table",
-                ));
-            }
-        };
-        let policy = if let LuaValue::Table(table) = &completion_value {
-            let mode = table.get::<Option<LuaValue>>("mode")?;
-            let policy = table.get::<Option<LuaValue>>("policy")?;
-            if mode.is_some() && policy.is_some() {
-                return Err(mlua::Error::runtime(
-                    "register_command: argument completion accepts only one of 'mode' or 'policy'",
-                ));
-            }
-            match mode.or(policy) {
-                Some(value) => parse_completion_policy(value)?,
-                None => CompletionPolicy::Replace,
-            }
-        } else {
-            parse_completion_policy(completion_value)?
-        };
-        parsed.push(PositionalArgument {
-            name: Arc::from(name),
-            kind: parse_argument_kind(&argument)?,
-            optional,
-            variadic,
-            completion: policy,
-        });
-        completions.push(completion);
-    }
-    Ok(Some((parsed.into(), completions)))
-}
-
-fn remove_command_registry_values(lua: &Lua, entry: CommandEntry) {
+fn remove_argument_completion(lua: &Lua, completion: ArgumentCompletion) {
     for key in [
-        Some(entry.handler),
-        entry.argument_completion,
-        entry.completion_on_highlight,
-        entry.completion_on_accept,
-        entry.completion_on_cancel,
+        Some(completion.completion),
+        completion.on_highlight,
+        completion.on_accept,
+        completion.on_cancel,
     ]
     .into_iter()
     .flatten()
-    .chain(
-        entry
-            .argument_completions
-            .into_iter()
-            .flatten()
-            .flat_map(|completion| {
-                [
-                    Some(completion.completion),
-                    completion.on_highlight,
-                    completion.on_accept,
-                    completion.on_cancel,
-                ]
-                .into_iter()
-                .flatten()
-            }),
-    ) {
+    {
         let _ = lua.remove_registry_value(key);
+    }
+}
+
+fn remove_command_registry_values(lua: &Lua, entry: CommandEntry) {
+    let CommandEntry {
+        handler,
+        argument_completions,
+        ..
+    } = entry;
+    let _ = lua.remove_registry_value(handler);
+    for completion in argument_completions.into_iter().flatten() {
+        remove_argument_completion(lua, completion);
     }
 }
 
@@ -1809,82 +1753,17 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
         LuaValue::Boolean(value) => value,
         _ => return Err(mlua::Error::runtime(TUI_ONLY_ERR)),
     };
-    let (typed_arguments, mut argument_completions) = parse_typed_arguments(lua, spec)?
-        .map_or((None, Vec::new()), |(arguments, completions)| {
-            (Some(arguments), completions)
-        });
-    if typed_arguments.is_some() && !matches!(spec.get::<LuaValue>("nargs")?, LuaValue::Nil) {
-        return Err(mlua::Error::runtime(ARGUMENTS_NARGS_ERR));
+    for key in ["nargs", "completion", "argument_completion", "completions"] {
+        if spec.contains_key(key)? {
+            return Err(mlua::Error::runtime(format!(
+                "register_command: unsupported field '{key}'"
+            )));
+        }
     }
-    let arguments = parse_nargs(spec)?;
+    let (arguments, argument_completions) = parse_arguments(lua, spec)?;
     let handler: Function = spec
         .get("handler")
         .map_err(|_| mlua::Error::runtime("register_command: missing 'handler'"))?;
-
-    if typed_arguments.is_some() && !matches!(spec.get::<LuaValue>("completion")?, LuaValue::Nil) {
-        return Err(mlua::Error::runtime(
-            "register_command: typed arguments cannot use command-wide completion",
-        ));
-    }
-    let completion = spec.get::<Option<Table>>("completion")?;
-    let (completion_key, completion_on_highlight, completion_on_accept, completion_on_cancel) =
-        match completion.as_ref() {
-            Some(completion) => {
-                let items = completion.get::<Option<mlua::Table>>("items")?;
-                let get_items = completion.get::<Option<Function>>("get_items")?;
-                if items.is_some() == get_items.is_some() {
-                    return Err(mlua::Error::runtime(
-                        "register_command: completion requires exactly one of 'items' or 'get_items'",
-                    ));
-                }
-                let items = if let Some(items) = items {
-                    lua.create_registry_value(items)?
-                } else {
-                    lua.create_registry_value(get_items.expect("validated get_items"))?
-                };
-                let hook = |name| -> LuaResult<Option<RegistryKey>> {
-                    completion
-                        .get::<Option<Function>>(name)?
-                        .map(|function| lua.create_registry_value(function))
-                        .transpose()
-                };
-                (
-                    Some(items),
-                    hook("on_highlight")?,
-                    hook("on_accept")?,
-                    hook("on_cancel")?,
-                )
-            }
-            None => (None, None, None, None),
-        };
-    if let Some(arguments) = typed_arguments.as_ref() {
-        let legacy_specs = spec.get::<Option<Table>>("argument_completion")?;
-        let legacy_alias = spec.get::<Option<Table>>("completions")?;
-        if legacy_specs.is_some() && legacy_alias.is_some() {
-            return Err(mlua::Error::runtime(ARGUMENT_COMPLETIONS_CONFLICT_ERR));
-        }
-        let specs = legacy_specs
-            .or(legacy_alias)
-            .map(|specs| dense_sequence_values::<Option<Table>>(&specs, ARGUMENT_COMPLETIONS_ERR))
-            .transpose()?;
-        if let Some(specs) = specs {
-            if specs.len() > arguments.len() {
-                return Err(mlua::Error::runtime(ARGUMENT_COMPLETIONS_ERR));
-            }
-            if argument_completions
-                .iter()
-                .any(|completion| completion.is_some())
-            {
-                return Err(mlua::Error::runtime(ARGUMENT_COMPLETIONS_CONFLICT_ERR));
-            }
-            for (index, completion) in specs.into_iter().enumerate() {
-                if let Some(completion) = completion {
-                    argument_completions[index] =
-                        Some(parse_argument_completion(lua, &completion)?);
-                }
-            }
-        }
-    }
     let handler_key = lua.create_registry_value(handler)?;
     let name: Arc<str> = Arc::from(name.as_str());
     let description: Arc<str> = Arc::from(description.as_str());
@@ -1902,12 +1781,7 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
                 description,
                 argument_hint,
                 arguments,
-                typed_arguments,
                 tui_only,
-                argument_completion: completion_key,
-                completion_on_highlight,
-                completion_on_accept,
-                completion_on_cancel,
                 argument_completions,
             },
         )

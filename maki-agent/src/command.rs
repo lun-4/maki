@@ -9,11 +9,12 @@ use std::{
 };
 
 use maki_commands::{
-    AgentTurn, ArgumentArity, ArgumentValue, BUILTIN_COMMANDS, BuiltinOperation, CommandBehavior,
-    CommandCompletion, CommandContent, CommandError, CommandFuture, CommandInvocation,
-    CommandOutcome, CommandRegistry, CompletionKey, HostContextRequest, HostContextResponse,
-    HostRequest, HostResponse, Producer, ProducerPrecedence, Registration, RegistrationError,
-    TargetCapabilities, TargetCapability, resolve_path,
+    AgentTurn, ArgumentValue, BUILTIN_COMMANDS, BuiltinOperation, CancellationToken,
+    CommandBehavior, CommandCompletion, CommandContent, CommandError, CommandFuture,
+    CommandInvocation, CommandOutcome, CommandRegistry, CompletionContext, CompletionError,
+    CompletionItem, HostContextRequest, HostContextResponse, HostRequest, HostResponse, Producer,
+    ProducerPrecedence, Registration, RegistrationError, TargetCapabilities, TargetCapability,
+    resolve_path,
 };
 use maki_config::ModelPolicy;
 use maki_match::{MatchCandidate, Resolution, fuzzy_resolve, fuzzy_resolve_candidates};
@@ -517,6 +518,18 @@ impl CommandBehavior for BuiltinBehavior {
     }
 }
 
+struct EmptyCompletion;
+
+impl CommandCompletion for EmptyCompletion {
+    fn complete(
+        &self,
+        _context: CompletionContext,
+        _cancellation: CancellationToken,
+    ) -> CommandFuture<Result<Vec<CompletionItem>, CompletionError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
 #[derive(Default)]
 pub struct StandardCompletions {
     pub model: Option<Arc<dyn CommandCompletion>>,
@@ -555,18 +568,31 @@ impl StandardCommands {
                     .iter()
                     .map(|command| {
                         let spec = command.spec();
-                        let argument_completions = spec
-                            .arguments
-                            .positional()
-                            .map_or_else(Vec::new, |arguments| vec![None; arguments.len()]);
+                        let argument_completions = command
+                            .argument_completions
+                            .iter()
+                            .map(|completion| {
+                                completion
+                                    .as_ref()
+                                    .and_then(|completion| match completion.key {
+                                        maki_commands::CompletionKey::Model => {
+                                            completions.model.clone().or_else(|| {
+                                                Some(Arc::new(EmptyCompletion)
+                                                    as Arc<dyn CommandCompletion>)
+                                            })
+                                        }
+                                        maki_commands::CompletionKey::Theme => {
+                                            completions.theme.clone().or_else(|| {
+                                                Some(Arc::new(EmptyCompletion)
+                                                    as Arc<dyn CommandCompletion>)
+                                            })
+                                        }
+                                    })
+                            })
+                            .collect();
                         Registration {
                             spec,
                             behavior: Arc::new(BuiltinBehavior { id: command.id }),
-                            completion: match command.completion {
-                                Some(CompletionKey::Model) => completions.model.clone(),
-                                Some(CompletionKey::Theme) => completions.theme.clone(),
-                                None => None,
-                            },
                             argument_completions,
                         }
                     })
@@ -619,11 +645,11 @@ pub fn register_commands(
                 spec: maki_commands::CommandSpec {
                     name: Arc::from(command.display_name()),
                     aliases: Arc::from([]),
-                    arguments: maki_commands::CommandArguments::Legacy(if command.has_args() {
-                        ArgumentArity::ANY
+                    arguments: if command.has_args() {
+                        maki_commands::CommandArguments::Raw { required: false }
                     } else {
-                        ArgumentArity::NONE
-                    }),
+                        maki_commands::CommandArguments::Positional(Arc::from([]))
+                    },
                     docs: maki_commands::CommandDocs {
                         summary: Arc::from(command.description.clone()),
                         argument_hint: command.argument_hint.clone().map(Arc::from),
@@ -631,7 +657,6 @@ pub fn register_commands(
                     required_capabilities: Default::default(),
                 },
                 behavior: Arc::new(CustomCommandBehavior { command }),
-                completion: None,
                 argument_completions: Vec::new(),
             })
             .collect(),

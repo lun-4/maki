@@ -225,6 +225,114 @@ fn queued_execute_command_rejects_retired_generation_before_worker_consumes_it()
 }
 
 #[test]
+fn queued_legacy_run_command_rejects_retired_generation_before_worker_consumes_it() {
+    let host = PluginHost::new(Arc::new(maki_agent::tools::ToolRegistry::new())).unwrap();
+    host.load_source("legacy_generation", GENERATION_A_PLUGIN)
+        .unwrap();
+    let handle = host.event_handle();
+    let release = host.pause_worker_for_test();
+    let replacement = host
+        .queue_load_source_for_test("legacy_generation", GENERATION_B_PLUGIN)
+        .unwrap();
+    handle.run_command(
+        Arc::from("legacy_generation"),
+        Arc::from("/typed"),
+        "queued".into(),
+        0,
+    );
+
+    release.send(()).unwrap();
+    replacement
+        .recv()
+        .expect("replacement load reply")
+        .expect("replacement load failed");
+    host.wait_for_worker_barrier_for_test();
+
+    assert!(matches!(
+        host.ui_action_rx().try_recv(),
+        Err(flume::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn callbacks_none_lifecycle_rejects_retired_generation() {
+    let host = PluginHost::new(Arc::new(maki_agent::tools::ToolRegistry::new())).unwrap();
+    host.load_source(
+        "lifecycle_generation",
+        r#"
+        maki.api.register_command({
+            name = "/deploy",
+            tui_only = false,
+            arguments = { { name = "value", type = "string", completion = {
+                items = {},
+                on_cancel = function() maki.ui.flash("old-generation") end,
+            } } },
+            handler = function() end,
+        })
+        "#,
+    )
+    .unwrap();
+    let registry = host.command_registry();
+    let target = registry.bind_target(
+        maki_commands::TargetCapabilities::ALL,
+        Arc::new(TestCommandHost),
+    );
+    let command = registry.resolve_for(&target, "/deploy").unwrap();
+    let session = registry.open_completion(command, target.id()).unwrap();
+    let _ = smol::block_on(session.complete(Arc::from(""), Arc::from(""), 0, Arc::from("build")));
+    let context = maki_lua::CommandArgumentContext {
+        command: Arc::from("/deploy"),
+        plugin: Arc::from("lifecycle_generation"),
+        args: String::new(),
+        arg: String::new(),
+        index: 0,
+        mode: "build".into(),
+        session: 1,
+        generation: 0,
+        command_generation: host
+            .event_handle()
+            .command_generation_for_test("lifecycle_generation", "/deploy"),
+        argument_name: Some(Arc::from("value")),
+        argument_kind: Some("string".into()),
+        preceding_values: Arc::from([]),
+    };
+    host.load_source(
+        "lifecycle_generation",
+        r#"
+        maki.api.register_command({
+            name = "/deploy",
+            tui_only = false,
+            arguments = { { name = "value", type = "string", completion = {
+                items = {},
+                on_cancel = function() maki.ui.flash("new-generation") end,
+            } } },
+            handler = function() end,
+        })
+        "#,
+    )
+    .unwrap();
+    host.wait_for_worker_barrier_for_test();
+    let new_generation = host
+        .event_handle()
+        .command_generation_for_test("lifecycle_generation", "/deploy");
+    assert_ne!(context.command_generation, new_generation);
+    let flashes = host.ui_action_rx();
+    while flashes.try_recv().is_ok() {}
+    handle_lifecycle_for_test(&host.event_handle(), context);
+    let result = flashes.recv_timeout(Duration::from_millis(250));
+    assert!(result.is_err(), "unexpected lifecycle action received");
+}
+
+fn handle_lifecycle_for_test(handle: &EventHandle, context: maki_lua::CommandArgumentContext) {
+    handle.command_argument_lifecycle(
+        context,
+        maki_lua::CommandArgumentLifecycle::Cancel,
+        None,
+        maki_agent::CancelToken::none(),
+    );
+}
+
+#[test]
 fn invalid_typed_invocations_never_reach_the_handler() {
     let invalid_inputs = [
         (

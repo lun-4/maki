@@ -305,7 +305,7 @@ fn registration_with(
         spec: CommandSpec {
             name: Arc::from(name),
             aliases: aliases.iter().copied().map(Arc::from).collect(),
-            arguments: CommandArguments::Legacy(ArgumentArity::ANY),
+            arguments: CommandArguments::Raw { required: false },
             docs: CommandDocs {
                 summary: Arc::from("test command"),
                 argument_hint: None,
@@ -313,16 +313,18 @@ fn registration_with(
             required_capabilities: capabilities,
         },
         behavior,
-        completion: None,
         argument_completions: Vec::new(),
     }
 }
 
 fn completion_registration(completion: Arc<dyn CommandCompletion>) -> Registration {
-    Registration {
-        completion: Some(completion),
-        ..registration("/complete", TargetCapabilities::NONE)
-    }
+    positional_registration_with_completion(
+        "/complete",
+        Arc::from([PositionalArgument::required("value", ArgumentKind::String)
+            .with_completion(CompletionPolicy::Replace)]),
+        Arc::new(OutcomeBehavior(CommandOutcome::Completed)),
+        Some(completion),
+    )
 }
 
 fn positional_registration(
@@ -351,8 +353,7 @@ fn positional_registration_with_completion(
             required_capabilities: TargetCapabilities::NONE,
         },
         behavior,
-        completion,
-        argument_completions: vec![None; arguments.len()],
+        argument_completions: vec![completion; arguments.len()],
     }
 }
 
@@ -810,6 +811,48 @@ fn invalid_typed_input_prevents_behavior_execution() {
 }
 
 #[test]
+fn builtin_argument_descriptors_carry_completion_metadata() {
+    let model = BUILTIN_COMMANDS
+        .iter()
+        .find(|command| command.id == BuiltinId::Model)
+        .unwrap()
+        .spec();
+    let theme = BUILTIN_COMMANDS
+        .iter()
+        .find(|command| command.id == BuiltinId::Theme)
+        .unwrap()
+        .spec();
+    assert!(matches!(model.arguments, CommandArguments::Positional(_)));
+    assert_eq!(
+        model
+            .arguments
+            .positional()
+            .unwrap()
+            .first()
+            .unwrap()
+            .completion,
+        CompletionPolicy::Replace
+    );
+    assert_eq!(
+        theme
+            .arguments
+            .positional()
+            .unwrap()
+            .first()
+            .unwrap()
+            .completion,
+        CompletionPolicy::Replace
+    );
+
+    let btw = BUILTIN_COMMANDS
+        .iter()
+        .find(|command| command.id == BuiltinId::Btw)
+        .unwrap()
+        .spec();
+    assert_eq!(btw.arguments, CommandArguments::Raw { required: true });
+}
+
+#[test]
 fn typed_usage_hint_fallback_preserves_explicit_hints() {
     let typed = CommandSpec {
         name: Arc::from("/typed"),
@@ -971,15 +1014,18 @@ fn producer_replacement_is_atomic_on_validation_failure() {
         .unwrap();
     let target = registry.bind_target(TargetCapabilities::NONE, Arc::new(Host));
     let generation = registry.snapshot_for(&target).unwrap().generation();
-    let mut invalid = registration("/invalid", TargetCapabilities::NONE);
-    invalid.spec.arguments = CommandArguments::Legacy(ArgumentArity::bounded(2, 1));
+    let invalid = positional_registration(
+        "/invalid",
+        Arc::from([
+            PositionalArgument::optional("first", ArgumentKind::String),
+            PositionalArgument::required("second", ArgumentKind::String),
+        ]),
+        Arc::new(OutcomeBehavior(CommandOutcome::Completed)),
+    );
 
     assert!(matches!(
-        producer.replace(vec![
-            registration("/new", TargetCapabilities::NONE),
-            invalid
-        ]),
-        Err(RegistrationError::InvalidArgumentArity { min: 2, max: 1 })
+        producer.replace(vec![registration("/new", TargetCapabilities::NONE), invalid]),
+        Err(RegistrationError::InvalidArgumentOrder(name)) if name.as_ref() == "second"
     ));
 
     let snapshot = registry.snapshot_for(&target).unwrap();

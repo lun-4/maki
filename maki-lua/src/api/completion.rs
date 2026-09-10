@@ -615,16 +615,13 @@ pub(crate) async fn collect_command_argument_items(
     } else if let Some((value, schema)) = lua.app_data_ref::<CommandHandlerMap>().and_then(|map| {
         map.get(&context.plugin)
             .and_then(|commands| commands.get(&context.command))
+            .filter(|entry| entry.generation == context.command_generation)
             .and_then(|entry| {
-                let key = entry
-                    .argument_completions
-                    .get(context.index)
-                    .and_then(Option::as_ref)
-                    .map(|completion| &completion.completion)
-                    .or(entry.argument_completion.as_ref())?;
+                let schema = entry.arguments.positional()?.to_vec().into();
+                let completion = entry.argument_completions.get(context.index)?.as_ref()?;
                 Some((
-                    lua.registry_value::<Value>(key).ok()?,
-                    entry.typed_arguments.clone(),
+                    lua.registry_value::<Value>(&completion.completion).ok()?,
+                    Some(schema),
                 ))
             })
     }) {
@@ -697,27 +694,19 @@ fn lifecycle_function(
         }?;
         return lua.registry_value::<Function>(key).ok();
     }
-    let entry = commands?.get(&request.context.command)?;
-    let argument_completion = entry
+    let entry = commands?
+        .get(&request.context.command)
+        .filter(|entry| entry.generation == request.context.command_generation)?;
+    let completion = entry
         .argument_completions
-        .get(request.context.index)
-        .and_then(Option::as_ref);
-    let (legacy, typed) = match request.event {
-        CommandArgumentLifecycle::Highlight => (
-            &entry.completion_on_highlight,
-            argument_completion.and_then(|c| c.on_highlight.as_ref()),
-        ),
-        CommandArgumentLifecycle::Accept => (
-            &entry.completion_on_accept,
-            argument_completion.and_then(|c| c.on_accept.as_ref()),
-        ),
-        CommandArgumentLifecycle::Cancel => (
-            &entry.completion_on_cancel,
-            argument_completion.and_then(|c| c.on_cancel.as_ref()),
-        ),
-    };
-    let key = typed.or(legacy.as_ref());
-    key.and_then(|key| lua.registry_value::<Function>(key).ok())
+        .get(request.context.index)?
+        .as_ref()?;
+    let key = match request.event {
+        CommandArgumentLifecycle::Highlight => completion.on_highlight.as_ref(),
+        CommandArgumentLifecycle::Accept => completion.on_accept.as_ref(),
+        CommandArgumentLifecycle::Cancel => completion.on_cancel.as_ref(),
+    }?;
+    lua.registry_value::<Function>(key).ok()
 }
 
 pub(crate) async fn run_command_argument_lifecycle(
@@ -727,22 +716,9 @@ pub(crate) async fn run_command_argument_lifecycle(
     let function = if let Some(callbacks) = request.callbacks.as_deref() {
         lifecycle_function(lua, Some(callbacks), None, request)
     } else {
-        lua.app_data_ref::<CommandHandlerMap>()
-            .and_then(|map| {
-                lifecycle_function(lua, None, map.get(&request.context.plugin), request)
-            })
-            .or_else(|| {
-                lua.app_data_ref::<crate::api::util::command::RetiredCommandHandlerMap>()
-                    .and_then(|retired| {
-                        retired
-                            .iter()
-                            .rev()
-                            .find(|(plugin, _)| plugin == &request.context.plugin)
-                            .and_then(|(_, commands)| {
-                                lifecycle_function(lua, None, Some(commands), request)
-                            })
-                    })
-            })
+        lua.app_data_ref::<CommandHandlerMap>().and_then(|map| {
+            lifecycle_function(lua, None, map.get(&request.context.plugin), request)
+        })
     };
     let Some(function) = function else { return };
     let ctx = match command_argument_ctx(
@@ -1159,14 +1135,22 @@ mod tests {
                         .unwrap(),
                     description: Arc::from("deploy"),
                     argument_hint: None,
-                    arguments: maki_commands::ArgumentArity::ONE,
-                    typed_arguments: None,
+                    arguments: maki_commands::CommandArguments::Positional(Arc::from([
+                        maki_commands::PositionalArgument::required(
+                            "environment",
+                            maki_commands::ArgumentKind::String,
+                        ),
+                    ])),
                     tui_only: false,
-                    argument_completion: Some(key),
-                    completion_on_highlight: None,
-                    completion_on_accept: None,
-                    completion_on_cancel: None,
-                    argument_completions: Vec::new(),
+                    argument_completions: vec![Some(
+                        crate::api::util::command::ArgumentCompletion {
+                            completion: key,
+                            on_highlight: None,
+                            on_accept: None,
+                            on_cancel: None,
+                            navigation: None,
+                        },
+                    )],
                 },
             )]),
         )]));
@@ -1182,6 +1166,7 @@ mod tests {
                 mode: "build".into(),
                 session: 7,
                 generation: 9,
+                command_generation: 0,
                 argument_name: None,
                 argument_kind: None,
                 preceding_values: Arc::from([]),

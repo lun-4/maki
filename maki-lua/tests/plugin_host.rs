@@ -19,8 +19,6 @@ use maki_storage::id::SessionRef;
 use rustix::process::{Pid, test_kill_process_group};
 use serde_json::{Value, json};
 
-const NARGS_ERR: &str = r#"'nargs' must be 0, 1, "?", "*", or "+""#;
-const ARGUMENTS_NARGS_ERR: &str = "'arguments' and 'nargs' cannot be used together";
 const USAGE_TOOL_NAME: &str = "usage_child";
 const USAGE_VALUE: &str = "12.3k↑ 456↓ $0.123";
 const USAGE_OUTPUT: &str = "usage_done";
@@ -1053,7 +1051,11 @@ fn bundled_commands_project_complete_metadata() {
                     .argument_hint
                     .as_deref()
                     .map(str::to_owned),
-                command.spec().arguments.arity(),
+                command
+                    .spec()
+                    .arguments
+                    .usage_hint()
+                    .map(|hint| hint.to_string()),
                 command
                     .spec()
                     .required_capabilities
@@ -1070,70 +1072,70 @@ fn bundled_commands_project_complete_metadata() {
                 "/automode".into(),
                 "Toggle bash auto mode (classifier gates every bash command)".into(),
                 None,
-                maki_commands::ArgumentArity::NONE,
+                None,
                 false
             ),
             (
                 "/build".into(),
                 "Switch to build mode (full tool access)".into(),
                 None,
-                maki_commands::ArgumentArity::NONE,
+                None,
                 false
             ),
             (
                 "/memory".into(),
                 "View, edit, and delete memory files".into(),
                 None,
-                maki_commands::ArgumentArity::NONE,
+                None,
                 true
             ),
             (
                 "/plan".into(),
                 "Switch to plan mode (analyse and write only the plan file)".into(),
                 None,
-                maki_commands::ArgumentArity::NONE,
+                None,
                 false
             ),
             (
                 "/rename".into(),
                 "Rename the current session".into(),
-                Some("<title>".into()),
-                maki_commands::ArgumentArity::ONE_OR_MORE,
+                None,
+                None,
                 true
             ),
             (
                 "/sessions".into(),
                 "Browse and switch sessions".into(),
+                None,
                 Some("[query]".into()),
-                maki_commands::ArgumentArity::OPTIONAL,
                 true
             ),
             (
                 "/splash".into(),
                 "Preview and select a splash renderer".into(),
+                None,
                 Some("[splash]".into()),
-                maki_commands::ArgumentArity::OPTIONAL,
                 true
             ),
             (
                 "/splash-fps".into(),
                 "Toggle the splash fps overlay: live fps and per-frame render time.".into(),
                 None,
-                maki_commands::ArgumentArity::NONE,
+                None,
                 true
             ),
             (
                 "/thinking".into(),
                 "Set thinking effort (bare opens a selector)".into(),
+                None,
                 Some("[effort]".into()),
-                maki_commands::ArgumentArity::OPTIONAL,
                 true
             ),
             (
                 "/usage".into(),
                 "Show provider quota and focused-session token usage".into(),
                 None,
-                maki_commands::ArgumentArity::NONE,
+                None,
                 true
             ),
         ]
@@ -2841,6 +2843,9 @@ fn register_command_typed_arguments_registers_descriptor_completion_and_context(
                 mode: "build".into(),
                 session: 1,
                 generation: 1,
+                command_generation: host
+                    .event_handle()
+                    .command_generation_for_test("typed_completion", "/typed"),
                 argument_name: Some(Arc::from("count")),
                 argument_kind: Some("integer".into()),
                 preceding_values: Arc::from([maki_commands::ArgumentValue::Enum(Arc::from(
@@ -2865,6 +2870,9 @@ fn register_command_typed_arguments_registers_descriptor_completion_and_context(
             mode: "build".into(),
             session: 1,
             generation: 1,
+            command_generation: host
+                .event_handle()
+                .command_generation_for_test("typed_completion", "/typed"),
             argument_name: Some(Arc::from("count")),
             argument_kind: Some("integer".into()),
             preceding_values: Arc::from([maki_commands::ArgumentValue::Enum(Arc::from("fast"))]),
@@ -2880,7 +2888,7 @@ fn register_command_typed_arguments_registers_descriptor_completion_and_context(
 }
 
 #[test]
-fn register_command_typed_arguments_rejects_nargs() {
+fn register_command_rejects_removed_nargs_field() {
     let host = PluginHost::new(fresh_registry()).unwrap();
     let error = host
         .load_source(
@@ -2891,8 +2899,8 @@ fn register_command_typed_arguments_rejects_nargs() {
                 handler = function() end,
             })"#,
         )
-        .expect_err("expected nargs conflict");
-    assert!(error.to_string().contains(ARGUMENTS_NARGS_ERR));
+        .expect_err("expected removed field rejection");
+    assert!(error.to_string().contains("unsupported field 'nargs'"));
 }
 
 #[test]
@@ -2904,24 +2912,34 @@ fn command_completion_static_dynamic_and_lifecycle_hooks() {
         maki.api.register_command({
             name = "/deploy",
             tui_only = false,
-            nargs = 1,
-            completion = {
-                get_items = function(ctx)
-                    return {{ label = ctx.arg .. ":dynamic", insertion = "staging" }}
-                end,
-                on_highlight = function(ctx, item)
-                    maki.ui.flash("highlight:" .. ctx.session .. ":" .. ctx.generation .. ":" .. item.insertion)
-                end,
-                on_accept = function(_, item) maki.ui.flash("accept:" .. item.insertion) end,
-                on_cancel = function(ctx) maki.ui.flash("cancel:" .. ctx.command) end,
+            arguments = {
+                {
+                    name = "value",
+                    type = "string",
+                    completion = {
+                        get_items = function(ctx)
+                            return { { label = ctx.arg .. ":dynamic", insertion = "staging" } }
+                        end,
+                        on_highlight = function(ctx, item)
+                            maki.ui.flash("highlight:" .. ctx.session .. ":" .. ctx.generation .. ":" .. item.insertion)
+                        end,
+                        on_accept = function(_, item) maki.ui.flash("accept:" .. item.insertion) end,
+                        on_cancel = function(ctx) maki.ui.flash("cancel:" .. ctx.command) end,
+                    },
+                },
             },
             handler = function() end,
         })
         maki.api.register_command({
             name = "/static",
             tui_only = false,
-            nargs = 1,
-            completion = { items = {{ label = "prod", insertion = "production" }} },
+            arguments = {
+                {
+                    name = "value",
+                    type = "string",
+                    completion = { items = { { label = "prod", insertion = "production" } } },
+                },
+            },
             handler = function() end,
         })
         "#,
@@ -2937,6 +2955,9 @@ fn command_completion_static_dynamic_and_lifecycle_hooks() {
         mode: "build".into(),
         session: 4,
         generation: 6,
+        command_generation: host
+            .event_handle()
+            .command_generation_for_test("completion_plugin", "/deploy"),
         argument_name: None,
         argument_kind: None,
         preceding_values: Arc::from([]),
@@ -2986,6 +3007,9 @@ fn command_completion_static_dynamic_and_lifecycle_hooks() {
                 mode: "build".into(),
                 session: 8,
                 generation: 1,
+                command_generation: host
+                    .event_handle()
+                    .command_generation_for_test("completion_plugin", "/static"),
                 argument_name: None,
                 argument_kind: None,
                 preceding_values: Arc::from([]),
@@ -3008,11 +3032,10 @@ fn dropping_command_completion_session_runs_lua_cancel_hook() {
         maki.api.register_command({
             name = "/deploy",
             tui_only = false,
-            nargs = 1,
-            completion = {
+            arguments = { { name = "value", type = "string", completion = {
                 get_items = function() return {{ label = "stage", insertion = "staging" }} end,
                 on_cancel = function(ctx) maki.ui.flash("cancelled:" .. ctx.command) end,
-            },
+            } } },
             handler = function() end,
         })
         "#,
@@ -3047,8 +3070,7 @@ fn reloaded_command_does_not_receive_old_completion_cancel() {
         maki.api.register_command({
             name = "/deploy",
             tui_only = false,
-            nargs = 1,
-            completion = { items = {{ label = "stage", insertion = "staging" }} },
+            arguments = {{ name = "value", type = "string", completion = { items = {{ label = "stage", insertion = "staging" }} } }},
             handler = function() end,
         })
         "#,
@@ -3076,11 +3098,10 @@ fn reloaded_command_does_not_receive_old_completion_cancel() {
         maki.api.register_command({
             name = "/deploy",
             tui_only = false,
-            nargs = 1,
-            completion = {
+            arguments = {{ name = "value", type = "string", completion = {
                 items = {{ label = "stage", insertion = "staging" }},
                 on_cancel = function() maki.ui.flash("new-generation") end,
-            },
+            }}},
             handler = function() end,
         })
         "#,
@@ -3100,12 +3121,11 @@ fn command_completion_timeout_returns_empty_and_keeps_host_live() {
         maki.api.register_command({
             name = "/slow",
             tui_only = false,
-            nargs = 1,
-            completion = {
+            arguments = { { name = "value", type = "string", optional = true, completion = {
                 get_items = function()
                     while true do end
                 end,
-            },
+            } } },
             handler = function() maki.ui.flash("recovered") end,
         })
         "#,
@@ -3124,6 +3144,9 @@ fn command_completion_timeout_returns_empty_and_keeps_host_live() {
                 mode: "build".into(),
                 session: 1,
                 generation: 1,
+                command_generation: host
+                    .event_handle()
+                    .command_generation_for_test("slow_completion", "/slow"),
                 argument_name: None,
                 argument_kind: None,
                 preceding_values: Arc::from([]),
@@ -3156,39 +3179,28 @@ fn command_completion_timeout_returns_empty_and_keeps_host_live() {
     ));
 }
 
-#[test_case::test_case("" => maki_commands::ArgumentArity::NONE ; "default_zero")]
-#[test_case::test_case("nargs = 0," => maki_commands::ArgumentArity::NONE ; "zero")]
-#[test_case::test_case("nargs = 1," => maki_commands::ArgumentArity::ONE ; "one")]
-#[test_case::test_case(r#"nargs = "?","# => maki_commands::ArgumentArity::OPTIONAL ; "zero_or_one")]
-#[test_case::test_case(r#"nargs = "*","# => maki_commands::ArgumentArity::ANY ; "any")]
-#[test_case::test_case(r#"nargs = "+","# => maki_commands::ArgumentArity::ONE_OR_MORE ; "one_or_more")]
-fn register_command_nargs_values(nargs_field: &str) -> maki_commands::ArgumentArity {
-    let reg = fresh_registry();
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+#[test]
+fn omitted_arguments_publish_empty_typed_schema() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
     host.load_source(
-        "cmd_nargs",
-        &format!(
-            r#"maki.api.register_command({{ name = "/test", tui_only = false, {nargs_field} handler = function() end }})"#
-        ),
+        "empty_arguments",
+        r#"maki.api.register_command({ name = "/test", tui_only = false, handler = function() end })"#,
     )
     .unwrap();
 
-    command_snapshot(&host).commands()[0]
-        .spec()
-        .arguments
-        .arity()
+    assert!(matches!(
+        &command_snapshot(&host).commands()[0].spec().arguments,
+        maki_commands::CommandArguments::Positional(arguments) if arguments.is_empty()
+    ));
 }
 
-#[test_case::test_case("nargs = 1," ; "exactly_one")]
-#[test_case::test_case(r#"nargs = "+","# ; "one_or_more")]
-fn required_nargs_rejects_empty_dispatch(nargs_field: &str) {
+#[test]
+fn required_raw_arguments_reject_empty_dispatch() {
     let registry = fresh_registry();
     let host = PluginHost::new(Arc::clone(&registry)).unwrap();
     host.load_source(
-        "required_nargs",
-        &format!(
-            r#"maki.api.register_command({{ name = "/required", tui_only = false, {nargs_field} handler = function() end }})"#
-        ),
+        "required_raw",
+        r#"maki.api.register_command({ name = "/required", tui_only = false, arguments = { raw = true, required = true }, handler = function() end })"#,
     )
     .unwrap();
     let commands = host.command_registry();
@@ -3202,14 +3214,37 @@ fn required_nargs_rejects_empty_dispatch(nargs_field: &str) {
     assert!(matches!(
         outcome,
         maki_commands::InputDispatch::Dispatched(maki_commands::CommandOutcome::Failed(
-            maki_commands::CommandError::InvalidArguments { actual: 0, .. }
+            maki_commands::CommandError::TypedArguments {
+                error: maki_commands::ArgumentParseError::MissingRaw,
+                ..
+            }
         ))
+    ));
+
+    let actions = host.ui_action_rx();
+    let result = host
+        .event_handle()
+        .run_command_for_test(
+            Arc::from("required_raw"),
+            Arc::from("/required"),
+            String::new(),
+            0,
+        )
+        .recv_timeout(Duration::from_secs(5))
+        .expect("required raw RunCommand completion was not sent");
+    assert!(
+        result.is_err(),
+        "required raw RunCommand unexpectedly succeeded"
+    );
+    assert!(matches!(
+        actions.try_recv(),
+        Err(flume::TryRecvError::Empty)
     ));
 }
 
-#[test_case::test_case("a  b c", "a  b c|a,b,c" ; "raw_text_and_split_list")]
-#[test_case::test_case("", "|" ; "empty_args")]
-fn command_handler_receives_args_and_fargs(args: &str, expected_flash: &str) {
+#[test_case::test_case("a  b c", "a  b c|nil|nil" ; "raw_text_preserves_whitespace")]
+#[test_case::test_case("", "|nil|nil" ; "empty_args")]
+fn command_handler_receives_raw_args_without_typed_fields(args: &str, expected_flash: &str) {
     let host = PluginHost::new(fresh_registry()).unwrap();
     host.load_source(
         "p",
@@ -3217,9 +3252,9 @@ fn command_handler_receives_args_and_fargs(args: &str, expected_flash: &str) {
         maki.api.register_command({
             name = "/echo",
             tui_only = false,
-            nargs = "*",
+            arguments = { raw = true },
             handler = function(opts)
-                maki.ui.flash(opts.args .. "|" .. table.concat(opts.fargs, ","))
+                maki.ui.flash(opts.args .. "|" .. tostring(opts.fargs) .. "|" .. tostring(opts.values))
             end,
         })
         "#,
@@ -3435,7 +3470,7 @@ fn nested_run_command_strips_extra_leading_slashes() {
         maki.api.register_command({
             name = "/target",
             tui_only = false,
-            nargs = 1,
+            arguments = { raw = true, required = true },
             handler = function(opts)
                 maki.ui.flash("target|" .. opts.args)
             end,
@@ -3552,15 +3587,15 @@ fn nested_run_command_rejects_unknown_command() {
 )]
 #[test_case::test_case(
     r#"maki.api.register_command({ name = "/test", tui_only = false, nargs = -1, handler = function() end })"#,
-    NARGS_ERR ; "negative_nargs"
+    "unsupported field 'nargs'" ; "negative_nargs"
 )]
 #[test_case::test_case(
     r#"maki.api.register_command({ name = "/test", tui_only = false, nargs = 2, handler = function() end })"#,
-    NARGS_ERR ; "nargs_two"
+    "unsupported field 'nargs'" ; "nargs_two"
 )]
 #[test_case::test_case(
     r#"maki.api.register_command({ name = "/test", tui_only = false, nargs = "!", handler = function() end })"#,
-    NARGS_ERR ; "unknown_string_nargs"
+    "unsupported field 'nargs'" ; "unknown_string_nargs"
 )]
 #[test_case::test_case(
     r#"maki.api.register_command({ name = "/test", handler = function() end })"#,
@@ -3584,11 +3619,11 @@ fn nested_run_command_rejects_unknown_command() {
 )]
 #[test_case::test_case(
     r#"maki.api.register_command({ name = "/test", tui_only = false, arguments = { { name = "value", type = "string" } }, argument_completion = { [2] = {} }, handler = function() end })"#,
-    "dense positional array" ; "sparse_argument_completion"
+    "unsupported field 'argument_completion'" ; "sparse_argument_completion"
 )]
 #[test_case::test_case(
     r#"maki.api.register_command({ name = "/test", tui_only = false, arguments = { { name = "value", type = "string", completion = { items = {} } } }, argument_completion = { {} }, handler = function() end })"#,
-    "either descriptor completions" ; "completion_sources_conflict"
+    "unsupported field 'argument_completion'" ; "completion_sources_conflict"
 )]
 fn register_command_validation_rejects(src: &str, expected_err: &str) {
     let reg = fresh_registry();

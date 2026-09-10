@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use maki_agent::SharedBuf;
-use maki_commands::{ArgumentArity, PositionalArgument};
+use maki_commands::{CommandArguments, PositionalArgument};
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
 
@@ -156,18 +156,14 @@ pub(crate) struct CommandEntry {
     pub handler: RegistryKey,
     pub description: Arc<str>,
     pub argument_hint: Option<Arc<str>>,
-    pub arguments: ArgumentArity,
-    pub typed_arguments: Option<Arc<[PositionalArgument]>>,
+    pub arguments: CommandArguments,
     pub tui_only: bool,
-    pub argument_completion: Option<RegistryKey>,
-    pub completion_on_highlight: Option<RegistryKey>,
-    pub completion_on_accept: Option<RegistryKey>,
-    pub completion_on_cancel: Option<RegistryKey>,
     pub argument_completions: Vec<Option<ArgumentCompletion>>,
 }
 
 pub(crate) type CommandHandlerMap = HashMap<Arc<str>, HashMap<Arc<str>, CommandEntry>>;
 pub(crate) type RetiredCommandHandlerMap = Vec<(Arc<str>, HashMap<Arc<str>, CommandEntry>)>;
+pub(crate) type CommandGenerationMap = HashMap<(Arc<str>, Arc<str>), u64>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dimension {

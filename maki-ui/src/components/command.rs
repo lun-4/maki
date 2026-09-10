@@ -302,7 +302,12 @@ impl CommandPalette {
                     if self.argument_range.is_none()
                         && let Some(command) = self.confirm_command_name(input)
                     {
-                        let text = format!("{} ", command.command.invoked_name());
+                        let name = command.command.invoked_name().to_owned();
+                        let text = if command_has_args(&command.command) {
+                            format!("{name} ")
+                        } else {
+                            name
+                        };
                         return CommandAction::Complete {
                             cursor: text.len(),
                             text,
@@ -1103,14 +1108,8 @@ impl CommandPalette {
         for item in snapshot.matched_items(0..count) {
             let cmd_item = &item.data;
 
-            if matches!(
-                cmd_item.command.spec().arguments,
-                CommandArguments::Legacy(_)
-            ) && !cmd_item
-                .command
-                .spec()
-                .arguments
-                .accepts(self.current_arg_count)
+            if let CommandArguments::Positional(arguments) = &cmd_item.command.spec().arguments
+                && !positional_accepts(arguments, self.current_arg_count)
             {
                 continue;
             }
@@ -1207,7 +1206,7 @@ impl CommandPalette {
     }
 
     fn item_has_args(&self, item: &Match) -> bool {
-        item.command.spec().arguments.arity().max != Some(0)
+        command_has_args(&item.command)
     }
 
     fn item_description<'a>(&self, item: &'a Match) -> &'a str {
@@ -1542,6 +1541,25 @@ fn argument_visible_rows(
         .min(fraction_rows.max(1))
 }
 
+fn command_has_args(command: &ResolvedCommand) -> bool {
+    match &command.spec().arguments {
+        CommandArguments::Positional(arguments) => !arguments.is_empty(),
+        CommandArguments::Raw { .. } => true,
+    }
+}
+
+fn positional_accepts(arguments: &[PositionalArgument], count: usize) -> bool {
+    let min = arguments
+        .iter()
+        .filter(|argument| !argument.optional)
+        .count();
+    let max = arguments
+        .last()
+        .filter(|argument| argument.variadic)
+        .map_or(Some(arguments.len()), |_| None);
+    count >= min && max.is_none_or(|max| count <= max)
+}
+
 fn command_args(input: &str) -> &str {
     let SlashClass::Command(input) = classify_input(input) else {
         return "";
@@ -1647,11 +1665,11 @@ mod tests {
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use maki_commands::{
-        ArgumentArity, ArgumentKind, CancellationToken, CommandArguments, CommandBehavior,
-        CommandCompletion, CommandDocs, CommandError, CommandFuture, CommandInvocation,
-        CommandOutcome, CommandRegistry, CommandSpec, CompletionContext, CompletionError,
-        CompletionItem, CompletionItemNavigation, CompletionPolicy, CompletionPublisher,
-        HostResponse, PositionalArgument, ProducerPrecedence, Registration, TargetCapabilities,
+        ArgumentKind, CancellationToken, CommandArguments, CommandBehavior, CommandCompletion,
+        CommandDocs, CommandError, CommandFuture, CommandInvocation, CommandOutcome,
+        CommandRegistry, CommandSpec, CompletionContext, CompletionError, CompletionItem,
+        CompletionItemNavigation, CompletionPolicy, CompletionPublisher, HostResponse,
+        PositionalArgument, ProducerPrecedence, Registration, TargetCapabilities,
     };
     use maki_config::DEFAULT_AUTOCOMPLETE_HEIGHT;
     use ratatui::Terminal;
@@ -1739,7 +1757,7 @@ mod tests {
             spec: CommandSpec {
                 name: Arc::from(name),
                 aliases: Arc::from([]),
-                arguments: maki_commands::CommandArguments::Legacy(ArgumentArity::bounded(0, 1)),
+                arguments: CommandArguments::Raw { required: false },
                 docs: CommandDocs {
                     summary: Arc::from(summary),
                     argument_hint: None,
@@ -1747,7 +1765,6 @@ mod tests {
                 required_capabilities: TargetCapabilities::default(),
             },
             behavior: Arc::new(Noop),
-            completion: None,
             argument_completions: Vec::new(),
         }
     }
@@ -1778,7 +1795,6 @@ mod tests {
                     required_capabilities: TargetCapabilities::default(),
                 },
                 behavior: Arc::new(Noop),
-                completion: None,
                 argument_completions: vec![Some(provider)],
             }])
             .unwrap();
@@ -1833,7 +1849,6 @@ mod tests {
                     required_capabilities: TargetCapabilities::default(),
                 },
                 behavior: Arc::new(Noop),
-                completion: None,
                 argument_completions: vec![Some(provider)],
             }])
             .unwrap();

@@ -614,9 +614,7 @@ mod tests {
                 spec: maki_commands::CommandSpec {
                     name: Arc::from("/inspect"),
                     aliases: Arc::from([]),
-                    arguments: maki_commands::CommandArguments::Legacy(
-                        maki_commands::ArgumentArity::NONE,
-                    ),
+                    arguments: maki_commands::CommandArguments::Positional(Arc::from([])),
                     docs: maki_commands::CommandDocs {
                         summary: Arc::from("inspect"),
                         argument_hint: None,
@@ -626,7 +624,6 @@ mod tests {
                     ),
                 },
                 behavior: Arc::new(ReplaceAttachment),
-                completion: None,
                 argument_completions: Vec::new(),
             }])
             .unwrap();
@@ -703,9 +700,7 @@ mod tests {
                 spec: maki_commands::CommandSpec {
                     name: Arc::from("/done"),
                     aliases: Arc::from([]),
-                    arguments: maki_commands::CommandArguments::Legacy(
-                        maki_commands::ArgumentArity::NONE,
-                    ),
+                    arguments: maki_commands::CommandArguments::Positional(Arc::from([])),
                     docs: maki_commands::CommandDocs {
                         summary: Arc::from("done"),
                         argument_hint: None,
@@ -713,7 +708,6 @@ mod tests {
                     required_capabilities: TargetCapabilities::default(),
                 },
                 behavior: Arc::new(Completed),
-                completion: None,
                 argument_completions: Vec::new(),
             }])
             .unwrap();

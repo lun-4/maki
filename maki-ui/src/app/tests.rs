@@ -127,8 +127,11 @@ impl maki_commands::CommandCompletion for TestLuaCompletion {
         Result<Vec<maki_commands::CompletionItem>, maki_commands::CompletionError>,
     > {
         let (_, cancel) = maki_agent::CancelToken::new();
+        let command_generation = self
+            .handle
+            .command_generation_for_test(&self.plugin, &context.invoked_name);
         let context = maki_lua::CommandArgumentContext {
-            command: context.invoked_name,
+            command: Arc::clone(&context.invoked_name),
             plugin: Arc::clone(&self.plugin),
             args: context.arguments.to_string(),
             arg: context.argument.to_string(),
@@ -136,6 +139,7 @@ impl maki_commands::CommandCompletion for TestLuaCompletion {
             mode: context.mode.to_string(),
             session: 1,
             generation: 0,
+            command_generation,
             argument_name: context.argument_name,
             argument_kind: context
                 .argument_kind
@@ -198,6 +202,9 @@ impl maki_commands::CommandCompletion for TestLuaCompletion {
                 mode: context.mode.to_string(),
                 session: 1,
                 generation: 0,
+                command_generation: self
+                    .handle
+                    .command_generation_for_test(&self.plugin, &context.invoked_name),
                 argument_name: context.argument_name.clone(),
                 argument_kind: context
                     .argument_kind
@@ -221,6 +228,29 @@ struct TestLuaCommand {
     completion: bool,
 }
 
+fn test_command_arguments(
+    max_args: Option<usize>,
+    completion: bool,
+) -> maki_commands::CommandArguments {
+    match (max_args, completion) {
+        (Some(0), _) => maki_commands::CommandArguments::Positional(Arc::from([])),
+        (_, true) => maki_commands::CommandArguments::Positional(Arc::from([
+            maki_commands::PositionalArgument {
+                name: Arc::from("arg"),
+                kind: maki_commands::ArgumentKind::String,
+                optional: true,
+                variadic: max_args.is_none(),
+                completion: maki_commands::CompletionPolicy::Replace,
+            },
+        ])),
+        (Some(1), false) => maki_commands::CommandArguments::Positional(Arc::from([
+            maki_commands::PositionalArgument::optional("arg", maki_commands::ArgumentKind::String),
+        ])),
+        (None, false) => maki_commands::CommandArguments::Raw { required: false },
+        (Some(_), false) => maki_commands::CommandArguments::Positional(Arc::from([])),
+    }
+}
+
 fn register_test_lua_command(
     registry: &maki_commands::CommandRegistry,
     command: TestLuaCommand,
@@ -237,12 +267,7 @@ fn register_test_lua_command(
             spec: maki_commands::CommandSpec {
                 name: Arc::clone(&command.name),
                 aliases: Arc::from([]),
-                arguments: maki_commands::CommandArguments::Legacy(
-                    command
-                        .max_args
-                        .map(|max| maki_commands::ArgumentArity::bounded(0, max))
-                        .unwrap_or_else(|| maki_commands::ArgumentArity::unbounded(0)),
-                ),
+                arguments: test_command_arguments(command.max_args, command.completion),
                 docs: maki_commands::CommandDocs {
                     summary: Arc::from("Lua test command"),
                     argument_hint: None,
@@ -254,8 +279,13 @@ fn register_test_lua_command(
                 plugin: command.plugin,
                 name: command.name,
             }),
-            completion,
-            argument_completions: Vec::new(),
+            argument_completions: if command.completion {
+                vec![completion]
+            } else if command.max_args == Some(1) {
+                vec![None]
+            } else {
+                Vec::new()
+            },
         }])
         .unwrap();
     producer
@@ -287,12 +317,7 @@ fn lua_registry_with_commands(
                 spec: maki_commands::CommandSpec {
                     name: Arc::clone(&command.name),
                     aliases: Arc::from([]),
-                    arguments: maki_commands::CommandArguments::Legacy(
-                        command
-                            .max_args
-                            .map(|max| maki_commands::ArgumentArity::bounded(0, max))
-                            .unwrap_or_else(|| maki_commands::ArgumentArity::unbounded(0)),
-                    ),
+                    arguments: test_command_arguments(command.max_args, command.completion),
                     docs: maki_commands::CommandDocs {
                         summary: Arc::from("Lua test command"),
                         argument_hint: None,
@@ -304,8 +329,13 @@ fn lua_registry_with_commands(
                     plugin: command.plugin,
                     name: command.name,
                 }),
-                completion,
-                argument_completions: Vec::new(),
+                argument_completions: if command.completion {
+                    vec![completion]
+                } else if command.max_args == Some(1) {
+                    vec![None]
+                } else {
+                    Vec::new()
+                },
             }
         })
         .collect();
@@ -4246,9 +4276,9 @@ fn typed_slash_command_executes() {
 const LUA_COMMAND_RAN: &str = "lua command with args must reach the plugin";
 const LUA_COMMAND_NOT_SENT: &str = "lua command with args must not reach the model";
 
-/// The palette hides a lua command once the typed words pass its `max_args`,
-/// and a hidden command falls through to `handle_submit`, so a multi word
-/// `nargs` command must still be routed to its plugin.
+/// The palette hides a Lua command once the typed words pass its derived
+/// positional bound, and a hidden command falls through to `handle_submit`,
+/// so a multiword raw command must still be routed to its plugin.
 #[test]
 fn typed_lua_command_with_args_executes() {
     let dir = StateDir::from_path(env::temp_dir());
@@ -5165,7 +5195,7 @@ fn btw_empty_is_rejected_by_registry() {
     assert!(actions.is_empty());
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
-        "invalid arguments for /btw: expected 1 or more"
+        "invalid typed arguments for /btw: raw arguments are required"
     );
 }
 
@@ -7112,9 +7142,13 @@ fn at_completion_insertion_synchronizes_argument_completion() {
             spec: maki_commands::CommandSpec {
                 name: Arc::from("/deploy"),
                 aliases: Arc::from([]),
-                arguments: maki_commands::CommandArguments::Legacy(
-                    maki_commands::ArgumentArity::bounded(0, 1),
-                ),
+                arguments: maki_commands::CommandArguments::Positional(Arc::from([
+                    maki_commands::PositionalArgument::optional(
+                        "arg",
+                        maki_commands::ArgumentKind::String,
+                    )
+                    .with_completion(maki_commands::CompletionPolicy::Replace),
+                ])),
                 docs: maki_commands::CommandDocs {
                     summary: Arc::from("Deploy"),
                     argument_hint: None,
@@ -7126,11 +7160,11 @@ fn at_completion_insertion_synchronizes_argument_completion() {
                 plugin: Arc::from("deploy"),
                 name: Arc::from("/deploy"),
             }),
-            completion: Some(Arc::new(TestLuaCompletion {
+            argument_completions: vec![Some(Arc::new(TestLuaCompletion {
                 handle: maki_lua::EventHandle::disconnected_for_test(),
                 plugin: Arc::from("deploy"),
-            })),
-            argument_completions: Vec::new(),
+            })
+                as Arc<dyn maki_commands::CommandCompletion>)],
         }])
         .unwrap();
     app.command_palette = CommandPalette::new(

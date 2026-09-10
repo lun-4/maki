@@ -365,9 +365,8 @@ browsing memory files or toggling settings.
     An optional variadic consumes zero or more values.
     Optional descriptors follow required descriptors.
     A variadic descriptor is last and consumes the
-    remaining values. Typed arguments cannot be used
-    with `nargs` or command-wide `completion`.
-    Typed input uses one quote-aware grammar. Unicode
+    remaining values. Typed input uses one quote-aware
+    grammar. Unicode
     whitespace separates tokens outside quotes. Single
     and double quotes group text, adjacent quoted and
     unquoted fragments concatenate, and empty quotes
@@ -381,13 +380,9 @@ browsing memory files or toggling settings.
     quotes, newlines inside quotes, and decoded values
     remain significant. Newlines separate tokens only
     outside quotes.
-  - `nargs` (`integer|string`) Optional. How many untyped arguments the
-    command takes, spelled like nvim's nargs: 0 (default),
-    1, "?" (zero or one), "*" (zero or more), or "+"
-    (one or more). Legacy arguments use whitespace-
-    separated words and retain legacy handler fields.
-    Invalid legacy counts leave the input as ordinary
-    model text.
+  - `arguments` (`table`) Use `{ raw = true }` for an unparsed argument
+    remainder. Add `required = true` to reject empty
+    input. Raw handlers receive `opts.args` only.
   - `handler` (`function`) Required. Called with one opts table after the
     command arguments pass validation. `opts.args` is
     the outer-trimmed original argument remainder. It
@@ -400,61 +395,42 @@ browsing memory files or toggling settings.
     empty array. A variadic value is always an array.
     File and directory values retain their decoded,
     non-empty, NUL-free spelling and are not expanded
-    or checked for existence by type validation. For
-    legacy commands, `opts.fargs` remains the existing
-    whitespace-split list and `opts.values` is absent.
+    or checked for existence by type validation. Raw
+    commands do not set `opts.fargs` or `opts.values`.
     Typed integers are signed decimal values with no
     separators or alternate bases. The inclusive exact
     range is `-9007199254740991` to
     `9007199254740991`.
-  - `completion` (`table`) Optional for legacy commands. Use `items = {...}`
-    for a static list or `get_items = function(ctx) ->
-    {...}` for dynamic candidates. Typed commands use
-    per-argument providers instead.
-    A typed descriptor omits `completion` for the
-    `default` policy. Defaults are enum choices in
-    the core and file or directory discovery in the
-    TUI. String and integer defaults are empty.
-    Set `completion = false` or
-    `completion = "disabled"` to disable completion.
-    Set `completion = "replace"` or provide a table
-    with `mode = "replace"` to use only the custom
-    provider. Set `completion = "extend"` or
-    `mode = "extend"` to combine defaults and custom
-    candidates. Custom candidates replace duplicate
-    default insertions. A provider table contains
-    exactly one of `items` and `get_items`.
-    Each candidate has `label`, decoded `insertion`,
-    optional `description`, and optional
-    `navigation = "directory"`. Providers return
-    values without command-line quotes. The command
-    UI encodes values with balanced quotes when it
-    inserts them. The compatibility
-    `argument_completion` array may provide the
-    per-argument tables.
-    The callback context retains `command`, `args`,
-    `arg`, `index`, `mode`, `session`, and
-    `generation`. `args` is the argument remainder,
-    not the full slash input. Typed contexts add
-    `argument`, `type`, and `values`. `index` is
-    zero-based. `values` contains successfully parsed
-    preceding values, with variadic values as arrays.
-    `on_highlight(ctx, item)`,
-    `on_accept(ctx, item)`, and `on_cancel(ctx)` are
-    lifecycle callbacks for the provider that owns
-    the candidate. Highlight and accept callbacks
-    never run for another provider's candidate.
-    Session cancellation calls `on_cancel` once for
-    each participating provider that has not
-    terminated. Accept calls `on_accept` for the
-    winning provider and cancels non-winning providers
-    that have not terminated. A final result does not
-    release lifecycle state. Callbacks stay bound to
-    the command registration generation that created
-    the session. A replacement or unload cannot route
-    an old candidate to a new registration. The
-    registration owns callback cleanup after old
-    sessions terminate.
+
+  Completion is declared on each typed descriptor with `completion = false`,
+
+
+  `completion = "disabled"`, `completion = "replace"`,
+
+
+  `completion = "extend"`, or a provider table.
+
+
+  A provider table contains exactly one of `items` and
+
+
+  `get_items`. Defaults are enum choices in the core
+
+
+  and file or directory discovery in the TUI. String
+
+
+  and integer defaults are empty. Provider callbacks
+
+
+  receive the typed argument name, type, parsed
+
+
+  preceding values, and the command completion context.
+
+
+  Raw commands do not have argument completion providers.
+
 
 **Example:**
 
@@ -476,17 +452,12 @@ maki.api.register_command({
 })
 -- `/copy "input file.txt" "build output" overwrite` records decoded values.
 
--- Legacy commands can still provide dynamic completion:
+-- Raw commands preserve the complete argument remainder:
 maki.api.register_command({
   name = "/hello",
   description = "Say hello",
   tui_only = false,
-  nargs = 1,
-  completion = {
-    get_items = function(ctx)
-      return { { label = "world", insertion = "world", description = ctx.mode } }
-    end,
-  },
+  arguments = { raw = true, required = true },
   handler = function(opts)
     recorded = opts.args
   end,

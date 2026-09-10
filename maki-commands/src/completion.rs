@@ -27,7 +27,6 @@ pub(super) struct CompletionSessionOwner {
 
 pub(super) struct CompletionSessionState {
     command: ResolvedCommand,
-    provider: Option<Arc<dyn CommandCompletion>>,
     argument_completions: Vec<Option<Arc<dyn CommandCompletion>>>,
     defaults: CompletionProviders,
     target_id: InvocationTargetId,
@@ -266,14 +265,6 @@ fn completion_argument_metadata(
 }
 
 pub trait CommandCompletion: Send + Sync + 'static {
-    fn argument_completion(&self, _name: &str) -> Option<Arc<dyn CommandCompletion>> {
-        None
-    }
-
-    fn has_legacy_completion(&self) -> bool {
-        true
-    }
-
     fn complete_incremental(
         &self,
         context: CompletionContext,
@@ -327,7 +318,6 @@ pub struct CompletionCandidate {
 pub enum CompletionSource {
     KindDefault,
     Argument(Arc<str>),
-    Legacy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -592,7 +582,6 @@ impl CompletionSession {
         producer_id: ProducerId,
         registry: Weak<RegistryInner>,
         command: ResolvedCommand,
-        provider: Option<Arc<dyn CommandCompletion>>,
         argument_completions: Vec<Option<Arc<dyn CommandCompletion>>>,
         defaults: CompletionProviders,
         target_id: InvocationTargetId,
@@ -600,7 +589,6 @@ impl CompletionSession {
     ) -> Self {
         let state = CompletionSessionState {
             command: command.clone(),
-            provider,
             argument_completions,
             defaults,
             target_id,
@@ -961,36 +949,25 @@ fn providers_for(
         return Vec::new();
     }
 
-    let custom = context
-        .argument_name
-        .as_deref()
-        .and_then(|name| {
-            let descriptor_index = state
-                .command
-                .spec()
-                .arguments
-                .positional()?
-                .iter()
-                .position(|argument| argument.name.as_ref() == name)?;
-            state
-                .argument_completions
-                .get(descriptor_index)
-                .and_then(Option::as_ref)
-                .map(|provider| {
-                    (
-                        Arc::clone(provider),
-                        CompletionSource::Argument(Arc::from(name)),
-                    )
-                })
-        })
-        .or_else(|| {
-            (context.argument_name.is_none()
-                || state.command.spec().arguments.positional().is_none())
-            .then_some(state.provider.as_ref())
-            .flatten()
-            .filter(|provider| provider.has_legacy_completion())
-            .map(|provider| (Arc::clone(provider), CompletionSource::Legacy))
-        });
+    let custom = context.argument_name.as_deref().and_then(|name| {
+        let descriptor_index = state
+            .command
+            .spec()
+            .arguments
+            .positional()?
+            .iter()
+            .position(|argument| argument.name.as_ref() == name)?;
+        state
+            .argument_completions
+            .get(descriptor_index)
+            .and_then(Option::as_ref)
+            .map(|provider| {
+                (
+                    Arc::clone(provider),
+                    CompletionSource::Argument(Arc::from(name)),
+                )
+            })
+    });
     let default = context
         .argument_kind
         .as_ref()

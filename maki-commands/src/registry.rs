@@ -249,10 +249,8 @@ impl CommandRegistry {
         if command.registry_id != self.0.id || target_id.0 != self.0.id {
             return Err(CompletionError::StaleCommand);
         }
-        let provider = command.completion();
         let argument_completions = command.argument_completions();
-        if provider.is_none()
-            && argument_completions.iter().all(Option::is_none)
+        if argument_completions.iter().all(Option::is_none)
             && command.spec().arguments.positional().is_none()
             && defaults.is_empty()
         {
@@ -281,7 +279,6 @@ impl CommandRegistry {
             command.producer_id(),
             Arc::downgrade(&self.0),
             command,
-            provider,
             argument_completions,
             defaults,
             target_id,
@@ -674,28 +671,11 @@ fn validate_registrations(
 ) -> Result<Vec<Registration>, RegistrationError> {
     let mut spellings = HashSet::new();
     for registration in &registrations {
-        if let CommandArguments::Legacy(arity) = &registration.spec.arguments {
-            if arity.max.is_some_and(|max| arity.min > max) {
-                return Err(RegistrationError::InvalidArgumentArity {
-                    min: arity.min,
-                    max: arity.max.unwrap_or_default(),
-                });
-            }
-            if !registration.argument_completions.is_empty() {
-                return Err(RegistrationError::InvalidArgumentSchema(Arc::from(
-                    "legacy commands cannot have argument completion providers",
-                )));
-            }
-        } else if let CommandArguments::Positional(arguments) = &registration.spec.arguments {
+        if let CommandArguments::Positional(arguments) = &registration.spec.arguments {
             validate_positional_arguments(arguments)?;
             if registration.argument_completions.len() != arguments.len() {
                 return Err(RegistrationError::InvalidArgumentSchema(Arc::from(
                     "argument completion providers must match the positional schema",
-                )));
-            }
-            if registration.completion.is_some() {
-                return Err(RegistrationError::InvalidArgumentSchema(Arc::from(
-                    "typed commands cannot have a command-wide completion provider",
                 )));
             }
             for (argument, provider) in arguments.iter().zip(&registration.argument_completions) {
@@ -720,6 +700,10 @@ fn validate_registrations(
                     )));
                 }
             }
+        } else if !registration.argument_completions.is_empty() {
+            return Err(RegistrationError::InvalidArgumentSchema(Arc::from(
+                "raw commands cannot have argument completion providers",
+            )));
         }
         for (spelling, alias) in std::iter::once((&registration.spec.name, false))
             .chain(registration.spec.aliases.iter().map(|alias| (alias, true)))

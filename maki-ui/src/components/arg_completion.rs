@@ -257,7 +257,7 @@ mod tests {
     use std::sync::Arc;
 
     use maki_commands::{
-        ArgumentArity, CommandBehavior, CommandDocs, CommandError, CommandFuture,
+        CommandArguments, CommandBehavior, CommandDocs, CommandError, CommandFuture,
         CommandInvocation, CommandOutcome, CommandRegistry, CommandSpec, CompletionResult,
         HostResponse, ProducerPrecedence, Registration, TargetCapabilities,
     };
@@ -297,7 +297,13 @@ mod tests {
                 spec: CommandSpec {
                     name: Arc::from("/theme"),
                     aliases: Vec::new().into(),
-                    arguments: maki_commands::CommandArguments::Legacy(ArgumentArity::unbounded(0)),
+                    arguments: CommandArguments::Positional(Arc::from([
+                        maki_commands::PositionalArgument::optional(
+                            "theme",
+                            maki_commands::ArgumentKind::String,
+                        )
+                        .with_completion(maki_commands::CompletionPolicy::Replace),
+                    ])),
                     docs: CommandDocs {
                         summary: Arc::from("test"),
                         argument_hint: None,
@@ -305,8 +311,7 @@ mod tests {
                     required_capabilities: TargetCapabilities::default(),
                 },
                 behavior: Arc::new(NoBehavior),
-                completion: Some(source.clone()),
-                argument_completions: Vec::new(),
+                argument_completions: vec![Some(source.clone())],
             }])
             .unwrap();
         (source, registry)
@@ -422,7 +427,6 @@ mod tests {
                     required_capabilities: TargetCapabilities::default(),
                 },
                 behavior: Arc::new(NoBehavior),
-                completion: None,
                 argument_completions: vec![None],
             }])
             .unwrap();
