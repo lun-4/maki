@@ -18,6 +18,7 @@ pub use types::{
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -175,11 +176,15 @@ impl AgentManagerHandle {
             graph.revision += 1;
             reservation
         };
-        let backend = match factory(agent_id) {
-            Ok(backend) => backend,
-            Err(error) => {
+        let backend = match catch_unwind(AssertUnwindSafe(|| factory(agent_id))) {
+            Ok(Ok(backend)) => backend,
+            Ok(Err(error)) => {
                 self.rollback_reservation(agent_id, reservation);
                 return Err(ManagerError::Factory(error.to_string()));
+            }
+            Err(_) => {
+                self.rollback_reservation(agent_id, reservation);
+                return Err(ManagerError::Factory("agent factory panicked".into()));
             }
         };
         self.commit_actor(
@@ -306,11 +311,15 @@ impl AgentManagerHandle {
             graph.revision += 1;
             reservation
         };
-        let backend = match factory(child_id) {
-            Ok(backend) => backend,
-            Err(error) => {
+        let backend = match catch_unwind(AssertUnwindSafe(|| factory(child_id))) {
+            Ok(Ok(backend)) => backend,
+            Ok(Err(error)) => {
                 self.rollback_reservation(child_id, reservation);
                 return Err(ManagerError::Factory(error.to_string()));
+            }
+            Err(_) => {
+                self.rollback_reservation(child_id, reservation);
+                return Err(ManagerError::Factory("agent factory panicked".into()));
             }
         };
         self.commit_actor(
@@ -372,15 +381,19 @@ impl AgentManagerHandle {
         child_id: AgentId,
         ticket: crate::TurnTicket,
         timeout: Option<Duration>,
-    ) -> Result<ManagedPromptWait, ManagerError> {
+    ) -> Result<ManagedPromptWait, (ManagerError, bool)> {
         if !Arc::ptr_eq(&lease.inner, &current.lease.inner) {
-            return Err(ManagerError::WrongManager);
+            return Err((ManagerError::WrongManager, false));
         }
-        self.validate_descendant(current, child_id)?;
+        self.validate_descendant(current, child_id)
+            .map_err(|error| (error, false))?;
 
         let watcher_id = self.0.next_watcher.fetch_add(1, Ordering::Relaxed);
         let (cancel, cancel_token) = crate::ReasonedCancelToken::new();
-        lease.inner.suspend(watcher_id, cancel.clone())?;
+        lease
+            .inner
+            .suspend(watcher_id, cancel.clone())
+            .map_err(|error| (error, true))?;
         let wait = Arc::new(PromptWaitInner {
             lease: Arc::clone(&lease.inner),
             manager: Arc::downgrade(&self.0),
@@ -726,7 +739,7 @@ impl AgentManagerHandle {
             }
             let finished = self.finished_nodes(&pending);
             if finished.is_empty() {
-                smol::future::yield_now().await;
+                smol::Timer::after(SHUTDOWN_POLL_INTERVAL).await;
                 continue;
             }
             self.take_finished_tasks(&finished.into_iter().collect::<Vec<_>>())

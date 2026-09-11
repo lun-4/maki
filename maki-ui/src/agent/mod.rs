@@ -366,11 +366,6 @@ impl AgentHandles {
         }
     }
 
-    pub(crate) fn cancel(self) {
-        let _ = self.manager.cancel_subtree(self.root_id);
-        self.subagent_cancels.cancel_all();
-    }
-
     /// Shuts the old actor down after the app and queue are repointed, so
     /// its close cannot poison the replacement. Everything the old agent
     /// still owns drains through the retained per-tab output channel.
@@ -448,6 +443,7 @@ impl AgentHandles {
     }
 
     pub(crate) fn shutdown(self) -> smol::Task<()> {
+        self.subagent_cancels.cancel_all();
         smol::spawn(async move {
             let _ = self.manager.shutdown(Duration::from_secs(3)).await;
         })

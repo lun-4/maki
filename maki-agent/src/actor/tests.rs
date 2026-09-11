@@ -13,7 +13,7 @@ use super::types::{
 };
 use super::{ActorBackend, ActorError, ActorWork, AgentActorHandle, TurnAdmission};
 use crate::types::{AgentId, DoneReason, EventSender, TurnCancellationReason, TurnOutcome};
-use crate::{AgentInput, AgentMode, ExtractedCommand, SharedMessages};
+use crate::{AgentEvent, AgentInput, AgentMode, ExtractedCommand, SharedMessages};
 
 /// Shared observations the scripted backend records for the test to assert.
 #[derive(Default)]
@@ -633,13 +633,19 @@ fn setup_failure_delivered_exactly_once() {
             .admit_turn(input("work"), Some(EventSender::new(tx, 0)), "w".into())
             .unwrap();
         let outcome = ticket.wait().await;
-        let events: Vec<_> = rx.drain().collect();
-        assert_eq!(
-            events.len(),
-            1,
-            "synthesized outcome delivered exactly once"
+        let event = rx
+            .try_recv()
+            .expect("ticket resolved before outcome delivery");
+        assert!(matches!(
+            event.event,
+            AgentEvent::TurnOutcome(TurnOutcome::Failed { .. })
+        ));
+        assert!(
+            rx.is_empty(),
+            "synthesized outcome delivered more than once"
         );
         assert!(matches!(outcome, TurnOutcome::Failed { .. }));
+        assert_eq!(handle.snapshot().status, ActorStatus::Idle);
         handle.close();
         task.await;
     });

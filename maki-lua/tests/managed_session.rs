@@ -5,8 +5,9 @@ use std::time::Duration;
 
 use maki_agent::tools::{ToolContext, ToolRegistry};
 use maki_agent::{
-    ActorBackend, AgentInput, AgentLimits, AgentManagerHandle, AgentMode, BackendResult,
-    ControlWork, DoneReason, GraphLifecycle, History, TurnContext, TurnOutcome, WorkKind,
+    ActorBackend, AgentEvent, AgentInput, AgentLimits, AgentManagerHandle, AgentMode,
+    BackendResult, ControlWork, DoneReason, GraphLifecycle, History, TurnContext, TurnOutcome,
+    WorkKind,
 };
 use maki_lua::PluginHost;
 use serde_json::json;
@@ -24,11 +25,18 @@ maki.api.register_tool({
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function(_, ctx)
-    local session, err = maki.agent.session(ctx, { name = "managed-child" })
+    local session, err = maki.agent.session(ctx, {
+      name = "managed-child",
+      inherit_provider = true,
+    })
     if not session then
       return { llm_output = err, is_error = true }
     end
+    local result, prompt_err = session:prompt("reply")
     session:close()
+    if not result then
+      return { llm_output = prompt_err, is_error = true }
+    end
     return "ok"
   end,
 })
@@ -112,7 +120,7 @@ fn managed_session_uses_root_authority_and_closes_its_node() {
         let registry = Arc::new(ToolRegistry::new());
         let _host = PluginHost::new(Arc::clone(&registry)).unwrap();
         _host.load_source("managed-session", PLUGIN_SRC).unwrap();
-        let (context, _events, _cancel) = common::ctx_with_canned_provider();
+        let (context, events, _cancel) = common::ctx_with_canned_provider();
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
         let (completed_tx, completed_rx) = flume::bounded(1);
         let root = manager
@@ -153,6 +161,11 @@ fn managed_session_uses_root_authority_and_closes_its_node() {
         assert_eq!(child.root_id, root.id());
         assert_eq!(child.depth, 1);
         assert_eq!(child.graph_lifecycle, GraphLifecycle::Closed);
+        let envelope = events
+            .try_iter()
+            .find(|envelope| matches!(envelope.event, AgentEvent::SubagentHistory { .. }))
+            .expect("managed child history envelope");
+        assert_eq!(envelope.subagent.unwrap().agent_id, child.agent_id);
 
         let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
         assert!(report.timed_out.is_empty());

@@ -95,6 +95,7 @@ struct AdapterResult {
 /// `status` never read through this struct; they speak to the actor handle.
 struct LuaActorState {
     params: AgentParams,
+    agent_id: OnceLock<AgentId>,
     system: String,
     tools: JsonValue,
     thinking: ThinkingConfig,
@@ -131,7 +132,10 @@ impl LuaActorState {
     fn init_subagent_info(&self, first_message: &str) {
         if self.subagent_info.get().is_none() {
             let _ = self.subagent_info.set(SubagentInfo {
-                agent_id: self.params.agent_id,
+                agent_id: *self
+                    .agent_id
+                    .get()
+                    .expect("session identity must be initialized before admission"),
                 parent_agent_id: self.parent_agent_id,
                 parent_is_root: self.parent_is_root,
                 auto_deliver: self.auto_deliver,
@@ -786,8 +790,11 @@ async fn is_yolo(_lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<Pair<bo
 ///     usage into the parent session's UI or event stream. The session still
 ///     completes and `:prompt()` still returns its result (including a commit
 ///     set via a `local_tools` handler). Use for hidden one-shot classification.
+///   `auto_deliver` (boolean?) - queue completed output for the parent agent.
+///     Default: `true`.
 ///   `semaphore` (maki.async.Semaphore?) - concurrency limit acquired by the
-///     driver immediately before each turn and released when that turn ends.
+///     driver immediately before each unmanaged turn and released when that turn
+///     ends. Managed sessions ignore it and use the parent manager's limit.
 /// @return (Session?, string?) Session handle, or `(nil, err)` on failure.
 /// @example
 /// local tools = maki.agent.tools(ctx, { audience = "general_sub" })
@@ -1001,6 +1008,7 @@ async fn session(
     });
     let state = Arc::new(LuaActorState {
         params,
+        agent_id: OnceLock::new(),
         system: system.unwrap_or_default(),
         tools: tools_json,
         thinking,
@@ -1042,7 +1050,11 @@ async fn session(
             None,
             Box::new(LuaActorBackend::new(Arc::clone(&state))),
         ));
-        let actor = child.actor().map_err(mlua::Error::external)?;
+        state
+            .agent_id
+            .set(child.id())
+            .expect("session identity must only be initialized once");
+        let actor = try_pair!(child.actor());
         (
             actor,
             SessionControl::Managed {
@@ -1051,6 +1063,10 @@ async fn session(
             },
         )
     } else {
+        state
+            .agent_id
+            .set(agent_id)
+            .expect("session identity must only be initialized once");
         let (actor, task) = AgentActorHandle::spawn(
             agent_id,
             Vec::new(),
@@ -1387,10 +1403,11 @@ async fn prompt(
         match wait.wait().await {
             Ok(outcome) => outcome,
             Err(maki_agent::PromptWaitError::Timeout) => {
-                return Ok(err_pair(format!(
-                    "session prompt timed out after {}s",
-                    timeout.expect("managed timeout error requires a timeout")
-                )));
+                let message = timeout.map_or_else(
+                    || "session prompt timed out".to_owned(),
+                    |seconds| format!("session prompt timed out after {seconds}s"),
+                );
+                return Ok(err_pair(message));
             }
             Err(
                 maki_agent::PromptWaitError::Cancelled | maki_agent::PromptWaitError::LeaseClosed,
@@ -1893,6 +1910,7 @@ mod tests {
         };
         let state = Arc::new(LuaActorState {
             params,
+            agent_id: OnceLock::from(agent_id),
             system: String::new(),
             tools: JsonValue::Array(vec![]),
             thinking: ThinkingConfig::Off,

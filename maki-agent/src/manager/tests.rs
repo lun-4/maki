@@ -221,6 +221,23 @@ fn root_and_nested_children_use_one_factory() {
 }
 
 #[test]
+fn duplicate_root_is_rejected_without_mutating_graph() {
+    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+    let root = manager
+        .create_root(Vec::new(), None, TestBackend::boxed())
+        .unwrap();
+
+    let error = manager
+        .create_root(Vec::new(), None, TestBackend::boxed())
+        .unwrap_err();
+
+    assert_eq!(error, ManagerError::DuplicateRoot);
+    assert_eq!(manager.snapshot().len(), 1);
+    assert_eq!(manager.root_id().unwrap(), root.id());
+    smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
+}
+
+#[test]
 fn wrong_manager_capability_is_rejected() {
     let (manager, _, current, gate) = active_root(AgentLimits::default());
     let other = AgentManagerHandle::new(AgentLimits::default()).unwrap();
@@ -280,6 +297,66 @@ fn factory_failure_rolls_back_reservation() {
     manager
         .create_root(Vec::new(), None, TestBackend::boxed())
         .unwrap();
+}
+
+#[test]
+fn panicking_root_factory_rolls_back_reservation() {
+    let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+    let error = manager
+        .create_root_with(
+            Vec::new(),
+            None,
+            |_| -> Result<Box<dyn ActorBackend>, String> { panic!("factory panic") },
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        ManagerError::Factory("agent factory panicked".into())
+    );
+    assert!(manager.snapshot().is_empty());
+    manager
+        .create_root(Vec::new(), None, TestBackend::boxed())
+        .unwrap();
+}
+
+#[test]
+fn panicking_child_factory_restores_capacity() {
+    let limits = AgentLimits {
+        max_children_per_agent: 1,
+        max_live_agents: 2,
+        ..AgentLimits::default()
+    };
+    let (manager, _root, current, gate) = active_root(limits);
+    let error = manager
+        .spawn_child_with(
+            &current,
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            |_| -> Result<Box<dyn ActorBackend>, String> { panic!("factory panic") },
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        ManagerError::Factory("agent factory panicked".into())
+    );
+    let child = manager
+        .spawn_child(
+            &current,
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            TestBackend::boxed(),
+        )
+        .unwrap();
+    assert_eq!(manager.snapshot().len(), 2);
+
+    child.close_subtree().unwrap();
+    drop(current);
+    drop(gate);
+    smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
 }
 
 #[test]
@@ -398,6 +475,39 @@ fn depth_and_child_limits_are_atomic() {
             max: 1
         }
     );
+    assert_eq!(manager.snapshot().len(), 2);
+    gate.release(1);
+    smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
+}
+
+#[test]
+fn live_agent_limit_is_atomic() {
+    let limits = AgentLimits {
+        max_live_agents: 2,
+        ..AgentLimits::default()
+    };
+    let (manager, _, current, gate) = active_root(limits);
+    manager
+        .spawn_child(
+            &current,
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            TestBackend::boxed(),
+        )
+        .unwrap();
+
+    let error = manager
+        .spawn_child(
+            &current,
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            TestBackend::boxed(),
+        )
+        .unwrap_err();
+
+    assert_eq!(error, ManagerError::LiveAgentLimit { max: 2 });
     assert_eq!(manager.snapshot().len(), 2);
     gate.release(1);
     smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
@@ -537,6 +647,56 @@ fn descendant_preflight_rejects_before_suspension() {
     assert!(report.timed_out.is_empty());
     let report = smol::block_on(other.shutdown(std::time::Duration::from_secs(1)));
     assert!(report.timed_out.is_empty());
+}
+
+#[test]
+fn unauthorized_prompt_wait_does_not_cancel_child_turn() {
+    smol::block_on(async {
+        let (manager, _, current, root_gate) = active_root(AgentLimits::default());
+        let child_gate = Gate::new();
+        let (child_tx, child_rx) = flume::bounded(1);
+        let child = manager
+            .spawn_child(
+                &current,
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::reporting(child_tx, Some(Arc::clone(&child_gate))),
+            )
+            .unwrap();
+        let actor = child.actor().unwrap();
+        let ticket = actor.admit_turn(input(), None, "child".into()).unwrap();
+        child_rx.recv_async().await.unwrap();
+        let (wrong_manager, _, wrong_current, wrong_gate) = active_root(AgentLimits::default());
+
+        let Err(error) = wrong_current.lease().wait_for_descendant(
+            &wrong_current,
+            child.id(),
+            &actor,
+            ticket.clone(),
+            None,
+        ) else {
+            panic!("wrong manager accepted prompt wait");
+        };
+        assert_eq!(error, ManagerError::UnknownAgent(child.id()));
+        let mut pending = Box::pin(ticket.wait());
+        assert!(
+            futures_lite::future::poll_once(&mut pending)
+                .await
+                .is_none()
+        );
+
+        child_gate.release(1);
+        assert!(matches!(pending.await, TurnOutcome::Completed { .. }));
+        root_gate.release(1);
+        wrong_gate.release(1);
+        let report = manager.shutdown(std::time::Duration::from_secs(1)).await;
+        assert!(report.timed_out.is_empty());
+        let report = wrong_manager
+            .shutdown(std::time::Duration::from_secs(1))
+            .await;
+        assert!(report.timed_out.is_empty());
+    });
 }
 
 #[test]

@@ -3003,9 +3003,8 @@ mod tests {
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
         // The crash happened between the record's closing brace and the
         // newline the writer emits after it.
-        let record =
-            serde_json::to_string(&serde_json::json!({"t":"msg","d":{"role":"user"}})).unwrap();
-        file.write_all(record.as_bytes()).unwrap();
+        file.write_all(br#"{"t":"msg","d":{"role":"user"}}"#)
+            .unwrap();
         drop(file);
 
         let list = TestSession::list_in("/project", dir).unwrap();

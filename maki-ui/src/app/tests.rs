@@ -7551,6 +7551,10 @@ fn duplicate_compatibility_ids_route_by_agent_id() {
     assert_eq!(app.chats[first_index].last_message_text(), FIRST_TEXT);
     assert_eq!(app.chats[second_index].last_message_text(), SECOND_TEXT);
 
+    app.update(done_event());
+    assert_eq!(app.live_chat_index[&first_id], first_index);
+    assert_eq!(app.live_chat_index[&second_id], second_index);
+
     app.active_chat = second_index;
     assert!(matches!(
         app.submit_prompt(queued_msg("continue")),

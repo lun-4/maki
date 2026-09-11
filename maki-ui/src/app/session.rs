@@ -18,7 +18,9 @@ use crate::AppSession;
 use super::PendingInput;
 #[cfg(test)]
 use super::session_state::SessionState;
-use super::session_state::{rules_to_stored, stored_to_rules};
+use super::session_state::rules_to_stored;
+#[cfg(test)]
+use super::session_state::stored_to_rules;
 use super::{App, Status};
 
 /// The shortest gap between two writes that carry only UI state.
@@ -272,8 +274,6 @@ impl App {
     /// history, so no respawn follows and the restored queue must be
     /// flushed here.
     pub(crate) fn restore_resumed_session(&mut self) {
-        self.permissions
-            .load_session_rules(stored_to_rules(&self.state.session.meta.session_rules));
         self.restore_display();
         self.flush_restored_queue();
         for w in self.state.warnings.drain(..) {

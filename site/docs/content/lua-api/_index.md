@@ -1224,8 +1224,11 @@ and tool set.
     usage into the parent session's UI or event stream. The session still
     completes and `:prompt()` still returns its result (including a commit
     set via a `local_tools` handler). Use for hidden one-shot classification.
+  - `auto_deliver` (`boolean?`) queue completed output for the parent agent.
+    Default: `true`.
   - `semaphore` (`maki.async.Semaphore?`) concurrency limit acquired by the
-    driver immediately before each turn and released when that turn ends.
+    driver immediately before each unmanaged turn and released when that turn
+    ends. Managed sessions ignore it and use the parent manager's limit.
 
 **Returns:** ([`Session?`](#maki-agent-Session), `string?`) Session handle, or `(nil, err)` on failure.
 

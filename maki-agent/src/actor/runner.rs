@@ -446,6 +446,11 @@ impl Runner {
         outcome: Option<TurnOutcome>,
         deliver: bool,
     ) {
+        {
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.active = None;
+            state.status = ActorStatus::Idle;
+        }
         if let Some(outcome) = outcome {
             finalize_turn(
                 &self.inner,
@@ -455,10 +460,6 @@ impl Runner {
                 deliver,
             );
         }
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.active = None;
-        state.status = ActorStatus::Idle;
-        drop(state);
         self.wake.wake();
     }
 }

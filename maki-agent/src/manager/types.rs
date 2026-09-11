@@ -186,8 +186,10 @@ impl TurnPermitLease {
             .register_prompt_wait(current, self, child_id, ticket, timeout)
         {
             Ok(wait) => Ok(wait),
-            Err(error) => {
-                let _ = actor.cancel_turn(turn_id);
+            Err((error, cancel_ticket)) => {
+                if cancel_ticket {
+                    let _ = actor.cancel_turn(turn_id);
+                }
                 Err(error)
             }
         }

@@ -415,6 +415,14 @@ impl PreparedApp {
         self.command_target.handle().id()
     }
 
+    #[cfg(test)]
+    pub(crate) fn session_rule_allows(&self, tool: &ToolKey, scope: &str) -> bool {
+        matches!(
+            self.app.permissions.check(tool, scope, None),
+            maki_agent::permissions::PermissionCheck::Allowed
+        )
+    }
+
     pub(crate) fn activate(mut self) -> App {
         let target = self.command_target.activate();
         self.app.command_target = target.clone();
@@ -447,6 +455,9 @@ impl App {
         command_runtime: Arc<CommandRuntime>,
     ) -> PreparedApp {
         let state = SessionState::from_session(session, model, &storage, &model_policy);
+        permissions.load_session_rules(session_state::stored_to_rules(
+            &state.session.meta.session_rules,
+        ));
         let typewriter = ui_config.typewriter_ms_per_char;
         let flash = ui_config.flash_duration();
         let input_box = InputBox::new(
@@ -2884,8 +2895,9 @@ impl App {
                 false
             }
         });
-        self.live_chat_index
-            .retain(|_, index| self.chat_index.values().any(|value| value == index));
+        self.live_chat_index.retain(|_, index| {
+            reusable.contains(index) || self.chat_index.values().any(|value| value == index)
+        });
         self.subagent_channels
             .retain(|id, _| self.live_chat_index.contains_key(id));
         self.sync_subagents();

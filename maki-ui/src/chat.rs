@@ -198,8 +198,7 @@ impl Chat {
                     ));
                 }
             }
-            AgentEvent::SubagentHistory { .. } => {}
-            AgentEvent::SubagentClosed => unreachable!("handled before chat event routing"),
+            AgentEvent::SubagentHistory { .. } | AgentEvent::SubagentClosed => {}
             AgentEvent::LiveToolBuf { id, body } => {
                 self.messages_panel.register_live_buf(id, body);
             }

@@ -151,24 +151,26 @@ pub(crate) fn finalize_turn(
                 vacant.insert(outcome.clone());
                 *inner.latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome.clone());
                 *inner.usage.lock().unwrap_or_else(|e| e.into_inner()) += outcome.usage();
-                if let Some(admission) = admission {
-                    admission.ticket.resolve(outcome.clone());
-                    inner
-                        .tickets
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&turn_id);
-                }
                 true
             }
         }
     };
-    if first
-        && deliver
+    if !first {
+        return;
+    }
+    if deliver
         && let Some(admission) = admission
         && let Some(sender) = &admission.event_sender
     {
-        let _ = sender.send(AgentEvent::TurnOutcome(outcome));
+        let _ = sender.send(AgentEvent::TurnOutcome(outcome.clone()));
+    }
+    if let Some(admission) = admission {
+        admission.ticket.resolve(outcome);
+        inner
+            .tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&turn_id);
     }
 }
 
