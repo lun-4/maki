@@ -1,0 +1,34 @@
+use thiserror::Error;
+
+use crate::{AgentId, TurnId};
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ManagerError {
+    #[error("the agent graph already has a root")]
+    DuplicateRoot,
+    #[error("the agent graph has no root")]
+    MissingRoot,
+    #[error("agent {0} is unknown")]
+    UnknownAgent(AgentId),
+    #[error("agent {0} is not live")]
+    NonLiveAgent(AgentId),
+    #[error("agent graph is shutting down")]
+    GraphShutdown,
+    #[error("agent depth {depth} exceeds the configured maximum {max}")]
+    DepthExceeded { depth: usize, max: usize },
+    #[error("agent {parent_id} already has the configured maximum of {max} live children")]
+    ChildLimit { parent_id: AgentId, max: usize },
+    #[error("agent graph already has the configured maximum of {max} live agents")]
+    LiveAgentLimit { max: usize },
+    #[error("managed turn authority belongs to another manager")]
+    WrongManager,
+    #[error("managed turn {turn_id} for agent {agent_id} is no longer active")]
+    InactiveTurn { agent_id: AgentId, turn_id: TurnId },
+    #[error("agent {child_id} is not a descendant of agent {parent_id}")]
+    NotDescendant {
+        parent_id: AgentId,
+        child_id: AgentId,
+    },
+    #[error("agent factory failed: {0}")]
+    Factory(String),
+}

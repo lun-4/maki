@@ -26,6 +26,8 @@ pub struct SessionMailbox {
     state: Arc<Mutex<State>>,
 }
 
+pub struct PreparedSessionMailbox(SessionMailbox);
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -37,9 +39,19 @@ impl SessionMailbox {
             return Self { session_id, state };
         }
 
-        let state = Arc::new(Mutex::new(State::default()));
-        mailboxes.insert(session_id, Arc::downgrade(&state));
-        Self { session_id, state }
+        let mailbox = Self {
+            session_id,
+            state: Arc::new(Mutex::new(State::default())),
+        };
+        mailboxes.insert(session_id, Arc::downgrade(&mailbox.state));
+        mailbox
+    }
+
+    pub fn prepare(session_id: MakiId) -> PreparedSessionMailbox {
+        PreparedSessionMailbox(Self {
+            session_id,
+            state: Arc::new(Mutex::new(State::default())),
+        })
     }
 
     pub fn notify(session_id: MakiId, text: String, wake: bool) -> Result<(), MailboxError> {
@@ -76,6 +88,17 @@ impl SessionMailbox {
     }
 }
 
+impl PreparedSessionMailbox {
+    pub fn mailbox(&self) -> SessionMailbox {
+        self.0.clone()
+    }
+
+    pub fn activate(self) -> SessionMailbox {
+        lock(&MAILBOXES).insert(self.0.session_id, Arc::downgrade(&self.0.state));
+        self.0
+    }
+}
+
 impl Drop for SessionMailbox {
     fn drop(&mut self) {
         if Arc::strong_count(&self.state) != 1 {
@@ -99,6 +122,27 @@ mod tests {
 
     fn text(message: &Message) -> &str {
         message.user_text().unwrap()
+    }
+
+    #[test]
+    fn prepared_mailbox_is_not_addressable_until_activation() {
+        let id = MakiId::generate();
+        let prepared = SessionMailbox::prepare(id);
+        let mailbox = prepared.mailbox();
+
+        assert!(SessionMailbox::notify(id, "early".into(), false).is_err());
+        let activated = prepared.activate();
+        SessionMailbox::notify(id, "ready".into(), false).unwrap();
+        assert_eq!(activated.drain().len(), 1);
+        drop(mailbox);
+    }
+
+    #[test]
+    fn dropped_prepared_mailbox_is_never_addressable() {
+        let id = MakiId::generate();
+        drop(SessionMailbox::prepare(id));
+
+        assert!(SessionMailbox::notify(id, "late".into(), false).is_err());
     }
 
     #[test]

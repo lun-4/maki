@@ -20,19 +20,23 @@ mod runner;
 mod tickets;
 mod types;
 
+#[cfg(test)]
+mod tests;
+
 pub use actor_error::ActorError;
 pub use queue::{ActorQueue, InterruptQueue, QueueProjection};
 pub use tickets::TurnTicket;
+pub(crate) use types::ManagedTurnAdmission;
 pub use types::{
     ActorBackend, ActorLifecycle, ActorSnapshot, ActorStatus, BackendResult, ControlWork, RootWork,
     TurnAdmission, TurnContext, WorkKind,
 };
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use maki_providers::{Message, TokenUsage};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::cancel::{CancelToken, ReasonedCancelToken, ReasonedCancelTrigger};
 use crate::types::{AgentEvent, AgentId, EventSender, TurnCancellationReason, TurnId, TurnOutcome};
@@ -58,6 +62,9 @@ pub(crate) struct ActorInner {
     pub(crate) latest: Mutex<Option<TurnOutcome>>,
     pub(crate) usage: Mutex<TokenUsage>,
     pub(crate) tickets: Mutex<HashMap<TurnId, TurnTicket>>,
+    pub(crate) managed_admission: Option<ManagedTurnAdmission>,
+    #[cfg(test)]
+    pub(crate) after_pop: Mutex<Option<(flume::Sender<()>, flume::Receiver<()>)>>,
 }
 
 /// Lifecycle, run status, and the active turn's cancellation wiring. One
@@ -70,6 +77,8 @@ pub(crate) struct ActorState {
     pub(crate) status: ActorStatus,
     pub(crate) active: Option<ActiveCancel>,
     pub(crate) cancelled_correlations: HashMap<String, TurnCancellationReason>,
+    pub(crate) cancelled_turns: HashSet<TurnId>,
+    pub(crate) cancellation_generation: u64,
 }
 
 impl ActorState {
@@ -79,6 +88,8 @@ impl ActorState {
             status: ActorStatus::Idle,
             active: None,
             cancelled_correlations: HashMap::new(),
+            cancelled_turns: HashSet::new(),
+            cancellation_generation: 0,
         }
     }
 }
@@ -210,6 +221,32 @@ impl AgentActorHandle {
         shared_messages: Option<SharedMessages>,
         backend: Box<dyn ActorBackend>,
     ) -> (Self, smol::Task<()>) {
+        Self::spawn_inner(agent_id, initial_messages, shared_messages, backend, None)
+    }
+
+    pub(crate) fn spawn_managed(
+        agent_id: AgentId,
+        initial_messages: Vec<Message>,
+        shared_messages: Option<SharedMessages>,
+        backend: Box<dyn ActorBackend>,
+        managed_admission: ManagedTurnAdmission,
+    ) -> (Self, smol::Task<()>) {
+        Self::spawn_inner(
+            agent_id,
+            initial_messages,
+            shared_messages,
+            backend,
+            Some(managed_admission),
+        )
+    }
+
+    fn spawn_inner(
+        agent_id: AgentId,
+        initial_messages: Vec<Message>,
+        shared_messages: Option<SharedMessages>,
+        backend: Box<dyn ActorBackend>,
+        managed_admission: Option<ManagedTurnAdmission>,
+    ) -> (Self, smol::Task<()>) {
         let history = match shared_messages {
             Some(mirror) => History::restored(initial_messages).with_mirror(mirror),
             None => History::restored(initial_messages),
@@ -222,6 +259,9 @@ impl AgentActorHandle {
             latest: Mutex::new(None),
             usage: Mutex::new(TokenUsage::default()),
             tickets: Mutex::new(HashMap::new()),
+            managed_admission,
+            #[cfg(test)]
+            after_pop: Mutex::new(None),
         });
         let wake = Arc::new(runner::WakeFlag::new());
         let handle = Self {
@@ -234,6 +274,18 @@ impl AgentActorHandle {
 
     pub fn agent_id(&self) -> AgentId {
         self.inner.agent_id
+    }
+
+    #[cfg(test)]
+    fn pause_after_next_pop(&self) -> (flume::Receiver<()>, flume::Sender<()>) {
+        let (popped_tx, popped_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        *self
+            .inner
+            .after_pop
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((popped_tx, release_rx));
+        (popped_rx, release_tx)
     }
 
     /// Admits one turn. The [`TurnId`] and ticket are allocated immediately
@@ -429,9 +481,78 @@ impl AgentActorHandle {
     /// Cancels the active turn, terminalizes every queued admitted turn, and
     /// drops queued roots/controls. The actor stays open and reusable.
     pub fn cancel_all(&self) {
-        self.fire_active(TurnCancellationReason::User);
+        self.cancel_existing();
+    }
+
+    /// Cancels exactly the active and queued work present at one actor cut.
+    /// The state lock spans active removal and queue draining, so a runner
+    /// cannot move a turn through the pop/install gap without observing the cut.
+    pub fn cancel_existing(&self) {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.cancellation_generation = state.cancellation_generation.wrapping_add(1);
+        let active = state.active.take();
         let drained = self.inner.queue.drain_all();
+        drop(state);
+        if let Some(active) = active {
+            active.fire(TurnCancellationReason::User);
+        }
         terminalize_work(&self.inner, drained, TurnCancellationReason::User);
+    }
+
+    /// Cancels one already-admitted turn by nominal identity. The exact turn
+    /// is caught while queued, active, or between queue pop and active install.
+    /// Unknown and already-terminal turns are rejected; no future admission is
+    /// affected.
+    pub fn cancel_turn(&self, turn_id: TurnId) -> Result<(), ActorError> {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.lifecycle != ActorLifecycle::Open {
+            return Err(match state.lifecycle {
+                ActorLifecycle::Closed => ActorError::Closed,
+                ActorLifecycle::Shutdown => ActorError::Shutdown,
+                ActorLifecycle::Open => unreachable!(),
+            });
+        }
+        if !self
+            .inner
+            .tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&turn_id)
+        {
+            return Err(ActorError::UnknownTurn(turn_id));
+        }
+        let active = if state.status == ActorStatus::Running(turn_id) {
+            state.active.take()
+        } else {
+            None
+        };
+        let queued = self.inner.queue.remove_turn(turn_id);
+        if active.is_none()
+            && queued.is_none()
+            && state.lifecycle == ActorLifecycle::Open
+            && state.status == ActorStatus::Idle
+        {
+            state.cancelled_turns.insert(turn_id);
+        }
+        drop(state);
+        if let Some(active) = active {
+            active.fire(TurnCancellationReason::User);
+        }
+        if let Some(admission) = queued {
+            let outcome = cancelled_outcome(
+                self.inner.agent_id,
+                admission.turn_id,
+                TurnCancellationReason::User,
+            );
+            finalize_turn(
+                &self.inner,
+                admission.turn_id,
+                outcome,
+                Some(&admission),
+                true,
+            );
+        }
+        Ok(())
     }
 
     /// Closes the actor: admissions are rejected, the active turn is
@@ -594,6 +715,7 @@ impl AgentActorHandle {
             }
             state.lifecycle = lifecycle;
             state.cancelled_correlations.clear();
+            state.cancelled_turns.clear();
             state.active.take()
         };
         if let Some(active) = active {
@@ -604,19 +726,5 @@ impl AgentActorHandle {
         self.inner.queue.notify();
         self.wake.wake();
         info!(agent_id = %self.inner.agent_id, ?reason, ?lifecycle, "actor closed");
-    }
-
-    fn fire_active(&self, reason: TurnCancellationReason) {
-        let active = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .active
-            .take();
-        if let Some(active) = active {
-            active.fire(reason);
-        }
-        warn!(agent_id = %self.inner.agent_id, ?reason, "active turn cancelled");
     }
 }

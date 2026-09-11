@@ -4,9 +4,8 @@
 
 use std::sync::Arc;
 
-use maki_agent::tools::ToolContext;
-use maki_agent::tools::ToolRegistry;
 use maki_agent::tools::test_support::stub_ctx;
+use maki_agent::tools::{ToolAudience, ToolContext, ToolRegistry};
 use maki_agent::{AgentMode, ToolOutput};
 use maki_lua::PluginHost;
 use maki_providers::provider::{BoxFuture, Provider};
@@ -44,6 +43,7 @@ const PROMPT_ERR_MSG: &str = "model exploded";
 const RAISE_MSG: &str = "stub prompt kaboom";
 const PARTIAL_TEXT: &str = "half a transcript";
 const CANCELLED_ERR: &str = "cancelled";
+const DUPLICATE_TASK_ID_ERR: &str = "duplicate task_id";
 /// Mirrors the task plugin's `max_concurrent` default.
 const TASK_DEFAULT_MAX_CONCURRENT: u64 = 8;
 
@@ -580,6 +580,22 @@ fn raising_prompt_does_not_exhaust_semaphore() {
 // --- Four-tool async lifecycle (AC.1 - AC.5, AC.7) --------------------------
 
 #[test]
+fn task_tools_allow_general_children_but_not_research_children() {
+    let (reg, _host) = load_task_host();
+    for name in [
+        "task",
+        "task_spawn",
+        "task_get",
+        "task_send",
+        "task_despawn",
+    ] {
+        let audience = reg.get(name).unwrap().tool.audience();
+        assert!(audience.contains(ToolAudience::GENERAL_SUB), "{name}");
+        assert!(!audience.contains(ToolAudience::RESEARCH_SUB), "{name}");
+    }
+}
+
+#[test]
 fn spawn_returns_task_id_immediately() {
     let (reg, _host) = load_task_host();
     let out = exec_tool_json(&reg, "task_spawn", task_input(SCENARIO_PLAIN, None));
@@ -603,6 +619,22 @@ fn spawn_structured_task_registers_commit_tool() {
     );
     let snap = probe(&reg);
     assert_eq!(snap["has_local_tools"], json!(true));
+}
+
+#[test]
+fn duplicate_task_id_is_rejected_without_overwrite() {
+    let (reg, _host) = load_task_host();
+    let first = exec_tool_json(&reg, "task_spawn", task_input(SCENARIO_PLAIN, None));
+    let task_id = first["task_id"].as_str().unwrap();
+
+    let error = exec_tool(&reg, "task_spawn", task_input(SCENARIO_PLAIN, None)).unwrap_err();
+    assert_eq!(error, DUPLICATE_TASK_ID_ERR);
+
+    let status = exec_tool_json(&reg, "task_get", json!({ "task_id": task_id }));
+    assert_eq!(status["status"], json!("done"));
+    let snap = probe(&reg);
+    assert_eq!(snap["sessions"], json!(2));
+    assert_eq!(snap["closed"], json!(1));
 }
 
 #[test]

@@ -38,29 +38,26 @@ use maki_providers::{Message, Model, TokenUsage};
 use maki_storage::StateDir;
 use maki_storage::StorageError;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
-use maki_storage::session_lock;
+use maki_storage::session_lock::{self, ClaimedSessionLock};
 use maki_storage::sessions::{
     Prefs, SESSIONS_DIR, SessionError, StoredTokenUsage, normalize_title, write_prefs,
 };
 use serde_json::json;
 use tracing::{info, warn};
 
-fn claim_lock(dir: &std::path::Path, id: &MakiId) -> Result<()> {
-    match session_lock::heartbeat(dir, id)? {
-        session_lock::LockBeat::Lost => Err(eyre!(
-            "session is open in another terminal; close it there first"
-        )),
-        session_lock::LockBeat::Claimed | session_lock::LockBeat::Held => Ok(()),
-    }
+fn claim_lock(dir: &std::path::Path, id: &MakiId) -> Result<ClaimedSessionLock> {
+    session_lock::claim(dir, id)?.ok_or_else(|| eyre!(session_lock::OPEN_ELSEWHERE_MSG))
 }
 
 use crate::AppSession;
 use crate::agent::{
-    AgentCommand, AgentHandles, ProviderChange, ProviderSlot, SystemPromptOverride,
-    shared_queue::QueueItem,
+    AgentCommand, AgentHandles, PreparedAgentHandles, ProviderChange, ProviderSlot,
+    SystemPromptOverride, shared_queue::QueueItem,
 };
 use crate::app::shell::{ShellEvent, spawn_shell};
-use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
+use crate::app::{
+    App, Msg, Notification, PreparedApp, QueuedMessage, SubmitOutcome, turn_response,
+};
 use crate::color_compat;
 use crate::command_runtime::{CommandEvent, CommandRuntime};
 use crate::components::arg_completion::{ModelArgSource, ThemeArgSource};
@@ -344,11 +341,103 @@ struct SessionRuntime {
     shell_rx: flume::Receiver<ShellEvent>,
     last_status: SessionStatus,
     notifications: RunNotificationState,
+    session_lock: Option<ClaimedSessionLock>,
+    restore_pending: bool,
+}
+
+struct PreparedProvider {
+    model: Model,
+    provider: Arc<dyn Provider>,
+}
+
+struct PreparedSessionRuntime {
+    app: PreparedApp,
+    handles: PreparedAgentHandles,
+    shell_tx: flume::Sender<ShellEvent>,
+    shell_rx: flume::Receiver<ShellEvent>,
+    resumed: bool,
+    provider: Option<PreparedProvider>,
+}
+
+impl PreparedSessionRuntime {
+    #[cfg(test)]
+    fn snapshot(
+        &self,
+    ) -> (
+        MakiId,
+        maki_commands::InvocationTargetId,
+        maki_agent::AgentManagerHandle,
+        maki_agent::AgentId,
+    ) {
+        let (manager, root_id) = self.handles.manager_and_root();
+        (
+            self.app.session_id(),
+            self.app.command_target_id(),
+            manager,
+            root_id,
+        )
+    }
+
+    fn activate(
+        self,
+        model_slot: &ProviderSlot,
+        session_lock: Option<ClaimedSessionLock>,
+    ) -> SessionRuntime {
+        let Self {
+            app,
+            handles,
+            shell_tx,
+            shell_rx,
+            resumed,
+            provider,
+        } = self;
+        if let Some(provider) = provider {
+            model_slot.install(provider.model, provider.provider);
+        }
+        let handles = handles.activate();
+        let mut app = app.activate();
+        handles.apply_to_app(&mut app);
+        SessionRuntime {
+            app,
+            handles,
+            shell_tx,
+            shell_rx,
+            last_status: SessionStatus::Idle,
+            notifications: RunNotificationState::default(),
+            session_lock,
+            restore_pending: resumed,
+        }
+    }
+}
+
+fn replace_session_runtime(
+    current: &mut SessionRuntime,
+    prepared: PreparedSessionRuntime,
+    sessions_dir: &std::path::Path,
+    model_slot: &ProviderSlot,
+) -> Result<SessionRuntime, String> {
+    let target_id = prepared.app.session_id();
+    let same_id = current.id() == target_id;
+    let target_lock = if same_id {
+        current.session_lock.take()
+    } else {
+        Some(claim_lock(sessions_dir, &target_id).map_err(|error| error.to_string())?)
+    };
+    let runtime = prepared.activate(model_slot, target_lock);
+    let old = std::mem::replace(current, runtime);
+    current.activate_deferred();
+    Ok(old)
 }
 
 impl SessionRuntime {
     fn id(&self) -> MakiId {
         self.app.state.session.id
+    }
+
+    fn activate_deferred(&mut self) {
+        if std::mem::take(&mut self.restore_pending) {
+            self.app.restore_resumed_session();
+        }
     }
 
     /// New work cancels an `exit_on_done` exit still waiting on its drain.
@@ -374,6 +463,7 @@ impl SessionRuntime {
 /// Everything needed to bring up a new session runtime after startup.
 struct SpawnCtx {
     storage: StateDir,
+    sessions_dir: PathBuf,
     config: AgentConfig,
     ui_config: UiConfig,
     input_history_size: usize,
@@ -396,10 +486,23 @@ struct SpawnCtx {
 }
 
 impl SpawnCtx {
-    fn spawn_runtime(&self, session: AppSession) -> SessionRuntime {
+    fn prepare_runtime(&self, session: AppSession) -> PreparedSessionRuntime {
+        self.prepare_runtime_with_provider(session, None)
+    }
+
+    fn prepare_runtime_with_provider(
+        &self,
+        session: AppSession,
+        provider: Option<PreparedProvider>,
+    ) -> PreparedSessionRuntime {
         let resumed = !session.messages().is_empty();
+        let model = provider
+            .as_ref()
+            .map(|provider| &provider.model)
+            .unwrap_or(&self.model_slot.load().model)
+            .clone();
         let permissions = Arc::new(self.permissions.fork());
-        let handles = AgentHandles::spawn(
+        let handles = AgentHandles::prepare(
             &self.model_slot,
             session.messages().to_vec(),
             self.config.clone(),
@@ -413,13 +516,13 @@ impl SpawnCtx {
             Arc::clone(&self.model_policy),
             self.system_prompt.clone(),
         );
-        let mut app = App::new(
-            &self.model_slot.load().model,
+        let app = App::prepare(
+            &model,
             session,
             self.storage.clone(),
             Arc::clone(&self.available_models),
             handles.mcp_reader(),
-            handles.mcp_config_errors.clone(),
+            self.mcp_config_errors.clone(),
             self.keymap_reader.clone(),
             self.hint_reader.clone(),
             self.status_content_reader.clone(),
@@ -432,19 +535,22 @@ impl SpawnCtx {
             crate::theme::default_provider().clone(),
             Arc::clone(&self.command_runtime),
         );
-        handles.apply_to_app(&mut app);
-        if resumed {
-            app.restore_resumed_session();
-        }
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
-        SessionRuntime {
+        PreparedSessionRuntime {
             app,
             handles,
             shell_tx,
             shell_rx,
-            last_status: SessionStatus::Idle,
-            notifications: RunNotificationState::default(),
+            resumed,
+            provider,
         }
+    }
+
+    fn spawn_runtime(&self, session: AppSession) -> Result<SessionRuntime> {
+        let id = session.id;
+        let prepared = self.prepare_runtime(session);
+        let session_lock = claim_lock(&self.sessions_dir, &id)?;
+        Ok(prepared.activate(&self.model_slot, Some(session_lock)))
     }
 }
 
@@ -674,6 +780,7 @@ impl<'t> EventLoop<'t> {
         let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd));
         let ctx = SpawnCtx {
             storage,
+            sessions_dir: sessions_dir.clone(),
             config,
             ui_config,
             input_history_size,
@@ -699,14 +806,12 @@ impl<'t> EventLoop<'t> {
         let mut runtimes: Vec<SessionRuntime> = sessions
             .into_iter()
             .map(|session| ctx.spawn_runtime(session))
-            .collect();
+            .collect::<Result<_>>()?;
+        for runtime in &mut runtimes {
+            runtime.activate_deferred();
+        }
         if runtimes.is_empty() {
             return Err(eyre!("event loop needs at least one session"));
-        }
-        for rt in &runtimes {
-            if let Err(e) = claim_lock(&sessions_dir, &rt.id()) {
-                warn!(id = %rt.id(), error = %e, "session lock claim failed");
-            }
         }
         let focused = focused.min(runtimes.len() - 1);
         let app = &mut runtimes[focused].app;
@@ -1004,20 +1109,20 @@ impl<'t> EventLoop<'t> {
         let now = Instant::now();
         if now.duration_since(self.last_heartbeat) >= session_lock::HEARTBEAT_INTERVAL {
             self.last_heartbeat = now;
-            let sessions_dir = self.sessions_dir.clone();
-            let ids: Vec<MakiId> = self.sessions.iter().map(|rt| rt.id()).collect();
-            smol::unblock(move || {
-                for id in &ids {
-                    match session_lock::heartbeat(&sessions_dir, id) {
-                        Ok(session_lock::LockBeat::Lost) => {
-                            warn!(id = %id, "session lock lost to another process")
-                        }
-                        Err(e) => warn!(id = %id, error = %e, "session lock heartbeat failed"),
-                        Ok(_) => {}
+            for runtime in &mut self.sessions {
+                let id = runtime.id();
+                let Some(session_lock) = runtime.session_lock.as_mut() else {
+                    continue;
+                };
+                match session_lock.heartbeat() {
+                    Ok(session_lock::LockBeat::Lost) => {
+                        runtime.session_lock = None;
+                        warn!(id = %id, "session lock lost to another process");
                     }
+                    Err(error) => warn!(id = %id, %error, "session lock heartbeat failed"),
+                    Ok(session_lock::LockBeat::Held | session_lock::LockBeat::Claimed) => {}
                 }
-            })
-            .detach();
+            }
         }
         let mut login_actions: Vec<(usize, Vec<Action>)> = Vec::new();
         for (i, rt) in self.sessions.iter_mut().enumerate() {
@@ -1566,7 +1671,14 @@ impl<'t> EventLoop<'t> {
                     let slot = self.ctx.model_slot.load();
                     AppSession::new(&slot.model.spec(), &self.session_cwd)
                 };
-                let idx = self.push_runtime(self.ctx.spawn_runtime(session));
+                let runtime = match self.ctx.spawn_runtime(session) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = reply_tx.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+                let idx = self.push_runtime(runtime);
                 let id = self.sessions[idx].id();
                 if let Some(prompt) = prompt {
                     let _ = self.submit_text(idx, prompt);
@@ -1704,13 +1816,12 @@ impl<'t> EventLoop<'t> {
     /// removable, so `sessions` stays non-empty.
     fn remove_runtime(&mut self, idx: usize) -> SessionRuntime {
         debug_assert_ne!(idx, self.focused);
-        let rt = self.sessions.remove(idx);
-        let id = rt.id();
-        let sessions_dir = self.sessions_dir.clone();
-        smol::unblock(move || {
-            session_lock::release(&sessions_dir, &id);
-        })
-        .detach();
+        let mut rt = self.sessions.remove(idx);
+        if let Some(session_lock) = rt.session_lock.take()
+            && let Err(error) = session_lock.release()
+        {
+            warn!(id = %rt.id(), %error, "session lock release failed");
+        }
         if idx < self.focused {
             self.focused -= 1;
         }
@@ -1723,16 +1834,62 @@ impl<'t> EventLoop<'t> {
                 .suppress_status_content
                 .store(true, Ordering::Release);
         }
-        let id = rt.id();
-        let sessions_dir = self.sessions_dir.clone();
-        smol::unblock(move || {
-            if let Err(e) = claim_lock(&sessions_dir, &id) {
-                warn!(id = %id, error = %e, "session lock claim failed");
-            }
-        })
-        .detach();
         self.sessions.push(rt);
-        self.sessions.len() - 1
+        let idx = self.sessions.len() - 1;
+        self.sessions[idx].activate_deferred();
+        idx
+    }
+
+    fn prepare_replacement_provider(
+        &self,
+        session: &AppSession,
+    ) -> Result<Option<PreparedProvider>, String> {
+        let model_spec = &session.model;
+        if model_spec == &self.ctx.model_slot.load().model.spec()
+            || !self.ctx.model_policy.allows(model_spec)
+        {
+            return Ok(None);
+        }
+        let mut model = Model::from_spec(model_spec).map_err(|error| error.to_string())?;
+        let provider =
+            from_model(&mut model, self.ctx.timeouts).map_err(|error| error.to_string())?;
+        Ok(Some(PreparedProvider {
+            model,
+            provider: Arc::from(provider),
+        }))
+    }
+
+    fn replace_runtime(&mut self, idx: usize, session: AppSession) -> Result<(), String> {
+        self.sessions[idx].app.checkpoint_now();
+        let prepared = self.ctx.prepare_runtime(session);
+        self.replace_prepared_runtime(idx, prepared)
+    }
+
+    fn replace_prepared_runtime(
+        &mut self,
+        idx: usize,
+        prepared: PreparedSessionRuntime,
+    ) -> Result<(), String> {
+        let old = replace_session_runtime(
+            &mut self.sessions[idx],
+            prepared,
+            &self.sessions_dir,
+            &self.ctx.model_slot,
+        )?;
+        let SessionRuntime {
+            app,
+            handles,
+            session_lock,
+            ..
+        } = old;
+        if let Some(session_lock) = session_lock
+            && let Err(error) = session_lock.release()
+        {
+            warn!(%error, "old session lock release failed");
+        }
+        drop(app);
+        handles.shutdown().detach();
+        Ok(())
     }
 
     fn set_focused(&mut self, next: usize) {
@@ -1760,26 +1917,16 @@ impl<'t> EventLoop<'t> {
         if let Some(block) = session_lock::resume_block(&session.cwd, &cwd, open_elsewhere) {
             return Err(block.to_string());
         }
-        let focused = &mut self.sessions[self.focused];
-        if SessionStatus::of(&focused.app) == SessionStatus::Idle && !focused.app.has_content() {
-            let old_id = focused.id();
-            let actions = focused.app.load_loaded_session(session);
-            let sessions_dir = self.sessions_dir.clone();
-            smol::unblock(move || {
-                session_lock::release(&sessions_dir, &old_id);
-            })
-            .detach();
-            let sessions_dir = self.sessions_dir.clone();
-            smol::unblock(move || {
-                if let Err(e) = session_lock::heartbeat(&sessions_dir, &id) {
-                    warn!(id = %id, error = %e, "session lock claim failed");
-                }
-            })
-            .detach();
-            self.dispatch(self.focused, actions);
-            return Ok(());
+        if SessionStatus::of(&self.sessions[self.focused].app) == SessionStatus::Idle
+            && !self.sessions[self.focused].app.has_content()
+        {
+            return self.replace_runtime(self.focused, session);
         }
-        let idx = self.push_runtime(self.ctx.spawn_runtime(session));
+        let runtime = self
+            .ctx
+            .spawn_runtime(session)
+            .map_err(|error| error.to_string())?;
+        let idx = self.push_runtime(runtime);
         self.set_focused(idx);
         Ok(())
     }
@@ -1895,22 +2042,6 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn respawn_agent(&mut self, idx: usize, history: Vec<Message>) {
-        let rt = &mut self.sessions[idx];
-        rt.reset_run_notifications();
-        let lua_handle = rt.app.lua_event_handle.clone();
-        let permissions = Arc::clone(&rt.app.permissions);
-        rt.handles.respawn(
-            history,
-            &self.ctx.model_slot,
-            self.ctx.config.clone(),
-            self.ctx.ui_config.tool_output_lines,
-            &permissions,
-            &mut rt.app,
-            lua_handle,
-        );
-    }
-
     fn handle_action(&mut self, idx: usize, action: Action) {
         match action {
             Action::SendMessage(input) => {
@@ -1938,21 +2069,37 @@ impl<'t> EventLoop<'t> {
                     .cmd_tx
                     .try_send(AgentCommand::CancelSubagent { tool_use_id });
             }
-            Action::NewSession => {
-                self.respawn_agent(idx, Vec::new());
-            }
-            Action::LoadSession(loaded) => {
-                let loaded = *loaded;
-                if loaded.model_spec != self.ctx.model_slot.load().model.spec()
-                    && self.ctx.model_policy.allows(&loaded.model_spec)
-                    && let Ok(mut new_model) = Model::from_spec(&loaded.model_spec)
-                    && let Ok(new_provider) = from_model(&mut new_model, self.ctx.timeouts)
-                {
-                    self.ctx
-                        .model_slot
-                        .install(new_model, Arc::from(new_provider));
+            Action::ReplaceSession(request) => {
+                let request = *request;
+                let provider = match self.prepare_replacement_provider(&request.session) {
+                    Ok(provider) => provider,
+                    Err(error) => {
+                        self.sessions[idx].app.flash(error);
+                        return;
+                    }
+                };
+                let prepared = self
+                    .ctx
+                    .prepare_runtime_with_provider(request.session, provider);
+                match self.replace_prepared_runtime(idx, prepared) {
+                    Ok(()) => {
+                        if let crate::components::SessionReplacementKind::Reset { ended_id } =
+                            request.kind
+                        {
+                            self.sessions[idx].app.lua_event_handle.fire_autocmd(
+                                "SessionReset",
+                                serde_json::json!({ "session_id": ended_id }),
+                            );
+                        }
+                        if let Some(post_commit) = request.post_commit {
+                            let actions = self.sessions[idx]
+                                .app
+                                .apply_replacement_post_commit(post_commit);
+                            self.dispatch(idx, actions);
+                        }
+                    }
+                    Err(error) => self.sessions[idx].app.flash(error),
                 }
-                self.respawn_agent(idx, loaded.messages);
             }
             Action::ChangeModel(spec) => {
                 if let Err(error) = self.change_model(idx, &spec) {
@@ -2094,9 +2241,6 @@ impl<'t> EventLoop<'t> {
             elapsed
         };
         let exit = self.sessions[self.focused].app.exit_request;
-        for rt in &self.sessions {
-            session_lock::release(&self.sessions_dir, &rt.id());
-        }
         if let Some(ref h) = self.ctx.mcp_handle {
             mcp::kill_process_groups(&h.reader().load().pids);
         }
@@ -2108,13 +2252,21 @@ impl<'t> EventLoop<'t> {
         let mut agent_tasks = Vec::with_capacity(self.sessions.len());
         for rt in self.sessions.drain(..) {
             let SessionRuntime {
-                mut app, handles, ..
+                mut app,
+                handles,
+                session_lock,
+                ..
             } = rt;
+            if let Some(session_lock) = session_lock
+                && let Err(error) = session_lock.release()
+            {
+                warn!(id = %app.state.session.id, %error, "session lock release failed");
+            }
             app.checkpoint_now();
             // `app` drops at the end of this iteration, closing the
             // channels the agent loop waits on, so `join_all` can finish.
             tabs.push(Arc::unwrap_or_clone(app.state.session));
-            agent_tasks.push(handles.into_task());
+            agent_tasks.push(handles.shutdown());
         }
         let save_sessions_ms = lap();
         crate::agent::join_all(agent_tasks, AGENT_SHUTDOWN_TIMEOUT);
@@ -2252,14 +2404,347 @@ fn ring_bell() {
 mod tests {
     use super::*;
     use crate::selection::SelectionZone;
+    use crate::theme::InMemoryThemesProvider;
     use crossterm::event::KeyModifiers;
-    use maki_agent::{AgentId, DoneReason, TurnId, TurnOutcome};
-    use maki_providers::TokenUsage;
+    use maki_agent::{AgentError, AgentId, DoneReason, SessionMailbox, TurnId, TurnOutcome};
+    use maki_config::PermissionsConfig;
+    use maki_providers::provider::BoxFuture;
+    use maki_providers::{ModelInfo, ProviderEvent, RequestOptions, StreamResponse, TokenUsage};
     use ratatui::{Terminal, backend::TestBackend};
+    use tempfile::TempDir;
     use test_case::test_case;
 
     const OBSERVATION: &str = "failed";
     const SHELL_RESULT: &str = "command finished";
+    const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+    struct StubProvider;
+
+    impl Provider for StubProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a serde_json::Value,
+            _event_tx: &'a flume::Sender<ProviderEvent>,
+            _opts: RequestOptions,
+            _session_id: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    struct RuntimeHarness {
+        _temp_dir: TempDir,
+        ctx: Option<SpawnCtx>,
+    }
+
+    impl RuntimeHarness {
+        fn new() -> Self {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let storage = StateDir::from_path(temp_dir.path().to_path_buf());
+            let sessions_dir = storage.ensure_subdir(SESSIONS_DIR).unwrap();
+            let available_models = Arc::new(ArcSwapOption::empty());
+            let themes = Arc::new(InMemoryThemesProvider::bundled());
+            let command_registry = maki_commands::CommandRegistry::new();
+            let command_runtime = Arc::new(CommandRuntime::new_for_test(
+                &[],
+                command_registry,
+                Arc::new(ModelArgSource::new(Arc::clone(&available_models))),
+                Arc::new(ThemeArgSource::new(themes)),
+            ));
+            let model = crate::components::test_model();
+            let (model_slot, _provider_change_rx) =
+                ProviderSlot::new(model, Arc::new(StubProvider));
+            let permissions = Arc::new(PermissionManager::new(
+                PermissionsConfig::default(),
+                temp_dir.path().to_path_buf(),
+                Arc::default(),
+            ));
+            let storage_writer =
+                Arc::new(StorageWriter::new(storage.clone(), flume::unbounded().0));
+            let ctx = SpawnCtx {
+                storage,
+                sessions_dir,
+                config: AgentConfig::default(),
+                ui_config: UiConfig::default(),
+                input_history_size: 100,
+                permissions,
+                timeouts: Timeouts::default(),
+                keymap_reader: KeymapReader::empty(),
+                hint_reader: HintReader::empty(),
+                status_content_reader: StatusContentReader::empty(),
+                lua_event_handle: EventHandle::disconnected_for_test(),
+                mcp_handle: None,
+                mcp_config_errors: McpConfigErrors::new(temp_dir.path().to_path_buf()),
+                model_slot,
+                available_models,
+                storage_writer,
+                model_policy: Arc::new(ModelPolicy::default()),
+                system_prompt: SystemPromptOverride::default(),
+                command_runtime,
+            };
+            Self {
+                _temp_dir: temp_dir,
+                ctx: Some(ctx),
+            }
+        }
+
+        fn ctx(&self) -> &SpawnCtx {
+            self.ctx.as_ref().unwrap()
+        }
+
+        fn session(&self) -> AppSession {
+            let cwd = self._temp_dir.path().to_string_lossy();
+            AppSession::new("test-model", cwd.as_ref())
+        }
+
+        fn prepare(&self) -> PreparedSessionRuntime {
+            self.ctx().prepare_runtime(self.session())
+        }
+
+        fn runtime(&self, session: AppSession) -> SessionRuntime {
+            self.ctx().spawn_runtime(session).unwrap()
+        }
+
+        fn target_count(&self) -> usize {
+            self.ctx().command_runtime.registry.target_count()
+        }
+    }
+
+    impl Drop for RuntimeHarness {
+        fn drop(&mut self) {
+            let ctx = self.ctx.take().unwrap();
+            let storage_writer = Arc::clone(&ctx.storage_writer);
+            drop(ctx);
+            let Ok(storage_writer) = Arc::try_unwrap(storage_writer) else {
+                panic!("runtime harness owns storage writer");
+            };
+            storage_writer.shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
+        }
+    }
+
+    fn shutdown_manager(manager: &maki_agent::AgentManagerHandle) {
+        let report = smol::block_on(manager.shutdown(RUNTIME_SHUTDOWN_TIMEOUT));
+        assert!(report.timed_out.is_empty());
+    }
+
+    fn release_runtime(runtime: SessionRuntime) {
+        let SessionRuntime {
+            handles,
+            session_lock,
+            ..
+        } = runtime;
+        if let Some(session_lock) = session_lock {
+            session_lock.release().unwrap();
+        }
+        let manager = handles.manager_and_root().0;
+        drop(handles);
+        shutdown_manager(&manager);
+    }
+
+    #[test]
+    fn prepared_runtime_is_inert_until_activate() {
+        let harness = RuntimeHarness::new();
+        let target_count = harness.target_count();
+        let prepared = harness.prepare();
+        let (session_id, _, manager, root_id) = prepared.snapshot();
+
+        assert_eq!(harness.target_count(), target_count);
+        assert!(SessionMailbox::notify(session_id, "early".into(), false).is_err());
+        assert_eq!(manager.root_id().unwrap(), root_id);
+        assert!(
+            manager
+                .snapshot()
+                .iter()
+                .any(|node| node.agent_id == root_id)
+        );
+
+        drop(prepared);
+        shutdown_manager(&manager);
+    }
+
+    #[test]
+    fn activation_publishes_target_mailbox_and_runtime_identities() {
+        let harness = RuntimeHarness::new();
+        let target_count = harness.target_count();
+        let prepared = harness.prepare();
+        let (session_id, target_id, manager, root_id) = prepared.snapshot();
+        let runtime = prepared.activate(&harness.ctx().model_slot, None);
+        let (active_manager, active_root_id) = runtime.handles.manager_and_root();
+
+        assert_eq!(harness.target_count(), target_count + 1);
+        assert_eq!(runtime.id(), session_id);
+        assert_eq!(runtime.app.command_target.id(), target_id);
+        assert_eq!(active_manager.generation(), manager.generation());
+        assert_eq!(active_root_id, root_id);
+        assert!(SessionMailbox::notify(session_id, "ready".into(), false).is_ok());
+
+        drop(runtime);
+        shutdown_manager(&manager);
+        assert_eq!(harness.target_count(), target_count);
+        assert!(SessionMailbox::notify(session_id, "late".into(), false).is_err());
+    }
+
+    #[test]
+    fn replacement_restore_effects_activate_once_after_publication() {
+        let harness = RuntimeHarness::new();
+        let mut session = harness.session();
+        session.push_message(Message::user("history".into()));
+        session.meta.queued_messages = vec!["restored".into()];
+        let prepared = harness.ctx().prepare_runtime(session);
+        let mut runtime = prepared.activate(&harness.ctx().model_slot, None);
+
+        assert!(runtime.handles.queue.is_empty());
+        assert!(runtime.restore_pending);
+        runtime.activate_deferred();
+        runtime.activate_deferred();
+
+        let envelope = runtime
+            .handles
+            .agent_rx
+            .recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT)
+            .expect("restored queue item was not consumed");
+        assert!(matches!(
+            envelope.event,
+            AgentEvent::QueueItemConsumed { ref text, .. } if text == "restored"
+        ));
+        assert!(runtime.handles.queue.is_empty());
+        assert!(!runtime.restore_pending);
+
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn one_manager_per_runtime() {
+        let harness = RuntimeHarness::new();
+        let first = harness.prepare();
+        let second = harness.prepare();
+        let (_, _, first_manager, first_root_id) = first.snapshot();
+        let (_, _, second_manager, second_root_id) = second.snapshot();
+
+        assert_ne!(first_manager.generation(), second_manager.generation());
+        assert_ne!(first_root_id, second_root_id);
+
+        drop((first, second));
+        shutdown_manager(&first_manager);
+        shutdown_manager(&second_manager);
+    }
+
+    #[test]
+    fn same_id_replacement_transfers_the_exact_lock_without_io() {
+        let harness = RuntimeHarness::new();
+        let session = harness.session();
+        let id = session.id;
+        let mut runtime = harness.runtime(session.clone());
+        let path = session_lock::lock_path(&harness.ctx().sessions_dir, &id);
+        let owner_before = std::fs::read(&path).unwrap();
+        let prepared = harness.ctx().prepare_runtime(session);
+
+        let old = replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        )
+        .unwrap();
+
+        assert!(old.session_lock.is_none());
+        assert!(runtime.session_lock.is_some());
+        assert_eq!(std::fs::read(&path).unwrap(), owner_before);
+        release_runtime(old);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn different_id_activation_releases_old_lock_only_after_swap() {
+        let harness = RuntimeHarness::new();
+        let mut runtime = harness.runtime(harness.session());
+        let old_id = runtime.id();
+        let old_path = session_lock::lock_path(&harness.ctx().sessions_dir, &old_id);
+        let target = harness.session();
+        let target_id = target.id;
+        let target_path = session_lock::lock_path(&harness.ctx().sessions_dir, &target_id);
+        let prepared = harness.ctx().prepare_runtime(target);
+
+        let mut old = replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        )
+        .unwrap();
+
+        assert_eq!(runtime.id(), target_id);
+        assert!(runtime.session_lock.is_some());
+        assert!(target_path.exists());
+        assert!(old.session_lock.is_some());
+        assert!(old_path.exists());
+        old.session_lock.take().unwrap().release().unwrap();
+        assert!(!old_path.exists());
+        assert!(target_path.exists());
+        release_runtime(old);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn different_id_claim_failure_preserves_the_complete_runtime() {
+        let harness = RuntimeHarness::new();
+        let mut runtime = harness.runtime(harness.session());
+        let old_id = runtime.id();
+        let old_target = runtime.app.command_target.id();
+        let (old_manager, old_root) = runtime.handles.manager_and_root();
+        let old_provider = harness.ctx().model_slot.load().provider.identity();
+        let old_target_count = harness.target_count();
+        let old_lock_path = session_lock::lock_path(&harness.ctx().sessions_dir, &old_id);
+        let old_owner = std::fs::read(&old_lock_path).unwrap();
+        let target = harness.session();
+        let target_id = target.id;
+        let target_path = session_lock::lock_path(&harness.ctx().sessions_dir, &target_id);
+        std::fs::write(&target_path, "4294967294 foreign-owner").unwrap();
+        let prepared = harness.ctx().prepare_runtime(target);
+        let (_, _, candidate_manager, _) = prepared.snapshot();
+
+        let error = match replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        ) {
+            Ok(old) => {
+                release_runtime(old);
+                panic!("foreign target lock must reject replacement");
+            }
+            Err(error) => error,
+        };
+
+        assert!(error.contains(session_lock::OPEN_ELSEWHERE_MSG));
+        assert_eq!(runtime.id(), old_id);
+        assert_eq!(runtime.app.command_target.id(), old_target);
+        assert_eq!(
+            runtime.handles.manager_and_root().0.generation(),
+            old_manager.generation()
+        );
+        assert_eq!(runtime.handles.manager_and_root().1, old_root);
+        assert_eq!(
+            harness.ctx().model_slot.load().provider.identity(),
+            old_provider
+        );
+        assert_eq!(harness.target_count(), old_target_count);
+        assert_eq!(std::fs::read(&old_lock_path).unwrap(), old_owner);
+        assert_eq!(
+            std::fs::read_to_string(&target_path).unwrap(),
+            "4294967294 foreign-owner"
+        );
+        shutdown_manager(&candidate_manager);
+        std::fs::remove_file(target_path).unwrap();
+        release_runtime(runtime);
+    }
 
     const MIDDLE_SCROLL_STEP: Duration = Duration::from_millis(100);
     const MIDDLE_SCROLL_CADENCE: Duration = Duration::from_millis(25);

@@ -263,6 +263,7 @@ pub struct ToolContext {
     /// while sibling dispatches stay independent. Serves as the reentry
     /// check input only and is never used for filesystem access.
     pub(crate) write_lock_chain: Arc<Vec<u64>>,
+    pub managed_turn: Option<crate::CurrentManagedTurn>,
 }
 
 impl ToolContext {
@@ -509,6 +510,7 @@ pub fn interpreter_ctx(
         model_policy: Arc::new(ModelPolicy::default()),
         file_write_locks: Arc::new(FileWriteLocks::new()),
         write_lock_chain: Arc::new(Vec::new()),
+        managed_turn: None,
     }
 }
 

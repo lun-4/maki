@@ -446,6 +446,7 @@ enum KillReason {
 pub(crate) struct TaskCell {
     pub(crate) id: u64,
     pub(crate) cancel: CancelToken,
+    pub(crate) managed_turn: Option<maki_agent::CurrentManagedTurn>,
     /// End of the current kill grace, armed by the first watchdog poke that
     /// sees a doomed task and cleared at every yield.
     kill_at: Cell<Option<Instant>>,
@@ -493,6 +494,7 @@ impl TaskCell {
         Self {
             id: NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed),
             cancel,
+            managed_turn: None,
             kill_at: Cell::new(None),
             kill_grace: KILL_GRACE,
             deadline: Cell::new(deadline),
@@ -1131,6 +1133,10 @@ impl<F: Future> Future for ScopedFuture<F> {
         }
         result
     }
+}
+
+pub(crate) fn current_managed_turn(lua: &Lua) -> Option<maki_agent::CurrentManagedTurn> {
+    lock_cell(&active_task(lua)).managed_turn.clone()
 }
 
 pub(crate) fn active_task(lua: &Lua) -> TaskHandle {
@@ -3061,7 +3067,8 @@ async fn run_tool_call(
         Ok(v) => v,
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
-    let live_sink = ctx.agent().and_then(|a| a.live_sink.clone());
+    let live_sink = ctx.agent().and_then(|agent| agent.live_sink.clone());
+    let managed_turn = ctx.agent().and_then(|agent| agent.managed_turn.clone());
     let ctx_ud = match lua.create_userdata(*ctx) {
         Ok(u) => u,
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
@@ -3074,6 +3081,7 @@ async fn run_tool_call(
     let live_id = live.as_ref().map(|l| l.tool_use_id.clone());
     let mut cell = TaskCell::new(cancel.clone(), deadline, live);
     cell.live_sink = live_sink;
+    cell.managed_turn = managed_turn;
     let scope = TaskScope::new(&lua, cell);
     let handle = Arc::clone(scope.handle());
 
