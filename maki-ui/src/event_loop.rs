@@ -406,6 +406,7 @@ impl SpawnCtx {
             self.ui_config.tool_output_lines,
             &permissions,
             Some(SessionRef::from(session.id)),
+            session.meta.plugin_data.clone(),
             self.timeouts,
             self.lua_event_handle.clone(),
             self.mcp_handle.clone(),
@@ -1590,6 +1591,18 @@ impl<'t> EventLoop<'t> {
                 let reply = parse_session_id(&id)
                     .and_then(|id| self.focus_session(id))
                     .map(|()| json!(true));
+                let _ = reply_tx.send(reply);
+            }
+            SessionRequest::SetMode { id, mode } => {
+                let reply = parse_session_id(&id)
+                    .and_then(|id| {
+                        self.position(id)
+                            .ok_or_else(|| format!("{NOT_LIVE_ERR}: {id}"))
+                    })
+                    .map(|index| {
+                        self.sessions[index].app.set_mode_id(mode);
+                        json!(true)
+                    });
                 let _ = reply_tx.send(reply);
             }
             SessionRequest::SetTitle { id, title } => {

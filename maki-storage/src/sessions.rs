@@ -21,6 +21,7 @@ use tracing::{info, warn};
 use crate::id::{MakiId, MakiIdParseError};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub use maki_domain::{Effort, MIN_THINKING_BUDGET, StoredThinking, ThinkingParseError};
 
@@ -159,6 +160,8 @@ pub struct SessionMeta {
     pub fast: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub workflow: bool,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub plugin_data: HashMap<String, Value>,
 }
 
 /// Messages plus the token of the run they belong to. Comparing tokens tells
@@ -372,7 +375,7 @@ enum LogRecord<M, U, T> {
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         usage_by_model: HashMap<String, StoredTokenUsage>,
         #[serde(flatten)]
-        meta: SessionMeta,
+        meta: Box<SessionMeta>,
     },
 }
 
@@ -757,7 +760,7 @@ where
             updated_at: session.updated_at,
             subagents: session.subagents.clone(),
             usage_by_model: session.usage_by_model.clone(),
-            meta: session.meta.clone(),
+            meta: Box::new(session.meta.clone()),
         },
     )?;
     Ok(buf)
@@ -919,7 +922,7 @@ where
                 updated_at = m_updated;
                 subagents = m_subagents;
                 usage_by_model = m_usage_by_model;
-                meta = m_meta;
+                meta = *m_meta;
             }
         }
     }
@@ -3166,6 +3169,7 @@ mod tests {
         assert!(meta.thinking.is_none());
         assert!(!meta.fast);
         assert!(!meta.workflow);
+        assert!(meta.plugin_data.is_empty());
     }
 
     #[test]
@@ -3176,6 +3180,10 @@ mod tests {
         session.meta.thinking = Some(StoredThinking::Budget { tokens: 8192 });
         session.meta.fast = true;
         session.meta.workflow = true;
+        session
+            .meta
+            .plugin_data
+            .insert("research".into(), serde_json::json!({"run": 3}));
         session.save_to(dir).unwrap();
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
@@ -3185,6 +3193,10 @@ mod tests {
         );
         assert!(loaded.meta.fast);
         assert!(loaded.meta.workflow);
+        assert_eq!(
+            loaded.meta.plugin_data["research"],
+            serde_json::json!({"run": 3})
+        );
     }
 
     #[test]
