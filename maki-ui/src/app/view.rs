@@ -181,14 +181,10 @@ impl App {
         }
     }
 
-    fn resolve_render_chat(&self) -> usize {
-        if self.task_picker.is_open() {
-            self.task_picker
-                .selected_index()
-                .unwrap_or(self.active_chat)
-        } else {
-            self.active_chat
-        }
+    pub(super) fn resolve_render_chat(&self) -> usize {
+        self.task_picker
+            .selected_item()
+            .map_or(self.active_chat, |entry| entry.chat_index)
     }
 
     fn render_background(&self, frame: &mut Frame) {

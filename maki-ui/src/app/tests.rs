@@ -2072,6 +2072,27 @@ fn open_tasks_picker_highlights_active_chat_after_sort() {
 }
 
 #[test]
+fn task_picker_preview_tracks_selected_chat_across_concurrent_reorder() {
+    let mut app = app_with_subagent_id("task1");
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "y".into() },
+        "task2",
+        Some("build"),
+    ));
+    finish_subagent(&mut app, "task1", false);
+    app.active_chat = 1;
+    app.open_tasks();
+
+    assert_eq!(app.task_picker.selected_item().unwrap().chat_index, 1);
+    assert_eq!(app.resolve_render_chat(), 1);
+
+    finish_subagent(&mut app, "task2", false);
+
+    assert_eq!(app.task_picker.selected_item().unwrap().chat_index, 1);
+    assert_eq!(app.resolve_render_chat(), 1);
+}
+
+#[test]
 fn ago_formats_relative_start_time() {
     let now = Instant::now();
     assert_eq!(ago(now), "just now");
