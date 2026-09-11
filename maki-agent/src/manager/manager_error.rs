@@ -4,6 +4,8 @@ use crate::{AgentId, TurnId};
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ManagerError {
+    #[error("agent limits must be at least one")]
+    InvalidLimits,
     #[error("the agent graph already has a root")]
     DuplicateRoot,
     #[error("the agent graph has no root")]

@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 
 use super::queue::{ActorQueue, InterruptQueue};
 use super::types::{ActorStatus, BackendResult, ControlWork, RootWork, TurnContext, WorkKind};
-use super::{ActiveCancel, ActorInner, ActorWork, TurnAdmission, finalize_turn};
+use super::{ActiveCancel, ActorInner, ActorWork, TurnAdmission, cancelled_outcome, finalize_turn};
 use crate::cancel::{CancelToken, ReasonedCancelToken};
 use crate::types::{TurnCancellationReason, TurnId, TurnOutcome};
 use crate::{ActorBackend, ActorLifecycle, History, InterruptSource};
@@ -188,26 +188,15 @@ impl Runner {
                 if admission.root {
                     self.settle_turn(&admission, None, false);
                 } else {
-                    let outcome = TurnOutcome::Cancelled {
-                        agent_id,
-                        turn_id,
-                        usage: TokenUsage::default(),
-                        num_turns: 0,
-                        reason: TurnCancellationReason::User,
-                    };
+                    let outcome =
+                        cancelled_outcome(agent_id, turn_id, TurnCancellationReason::User);
                     self.settle_turn(&admission, Some(outcome), true);
                 }
                 return;
             }
             if state.cancelled_turns.remove(&turn_id) {
                 drop(state);
-                let outcome = TurnOutcome::Cancelled {
-                    agent_id,
-                    turn_id,
-                    usage: TokenUsage::default(),
-                    num_turns: 0,
-                    reason: TurnCancellationReason::User,
-                };
+                let outcome = cancelled_outcome(agent_id, turn_id, TurnCancellationReason::User);
                 self.settle_turn(&admission, Some(outcome), true);
                 return;
             }
@@ -217,23 +206,15 @@ impl Runner {
                 let outcome = if admission.root {
                     None
                 } else {
-                    Some(match state.lifecycle {
-                        ActorLifecycle::Closed => TurnOutcome::Cancelled {
-                            agent_id,
-                            turn_id,
-                            usage: TokenUsage::default(),
-                            num_turns: 0,
-                            reason: TurnCancellationReason::Closed,
+                    Some(cancelled_outcome(
+                        agent_id,
+                        turn_id,
+                        match state.lifecycle {
+                            ActorLifecycle::Closed => TurnCancellationReason::Closed,
+                            ActorLifecycle::Shutdown => TurnCancellationReason::Shutdown,
+                            ActorLifecycle::Open => unreachable!(),
                         },
-                        ActorLifecycle::Shutdown => TurnOutcome::Cancelled {
-                            agent_id,
-                            turn_id,
-                            usage: TokenUsage::default(),
-                            num_turns: 0,
-                            reason: TurnCancellationReason::Shutdown,
-                        },
-                        ActorLifecycle::Open => unreachable!(),
-                    })
+                    ))
                 };
                 drop(state);
                 self.settle_turn(&admission, outcome, true);
@@ -255,13 +236,7 @@ impl Runner {
                 self.settle_turn(&admission, None, false);
             } else {
                 let reason = reasoned.reason().unwrap_or(TurnCancellationReason::User);
-                let outcome = TurnOutcome::Cancelled {
-                    agent_id,
-                    turn_id,
-                    usage: TokenUsage::default(),
-                    num_turns: 0,
-                    reason,
-                };
+                let outcome = cancelled_outcome(agent_id, turn_id, reason);
                 self.settle_turn(&admission, Some(outcome), true);
             }
             return;
@@ -281,13 +256,7 @@ impl Runner {
                     if admission.root {
                         self.settle_turn(&admission, None, false);
                     } else {
-                        let outcome = TurnOutcome::Cancelled {
-                            agent_id,
-                            turn_id,
-                            usage: TokenUsage::default(),
-                            num_turns: 0,
-                            reason,
-                        };
+                        let outcome = cancelled_outcome(agent_id, turn_id, reason);
                         self.settle_turn(&admission, Some(outcome), true);
                     }
                     return;

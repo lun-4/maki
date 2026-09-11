@@ -8,9 +8,10 @@
 //! agent event, or keypress arrives instead of sleeping in `event::poll`.
 
 use std::collections::HashMap;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
@@ -87,6 +88,11 @@ const PROVIDER_INIT_ERR: &str = "Failed to create provider";
 const PROVIDER_USAGE_CHANGED_ERR: &str = "provider changed while fetching usage";
 const PROVIDER_USAGE_SHUTDOWN_ERR: &str = "UI shut down while fetching usage";
 const NOT_LIVE_ERR: &str = "session not live";
+const LOCK_LOST_REPLACEMENT_ERR: &str = "session lock was lost; replacement is disabled";
+const LOCK_UNAVAILABLE_REPLACEMENT_ERR: &str =
+    "session lock ownership is unavailable; replacement is disabled";
+
+static NEXT_RUNTIME_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
 /// disk round-trip; `session_has_content` tells which ones were saved.
@@ -336,46 +342,150 @@ fn parse_session_id(id: &str) -> Result<MakiId, String> {
     id.parse().map_err(|e: MakiIdParseError| e.to_string())
 }
 
-fn heartbeat_runtime_lock(runtime: &mut SessionRuntime) {
-    let id = runtime.id();
-    let Some(session_lock) = runtime.session_lock.as_mut() else {
-        return;
-    };
-    match session_lock.heartbeat() {
-        Ok(session_lock::LockBeat::Lost) => {
-            runtime.session_lock = None;
-            runtime.lock_lost = true;
-            runtime
-                .app
-                .flash("Session lock lost to another process; stopping without saving".into());
-            runtime.app.exit_request = ExitRequest::Error;
-            let _ = runtime.handles.cmd_tx.try_send(AgentCommand::CancelAll);
-            warn!(id = %id, "session lock lost to another process; stopping without saving");
+enum SessionLockState {
+    Held(ClaimedSessionLock),
+    InFlight(smol::Task<HeartbeatCompletion>),
+}
+
+struct HeartbeatCompletion {
+    result: io::Result<session_lock::LockBeat>,
+    lease: Option<ClaimedSessionLock>,
+}
+
+impl Drop for HeartbeatCompletion {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            let _ = lease.release();
         }
-        Err(error) => warn!(id = %id, %error, "session lock heartbeat failed"),
-        Ok(session_lock::LockBeat::Held | session_lock::LockBeat::Claimed) => {}
     }
 }
 
-fn rollback_startup_runtimes(runtimes: Vec<SessionRuntime>) {
-    for mut runtime in runtimes {
-        if let Some(session_lock) = runtime.session_lock.take()
-            && let Err(error) = session_lock.release()
-        {
+fn mark_runtime_lock_lost(runtime: &mut SessionRuntime) {
+    runtime.session_lock = None;
+    runtime.lock_lost = true;
+    runtime
+        .app
+        .flash("Session lock lost to another process; stopping without saving".into());
+    runtime.app.exit_request = ExitRequest::Error;
+    let _ = runtime.handles.cmd_tx.try_send(AgentCommand::CancelAll);
+    warn!(id = %runtime.id(), "session lock lost to another process; stopping without saving");
+}
+
+fn apply_heartbeat_completion(runtime: &mut SessionRuntime, mut completion: HeartbeatCompletion) {
+    match completion.result {
+        Ok(session_lock::LockBeat::Held | session_lock::LockBeat::Claimed) => {
+            let lease = completion.lease.take().expect("heartbeat completion lease");
+            runtime.session_lock = Some(SessionLockState::Held(lease));
+        }
+        Ok(session_lock::LockBeat::Lost) => mark_runtime_lock_lost(runtime),
+        Err(ref error) => {
+            let lease = completion.lease.take().expect("heartbeat completion lease");
+            runtime.session_lock = Some(SessionLockState::Held(lease));
+            warn!(id = %runtime.id(), %error, "session lock heartbeat failed");
+        }
+    }
+}
+
+fn start_runtime_heartbeat(
+    runtime: &mut SessionRuntime,
+    internal_tx: &flume::Sender<InternalEvent>,
+) {
+    start_runtime_heartbeat_with(runtime, internal_tx, |mut lease| {
+        let result = lease.heartbeat();
+        (lease, result)
+    });
+}
+
+fn start_runtime_heartbeat_with<F>(
+    runtime: &mut SessionRuntime,
+    internal_tx: &flume::Sender<InternalEvent>,
+    heartbeat: F,
+) where
+    F: FnOnce(ClaimedSessionLock) -> (ClaimedSessionLock, io::Result<session_lock::LockBeat>)
+        + Send
+        + 'static,
+{
+    let lease = match runtime.session_lock.take() {
+        Some(SessionLockState::Held(lease)) => lease,
+        state => {
+            runtime.session_lock = state;
+            return;
+        }
+    };
+    let runtime_generation = runtime.generation;
+    let internal_tx = internal_tx.clone();
+    let task = smol::spawn(async move {
+        let (lease, result) = smol::unblock(move || heartbeat(lease)).await;
+        let _ = internal_tx.send(InternalEvent::SessionHeartbeat(runtime_generation));
+        HeartbeatCompletion {
+            result,
+            lease: Some(lease),
+        }
+    });
+    runtime.session_lock = Some(SessionLockState::InFlight(task));
+}
+
+fn collect_heartbeat(
+    task: smol::Task<HeartbeatCompletion>,
+    timeout: Option<Duration>,
+) -> Option<HeartbeatCompletion> {
+    smol::block_on(async move {
+        match timeout {
+            Some(timeout) => {
+                futures_lite::future::or(async { Some(task.await) }, async {
+                    smol::Timer::after(timeout).await;
+                    None
+                })
+                .await
+            }
+            None => Some(task.await),
+        }
+    })
+}
+
+fn release_lock_state(state: Option<SessionLockState>) -> io::Result<()> {
+    release_lock_state_with_timeout(state, AGENT_SHUTDOWN_TIMEOUT)
+}
+
+fn release_lock_state_with_timeout(
+    state: Option<SessionLockState>,
+    timeout: Duration,
+) -> io::Result<()> {
+    let lease = match state {
+        Some(SessionLockState::Held(lease)) => Some(lease),
+        Some(SessionLockState::InFlight(task)) => collect_heartbeat(task, Some(timeout))
+            .and_then(|mut completion| completion.lease.take()),
+        None => None,
+    };
+    lease.map_or(Ok(()), ClaimedSessionLock::release)
+}
+
+fn checkpoint_runtime(runtime: &mut SessionRuntime) {
+    if !runtime.lock_lost {
+        runtime.app.checkpoint();
+    }
+}
+
+fn rollback_startup_runtimes(mut runtimes: Vec<SessionRuntime>) {
+    for runtime in &mut runtimes {
+        if let Err(error) = release_lock_state(runtime.session_lock.take()) {
             warn!(id = %runtime.id(), %error, "startup rollback lock release failed");
         }
+    }
+    for runtime in runtimes {
         runtime.handles.shutdown().detach();
     }
 }
 
 struct SessionRuntime {
+    generation: u64,
     app: App,
     handles: AgentHandles,
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
     last_status: SessionStatus,
     notifications: RunNotificationState,
-    session_lock: Option<ClaimedSessionLock>,
+    session_lock: Option<SessionLockState>,
     lock_lost: bool,
     restore_pending: bool,
 }
@@ -416,7 +526,7 @@ impl PreparedSessionRuntime {
     fn activate(
         self,
         model_slot: &ProviderSlot,
-        session_lock: Option<ClaimedSessionLock>,
+        session_lock: Option<SessionLockState>,
     ) -> SessionRuntime {
         let Self {
             app,
@@ -433,6 +543,7 @@ impl PreparedSessionRuntime {
         let mut app = app.activate();
         handles.apply_to_app(&mut app);
         SessionRuntime {
+            generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
             app,
             handles,
             shell_tx,
@@ -455,10 +566,21 @@ fn replace_session_runtime(
     let target_id = prepared.app.session_id();
     let exit_on_done = current.app.exit_on_done;
     let same_id = current.id() == target_id;
+    if current.lock_lost {
+        return Err(LOCK_LOST_REPLACEMENT_ERR.into());
+    }
     let target_lock = if same_id {
-        current.session_lock.take()
+        match current.session_lock.take() {
+            Some(SessionLockState::Held(lease)) => Some(SessionLockState::Held(lease)),
+            state => {
+                current.session_lock = state;
+                return Err(LOCK_UNAVAILABLE_REPLACEMENT_ERR.into());
+            }
+        }
     } else {
-        Some(claim_lock(sessions_dir, &target_id).map_err(|error| error.to_string())?)
+        Some(SessionLockState::Held(
+            claim_lock(sessions_dir, &target_id).map_err(|error| error.to_string())?,
+        ))
     };
     let mut runtime = prepared.activate(model_slot, target_lock);
     runtime.app.exit_on_done = exit_on_done;
@@ -588,7 +710,7 @@ impl SpawnCtx {
         let id = session.id;
         let prepared = self.prepare_runtime(session);
         let session_lock = claim_lock(&self.sessions_dir, &id)?;
-        Ok(prepared.activate(&self.model_slot, Some(session_lock)))
+        Ok(prepared.activate(&self.model_slot, Some(SessionLockState::Held(session_lock))))
     }
 }
 
@@ -604,6 +726,7 @@ enum InternalEvent {
         provider: ProviderIdentity,
         result: ProviderUsageFetchResult,
     },
+    SessionHeartbeat(u64),
 }
 
 pub(crate) struct EventLoop<'t> {
@@ -1052,6 +1175,21 @@ impl<'t> EventLoop<'t> {
                 });
                 self.handle_provider_usage_outputs(outputs);
             }
+            InternalEvent::SessionHeartbeat(runtime_generation) => {
+                let Some(runtime) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|runtime| runtime.generation == runtime_generation)
+                else {
+                    return;
+                };
+                let Some(SessionLockState::InFlight(task)) = runtime.session_lock.take() else {
+                    return;
+                };
+                if let Some(completion) = collect_heartbeat(task, None) {
+                    apply_heartbeat_completion(runtime, completion);
+                }
+            }
         }
     }
 
@@ -1139,10 +1277,8 @@ impl<'t> EventLoop<'t> {
     }
 
     fn checkpoint_all(&mut self) {
-        for rt in &mut self.sessions {
-            if !rt.lock_lost {
-                rt.app.checkpoint();
-            }
+        for runtime in &mut self.sessions {
+            checkpoint_runtime(runtime);
         }
     }
 
@@ -1156,7 +1292,7 @@ impl<'t> EventLoop<'t> {
         if now.duration_since(self.last_heartbeat) >= session_lock::HEARTBEAT_INTERVAL {
             self.last_heartbeat = now;
             for runtime in &mut self.sessions {
-                heartbeat_runtime_lock(runtime);
+                start_runtime_heartbeat(runtime, &self.internal_tx);
             }
         }
         let mut login_actions: Vec<(usize, Vec<Action>)> = Vec::new();
@@ -1852,9 +1988,7 @@ impl<'t> EventLoop<'t> {
     fn remove_runtime(&mut self, idx: usize) -> SessionRuntime {
         debug_assert_ne!(idx, self.focused);
         let mut rt = self.sessions.remove(idx);
-        if let Some(session_lock) = rt.session_lock.take()
-            && let Err(error) = session_lock.release()
-        {
+        if let Err(error) = release_lock_state(rt.session_lock.take()) {
             warn!(id = %rt.id(), %error, "session lock release failed");
         }
         if idx < self.focused {
@@ -1896,7 +2030,7 @@ impl<'t> EventLoop<'t> {
 
     fn replace_runtime(&mut self, idx: usize, session: AppSession) -> Result<(), String> {
         if self.sessions[idx].lock_lost {
-            return Err("session lock was lost; replacement is disabled".into());
+            return Err(LOCK_LOST_REPLACEMENT_ERR.into());
         }
         self.sessions[idx].app.checkpoint_now();
         let prepared = self.ctx.prepare_runtime(session);
@@ -1920,9 +2054,7 @@ impl<'t> EventLoop<'t> {
             session_lock,
             ..
         } = old;
-        if let Some(session_lock) = session_lock
-            && let Err(error) = session_lock.release()
-        {
+        if let Err(error) = release_lock_state(session_lock) {
             warn!(%error, "old session lock release failed");
         }
         drop(app);
@@ -2286,6 +2418,7 @@ impl<'t> EventLoop<'t> {
             let _ = rt.handles.cmd_tx.try_send(AgentCommand::CancelAll);
         }
         let kill_mcp_ms = lap();
+        let heartbeat_deadline = Instant::now() + AGENT_SHUTDOWN_TIMEOUT;
         let mut tabs = Vec::with_capacity(self.sessions.len());
         let mut agent_tasks = Vec::with_capacity(self.sessions.len());
         for rt in self.sessions.drain(..) {
@@ -2296,9 +2429,8 @@ impl<'t> EventLoop<'t> {
                 lock_lost,
                 ..
             } = rt;
-            if let Some(session_lock) = session_lock
-                && let Err(error) = session_lock.release()
-            {
+            let heartbeat_timeout = heartbeat_deadline.saturating_duration_since(Instant::now());
+            if let Err(error) = release_lock_state_with_timeout(session_lock, heartbeat_timeout) {
                 warn!(id = %app.state.session.id, %error, "session lock release failed");
             }
             if !lock_lost {
@@ -2581,9 +2713,7 @@ mod tests {
             session_lock,
             ..
         } = runtime;
-        if let Some(session_lock) = session_lock {
-            session_lock.release().unwrap();
-        }
+        release_lock_state(session_lock).unwrap();
         let manager = handles.manager_and_root().0;
         drop(handles);
         shutdown_manager(&manager);
@@ -2729,7 +2859,20 @@ mod tests {
         let path = session_lock::lock_path(&harness.ctx().sessions_dir, &runtime.id());
         std::fs::write(&path, format!("{} replacement", std::process::id())).unwrap();
 
-        heartbeat_runtime_lock(&mut runtime);
+        let lease = match runtime.session_lock.take().unwrap() {
+            SessionLockState::Held(mut lease) => {
+                assert_eq!(lease.heartbeat().unwrap(), session_lock::LockBeat::Lost);
+                lease
+            }
+            SessionLockState::InFlight(_) => panic!("heartbeat was already in flight"),
+        };
+        apply_heartbeat_completion(
+            &mut runtime,
+            HeartbeatCompletion {
+                result: Ok(session_lock::LockBeat::Lost),
+                lease: Some(lease),
+            },
+        );
 
         assert!(runtime.lock_lost);
         assert!(runtime.session_lock.is_none());
@@ -2738,17 +2881,205 @@ mod tests {
     }
 
     #[test]
+    fn prepared_replacement_cannot_reset_lock_lost_or_save() {
+        let harness = RuntimeHarness::new();
+        let mut session = harness.session();
+        let id = session.id;
+        let path = session_lock::lock_path(&harness.ctx().sessions_dir, &id);
+        session.save(&harness.ctx().storage).unwrap();
+        let stored_before = AppSession::load(id, &harness.ctx().storage).unwrap();
+        let mut runtime = harness.runtime(session.clone());
+        let lease = match runtime.session_lock.take().unwrap() {
+            SessionLockState::Held(lease) => lease,
+            SessionLockState::InFlight(_) => panic!("heartbeat was already in flight"),
+        };
+        std::fs::write(&path, format!("{} replacement", std::process::id())).unwrap();
+        runtime.lock_lost = true;
+        runtime
+            .app
+            .state
+            .session_mut()
+            .push_message(Message::user("must not save".into()));
+        let prepared = harness.ctx().prepare_runtime(session);
+
+        let error = match replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        ) {
+            Ok(old) => {
+                release_runtime(old);
+                panic!("lock-lost replacement must fail");
+            }
+            Err(error) => error,
+        };
+
+        assert_eq!(error, LOCK_LOST_REPLACEMENT_ERR);
+        assert!(runtime.lock_lost);
+        assert!(runtime.session_lock.is_none());
+        checkpoint_runtime(&mut runtime);
+        assert_eq!(
+            AppSession::load(id, &harness.ctx().storage)
+                .unwrap()
+                .messages()
+                .len(),
+            stored_before.messages().len()
+        );
+        lease.release().unwrap();
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn heartbeat_runs_off_thread_and_only_one_is_in_flight() {
+        let harness = RuntimeHarness::new();
+        let mut runtime = harness.runtime(harness.session());
+        let (internal_tx, internal_rx) = flume::unbounded();
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+
+        start_runtime_heartbeat_with(&mut runtime, &internal_tx, move |lease| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            (lease, Ok(session_lock::LockBeat::Held))
+        });
+        entered_rx.recv().unwrap();
+        assert!(matches!(
+            runtime.session_lock,
+            Some(SessionLockState::InFlight(_))
+        ));
+
+        let second_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_probe = Arc::clone(&second_ran);
+        start_runtime_heartbeat_with(&mut runtime, &internal_tx, move |lease| {
+            second_probe.store(true, Ordering::SeqCst);
+            (lease, Ok(session_lock::LockBeat::Held))
+        });
+        assert!(!second_ran.load(Ordering::SeqCst));
+
+        release_tx.send(()).unwrap();
+        let InternalEvent::SessionHeartbeat(generation) = internal_rx.recv().unwrap() else {
+            panic!("expected heartbeat completion");
+        };
+        assert_eq!(generation, runtime.generation);
+        let Some(SessionLockState::InFlight(task)) = runtime.session_lock.take() else {
+            panic!("expected in-flight heartbeat task");
+        };
+        let completion = collect_heartbeat(task, None).unwrap();
+        apply_heartbeat_completion(&mut runtime, completion);
+        assert!(matches!(
+            runtime.session_lock,
+            Some(SessionLockState::Held(_))
+        ));
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn graceful_cleanup_joins_in_flight_heartbeat_and_releases_lock() {
+        let harness = RuntimeHarness::new();
+        let session = harness.session();
+        let id = session.id;
+        let mut runtime = harness.runtime(session.clone());
+        let (internal_tx, _internal_rx) = flume::unbounded();
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        start_runtime_heartbeat_with(&mut runtime, &internal_tx, move |lease| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            (lease, Ok(session_lock::LockBeat::Held))
+        });
+        entered_rx.recv().unwrap();
+
+        let prepared = harness.ctx().prepare_runtime(session);
+        let error = match replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        ) {
+            Ok(old) => {
+                release_runtime(old);
+                panic!("in-flight same-id replacement must fail");
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error, LOCK_UNAVAILABLE_REPLACEMENT_ERR);
+        assert!(matches!(
+            runtime.session_lock,
+            Some(SessionLockState::InFlight(_))
+        ));
+
+        let state = runtime.session_lock.take();
+        let (cleanup_started_tx, cleanup_started_rx) = flume::bounded(1);
+        let (cleanup_done_tx, cleanup_done_rx) = flume::bounded(1);
+        let cleanup = std::thread::spawn(move || {
+            cleanup_started_tx.send(()).unwrap();
+            let result = release_lock_state(state);
+            cleanup_done_tx.send(result).unwrap();
+        });
+        cleanup_started_rx.recv().unwrap();
+        assert!(cleanup_done_rx.try_recv().is_err());
+
+        release_tx.send(()).unwrap();
+        cleanup_done_rx.recv().unwrap().unwrap();
+        cleanup.join().unwrap();
+        assert!(!session_lock::open_elsewhere(
+            &harness.ctx().sessions_dir,
+            &id
+        ));
+        session_lock::claim(&harness.ctx().sessions_dir, &id)
+            .unwrap()
+            .unwrap()
+            .release()
+            .unwrap();
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn stale_heartbeat_signal_cannot_poison_replacement() {
+        let harness = RuntimeHarness::new();
+        let stale = harness.runtime(harness.session());
+        let stale_generation = stale.generation;
+        let replacement = harness.runtime(harness.session());
+        let replacement_generation = replacement.generation;
+        let replacement_id = replacement.id();
+        let mut runtimes = vec![replacement];
+
+        assert!(
+            runtimes
+                .iter_mut()
+                .find(|runtime| runtime.generation == stale_generation)
+                .is_none()
+        );
+        assert_eq!(runtimes[0].generation, replacement_generation);
+        assert_eq!(runtimes[0].id(), replacement_id);
+        assert!(!runtimes[0].lock_lost);
+        assert!(matches!(
+            runtimes[0].session_lock,
+            Some(SessionLockState::Held(_))
+        ));
+        release_runtime(stale);
+        release_runtime(runtimes.pop().unwrap());
+    }
+
+    #[test]
     fn startup_rollback_releases_previously_claimed_locks() {
         let harness = RuntimeHarness::new();
         let first = harness.runtime(harness.session());
         let second = harness.runtime(harness.session());
-        let first_path = session_lock::lock_path(&harness.ctx().sessions_dir, &first.id());
-        let second_path = session_lock::lock_path(&harness.ctx().sessions_dir, &second.id());
+        let first_id = first.id();
+        let second_id = second.id();
 
         rollback_startup_runtimes(vec![first, second]);
 
-        assert!(!first_path.exists());
-        assert!(!second_path.exists());
+        assert!(!session_lock::open_elsewhere(
+            &harness.ctx().sessions_dir,
+            &first_id
+        ));
+        assert!(!session_lock::open_elsewhere(
+            &harness.ctx().sessions_dir,
+            &second_id
+        ));
     }
 
     #[test]
@@ -2800,8 +3131,16 @@ mod tests {
         assert!(target_path.exists());
         assert!(old.session_lock.is_some());
         assert!(old_path.exists());
-        old.session_lock.take().unwrap().release().unwrap();
-        assert!(!old_path.exists());
+        release_lock_state(old.session_lock.take()).unwrap();
+        assert!(!session_lock::open_elsewhere(
+            &harness.ctx().sessions_dir,
+            &old_id
+        ));
+        assert!(
+            session_lock::claim(&harness.ctx().sessions_dir, &old_id)
+                .unwrap()
+                .is_some()
+        );
         assert!(target_path.exists());
         release_runtime(old);
         release_runtime(runtime);

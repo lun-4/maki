@@ -396,8 +396,8 @@ pub struct App {
     subagent_channels: HashMap<maki_agent::AgentId, SubagentChannels>,
     /// Stamped child outcomes outrank duplicate terminal delivery.
     stamped_subagent_outcomes: HashSet<(maki_agent::AgentId, maki_agent::TurnId)>,
-    /// Last cumulative history size delivered to the root for each live child.
-    delivered_subagent_history_len: HashMap<maki_agent::AgentId, usize>,
+    /// Last cumulative history delivered to the root for each live child.
+    delivered_subagent_histories: HashMap<maki_agent::AgentId, Vec<u8>>,
 }
 
 pub(crate) struct PreparedApp {
@@ -545,7 +545,7 @@ impl App {
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_channels: HashMap::new(),
             stamped_subagent_outcomes: HashSet::new(),
-            delivered_subagent_history_len: HashMap::new(),
+            delivered_subagent_histories: HashMap::new(),
         };
         app.model_picker.set_recents(
             maki_storage::model::read_recents(&app.storage)
@@ -1788,6 +1788,9 @@ impl App {
             if let Some(channels) = self.subagent_channels.get_mut(&subagent.agent_id) {
                 channels.closed = true;
             }
+            self.delivered_subagent_histories.remove(&subagent.agent_id);
+            self.stamped_subagent_outcomes
+                .retain(|(agent_id, _)| *agent_id != subagent.agent_id);
             self.chats[chat_idx].cancel_in_progress();
             self.sync_task_picker();
             return vec![];
@@ -1864,9 +1867,16 @@ impl App {
                         .is_some_and(|channels| channels.input_tx.is_some())
                 })
                 .filter(|agent_id| {
-                    self.delivered_subagent_history_len
-                        .insert(*agent_id, messages.len())
-                        != Some(messages.len())
+                    let Ok(history) = serde_json::to_vec(&messages) else {
+                        tracing::warn!(%agent_id, "subagent history dedup serialization failed");
+                        return true;
+                    };
+                    if self.delivered_subagent_histories.get(agent_id) == Some(&history) {
+                        false
+                    } else {
+                        self.delivered_subagent_histories.insert(*agent_id, history);
+                        true
+                    }
                 })
                 .and_then(|_| terminal_reply(&messages))
                 .filter(|reply| !reply.is_empty());

@@ -1,6 +1,7 @@
 //! Cross-process session locks. One `<id>.lock` file per session inside the
 //! sessions dir: the file holds the holder's PID and owner token; its mtime is
-//! the heartbeat. Legacy PID-only records remain readable.
+//! the heartbeat. Legacy PID-only records remain readable. Graceful release
+//! writes the ephemeral `released` marker, which the next claim replaces.
 //! A session whose lock is fresh and held by another process is open
 //! elsewhere and cannot be continued from here.
 //!
@@ -21,6 +22,8 @@ use crate::id::MakiId;
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 pub const STALE_AFTER: Duration = Duration::from_secs(5);
 pub const OPEN_ELSEWHERE_MSG: &str = "session is open in another terminal; close it there first";
+
+const RELEASED_RECORD: &str = "released";
 
 /// Reasons a stored session cannot be continued from this run.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -92,11 +95,33 @@ fn owner_token() -> io::Result<String> {
     Ok(token.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+#[cfg(test)]
+type ReleaseHook = (PathBuf, Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+fn release_before_write_hook() -> &'static Mutex<Option<ReleaseHook>> {
+    static HOOK: OnceLock<Mutex<Option<ReleaseHook>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn run_release_before_write_hook(path: &Path) {
+    let mut hook = release_before_write_hook()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if hook.as_ref().is_some_and(|(expected, _)| expected == path) {
+        let (_, callback) = hook.take().expect("matching release hook");
+        drop(hook);
+        callback();
+    }
+}
+
 /// The sole identity-bearing lease for a claimed session lock.
 #[derive(Debug)]
 pub struct ClaimedSessionLock {
     path: PathBuf,
     owner: LockOwner,
+    released: bool,
 }
 
 impl ClaimedSessionLock {
@@ -114,19 +139,35 @@ impl ClaimedSessionLock {
         Ok(LockBeat::Held)
     }
 
-    /// Remove the lock only while the on-disk lock still has this lease's identity.
-    pub fn release(self) -> io::Result<()> {
+    /// Mark this lease's locked inode released without mutating its pathname.
+    pub fn release(mut self) -> io::Result<()> {
+        self.release_inner()
+    }
+
+    fn release_inner(&mut self) -> io::Result<()> {
         let Some(mut file) = open_existing_locked(&self.path)? else {
+            self.released = true;
             return Ok(());
         };
         if read_owner(&mut file)?.as_ref() == Some(&self.owner) {
-            match fs::remove_file(&self.path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
+            #[cfg(test)]
+            run_release_before_write_hook(&self.path);
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(RELEASED_RECORD.as_bytes())?;
+            file.sync_data()?;
         }
-        file.unlock()
+        file.unlock()?;
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for ClaimedSessionLock {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = self.release_inner();
+        }
     }
 }
 
@@ -204,7 +245,11 @@ pub fn claim(dir: &Path, id: &MakiId) -> io::Result<Option<ClaimedSessionLock>> 
     };
     write_owner(&mut file, &owner)?;
     file.unlock()?;
-    Ok(Some(ClaimedSessionLock { path, owner }))
+    Ok(Some(ClaimedSessionLock {
+        path,
+        owner,
+        released: false,
+    }))
 }
 
 fn deferred_leases() -> &'static Mutex<HashMap<PathBuf, ClaimedSessionLock>> {
@@ -470,12 +515,40 @@ mod tests {
     }
 
     #[test]
-    fn release_removes_own_lock() {
+    fn release_does_not_modify_path_replaced_after_owner_check() {
+        let dir = tempdir().unwrap();
+        let id = MakiId::generate();
+        let path = lock_path(dir.path(), &id);
+        let lease = claim(dir.path(), &id).unwrap().unwrap();
+        let replacement = format!("{} replacement", std::process::id());
+        let replaced_path = path.clone();
+        *release_before_write_hook().lock().unwrap() = Some((
+            path.clone(),
+            Box::new(move || {
+                fs::remove_file(&replaced_path).unwrap();
+                fs::write(&replaced_path, &replacement).unwrap();
+            }),
+        ));
+
+        lease.release().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            format!("{} replacement", std::process::id())
+        );
+    }
+
+    #[test]
+    fn release_marker_is_immediately_claimable() {
         let dir = tempdir().unwrap();
         let id = MakiId::generate();
         heartbeat(dir.path(), &id).unwrap();
         release(dir.path(), &id);
-        assert!(!lock_path(dir.path(), &id).exists());
+
+        let path = lock_path(dir.path(), &id);
+        assert_eq!(fs::read_to_string(&path).unwrap(), RELEASED_RECORD);
+        assert!(!open_elsewhere(dir.path(), &id));
+        claim(dir.path(), &id).unwrap().unwrap().release().unwrap();
     }
 
     #[test]

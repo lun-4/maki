@@ -94,8 +94,7 @@ struct AdapterResult {
 /// a `Mutex`/`Sender`/`OnceLock` the borrowed shell can touch. `prompt` and
 /// `status` never read through this struct; they speak to the actor handle.
 struct LuaActorState {
-    params: AgentParams,
-    agent_id: OnceLock<AgentId>,
+    params: OnceLock<AgentParams>,
     system: String,
     tools: JsonValue,
     thinking: ThinkingConfig,
@@ -124,6 +123,7 @@ struct LuaActorState {
     execution_started: std::sync::atomic::AtomicBool,
     /// Prevents close/drop from duplicating the latest terminal relay.
     history_relayed: std::sync::atomic::AtomicBool,
+    close_notified: std::sync::atomic::AtomicBool,
     relay_snapshot: Mutex<Vec<Message>>,
     presentation: Mutex<HashMap<TurnId, AdapterResult>>,
 }
@@ -132,17 +132,24 @@ impl LuaActorState {
     fn init_subagent_info(&self, first_message: &str) {
         if self.subagent_info.get().is_none() {
             let _ = self.subagent_info.set(SubagentInfo {
-                agent_id: *self
-                    .agent_id
+                agent_id: self
+                    .params
                     .get()
-                    .expect("session identity must be initialized before admission"),
+                    .expect("session parameters must be initialized before admission")
+                    .agent_id,
                 parent_agent_id: self.parent_agent_id,
                 parent_is_root: self.parent_is_root,
                 auto_deliver: self.auto_deliver,
                 parent_tool_use_id: self.ui_id.clone(),
                 name: self.name.clone(),
                 prompt: Some(first_message.to_owned()),
-                model: Some(self.params.model.spec()),
+                model: Some(
+                    self.params
+                        .get()
+                        .expect("session parameters must be initialized before admission")
+                        .model
+                        .spec(),
+                ),
                 answer_tx: self.answer_tx.clone(),
                 input_tx: Some(self.input_tx.clone()),
                 cancel: Some(self.cancel.clone()),
@@ -281,8 +288,11 @@ impl ActorBackend for LuaActorBackend {
                 None => None,
             };
 
-            let mut params = state.params.clone();
-            params.agent_id = context.agent_id;
+            let mut params = state
+                .params
+                .get()
+                .expect("session parameters must be initialized before admission")
+                .clone();
             params.managed_turn = context.managed_turn.clone();
             let mut agent = Agent::new(
                 params,
@@ -975,8 +985,7 @@ async fn session(
     // Each message is admitted to the actor as its own turn (no second FIFO;
     // the actor's queue is the FIFO).
     let (ui_input_tx, ui_input_rx) = flume::unbounded::<String>();
-    let agent_id = AgentId::generate();
-    let params = AgentParams {
+    let build_params = |agent_id| AgentParams {
         agent_id,
         provider,
         model,
@@ -1007,8 +1016,7 @@ async fn session(
         }
     });
     let state = Arc::new(LuaActorState {
-        params,
-        agent_id: OnceLock::new(),
+        params: OnceLock::new(),
         system: system.unwrap_or_default(),
         tools: tools_json,
         thinking,
@@ -1037,6 +1045,7 @@ async fn session(
         start: Instant::now(),
         execution_started: std::sync::atomic::AtomicBool::new(false),
         history_relayed: std::sync::atomic::AtomicBool::new(false),
+        close_notified: std::sync::atomic::AtomicBool::new(false),
         relay_snapshot: Mutex::new(Vec::new()),
         presentation: Mutex::new(HashMap::new()),
     });
@@ -1050,10 +1059,11 @@ async fn session(
             None,
             Box::new(LuaActorBackend::new(Arc::clone(&state))),
         ));
-        state
-            .agent_id
-            .set(child.id())
-            .expect("session identity must only be initialized once");
+        let agent_id = child.id();
+        assert!(
+            state.params.set(build_params(agent_id)).is_ok(),
+            "session parameters must only be initialized once"
+        );
         let actor = try_pair!(child.actor());
         (
             actor,
@@ -1063,10 +1073,14 @@ async fn session(
             },
         )
     } else {
-        state
-            .agent_id
-            .set(agent_id)
-            .expect("session identity must only be initialized once");
+        let agent_id = AgentId::generate();
+        assert!(
+            state.params.set(build_params(agent_id)).is_ok(),
+            "session parameters must only be initialized once"
+        );
+        let cancel_slot = agent_ctx
+            .subagent_cancels
+            .insert(ui_id.clone(), child_trigger);
         let (actor, task) = AgentActorHandle::spawn(
             agent_id,
             Vec::new(),
@@ -1074,9 +1088,6 @@ async fn session(
             Box::new(LuaActorBackend::new(Arc::clone(&state))),
         );
         task.detach();
-        let cancel_slot = agent_ctx
-            .subagent_cancels
-            .insert(ui_id.clone(), child_trigger);
         (
             actor,
             SessionControl::Unmanaged {
@@ -1270,7 +1281,12 @@ struct LuaSession {
 
 impl LuaSession {
     fn close_controlled(&self) {
-        if let Some(subagent) = self.state.subagent_info.get() {
+        if let Some(subagent) = self.state.subagent_info.get()
+            && !self
+                .state
+                .close_notified
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
             let _ = self.state.parent_event_tx.send_envelope(Envelope {
                 event: AgentEvent::SubagentClosed,
                 subagent: Some(subagent.clone()),
@@ -1403,15 +1419,12 @@ async fn prompt(
         match wait.wait().await {
             Ok(outcome) => outcome,
             Err(maki_agent::PromptWaitError::Timeout) => {
-                let message = timeout.map_or_else(
-                    || "session prompt timed out".to_owned(),
-                    |seconds| format!("session prompt timed out after {seconds}s"),
-                );
-                return Ok(err_pair(message));
+                let seconds = timeout.expect("managed timeout requires a configured duration");
+                return Ok(err_pair(format!(
+                    "session prompt timed out after {seconds}s"
+                )));
             }
-            Err(
-                maki_agent::PromptWaitError::Cancelled | maki_agent::PromptWaitError::LeaseClosed,
-            ) => {
+            Err(maki_agent::PromptWaitError::Cancelled) => {
                 return Ok(err_pair(CANCELLED_MSG));
             }
         }
@@ -1909,8 +1922,7 @@ mod tests {
             (Arc::clone(&map), map.insert(ui_id.clone(), child_trigger))
         };
         let state = Arc::new(LuaActorState {
-            params,
-            agent_id: OnceLock::from(agent_id),
+            params: OnceLock::from(params),
             system: String::new(),
             tools: JsonValue::Array(vec![]),
             thinking: ThinkingConfig::Off,
@@ -1935,6 +1947,7 @@ mod tests {
             start: Instant::now(),
             execution_started: std::sync::atomic::AtomicBool::new(false),
             history_relayed: std::sync::atomic::AtomicBool::new(false),
+            close_notified: std::sync::atomic::AtomicBool::new(false),
             relay_snapshot: Mutex::new(Vec::new()),
             presentation: Mutex::new(HashMap::new()),
         });
@@ -2079,6 +2092,33 @@ mod tests {
             parent_rx
                 .drain()
                 .all(|e| !matches!(e.event, AgentEvent::SubagentHistory { .. }))
+        );
+    }
+
+    #[test]
+    fn repeated_close_and_drop_emit_subagent_closed_once() {
+        let provider: Arc<dyn Provider> = Arc::new(StreamOnceProvider::new_replies(vec![
+            canned_reply_with_usage("done", FIRST_USAGE),
+        ]));
+        let (actor, state, sess, parent_rx) = session_with_provider(provider, None);
+        let ticket = admit(&state, &actor, "run me");
+        assert!(matches!(
+            smol::block_on(ticket.wait()),
+            TurnOutcome::Completed { .. }
+        ));
+        let _ = parent_rx.drain().count();
+
+        sess.close_controlled();
+        sess.close_controlled();
+        drop(sess);
+
+        assert_eq!(
+            parent_rx
+                .drain()
+                .filter(|envelope| matches!(envelope.event, AgentEvent::SubagentClosed))
+                .count(),
+            1,
+            "close notification must be emitted once"
         );
     }
 

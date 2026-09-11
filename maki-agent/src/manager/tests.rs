@@ -2,6 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 
 use event_listener::Event;
 use maki_providers::TokenUsage;
@@ -75,6 +76,51 @@ struct CancellableBackend {
     entered: flume::Sender<()>,
 }
 
+struct ReportingCancellableBackend {
+    current: flume::Sender<crate::CurrentManagedTurn>,
+}
+
+impl ActorBackend for ReportingCancellableBackend {
+    fn run_turn<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        context: TurnContext,
+        _: AgentInput,
+        _: WorkKind,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async move {
+            self.current
+                .send(context.managed_turn.clone().unwrap())
+                .unwrap();
+            let reason = context.cancel_reason.cancelled().await;
+            BackendResult::EnteredRun(TurnOutcome::Cancelled {
+                agent_id: context.agent_id,
+                turn_id: context.turn_id.unwrap(),
+                usage: TokenUsage::default(),
+                num_turns: 0,
+                reason,
+            })
+        })
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: &'a ControlWork,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::ControlDone })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::CompactDone })
+    }
+}
+
 impl ActorBackend for CancellableBackend {
     fn run_turn<'a>(
         &'a mut self,
@@ -93,6 +139,89 @@ impl ActorBackend for CancellableBackend {
                 num_turns: 0,
                 reason,
             })
+        })
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: &'a ControlWork,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::ControlDone })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::CompactDone })
+    }
+}
+
+struct SuspendDuringPollBackend {
+    current: flume::Sender<crate::CurrentManagedTurn>,
+    checked: flume::Sender<bool>,
+}
+
+struct SuspendDuringPollFuture {
+    context: crate::CurrentManagedTurn,
+    cancel: crate::ReasonedCancelToken,
+    checked: flume::Sender<bool>,
+    first_poll: bool,
+    checked_once: bool,
+}
+
+impl Future for SuspendDuringPollFuture {
+    type Output = BackendResult;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.first_poll {
+            self.first_poll = false;
+            context.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        if !self.checked_once {
+            self.checked_once = true;
+            let (cancel, _) = crate::ReasonedCancelToken::new();
+            self.context.lease.inner.suspend(u64::MAX, cancel).unwrap();
+            let limiter = Arc::clone(&self.context.lease.inner.limiter);
+            let mut acquire = Box::pin(limiter.acquire_arc());
+            self.checked
+                .send(acquire.as_mut().poll(context).is_pending())
+                .unwrap();
+        }
+        let mut cancelled = Box::pin(self.cancel.cancelled());
+        let Poll::Ready(reason) = cancelled.as_mut().poll(context) else {
+            return Poll::Pending;
+        };
+        Poll::Ready(BackendResult::EnteredRun(TurnOutcome::Cancelled {
+            agent_id: self.context.agent_id(),
+            turn_id: self.context.turn_id(),
+            usage: TokenUsage::default(),
+            num_turns: 0,
+            reason,
+        }))
+    }
+}
+
+impl ActorBackend for SuspendDuringPollBackend {
+    fn run_turn<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        context: TurnContext,
+        _: AgentInput,
+        _: WorkKind,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        let managed = context.managed_turn.unwrap();
+        self.current.send(managed.clone()).unwrap();
+        Box::pin(SuspendDuringPollFuture {
+            context: managed,
+            cancel: context.cancel_reason,
+            checked: self.checked.clone(),
+            first_poll: true,
+            checked_once: false,
         })
     }
 
@@ -194,6 +323,143 @@ fn active_root(
         .unwrap();
     let current = smol::block_on(rx.recv_async()).unwrap();
     (manager, root, current, gate)
+}
+
+#[test]
+fn zero_agent_limits_are_rejected() {
+    for limits in [
+        AgentLimits {
+            max_concurrent_agent_turns: 0,
+            ..AgentLimits::default()
+        },
+        AgentLimits {
+            max_agent_depth: 0,
+            ..AgentLimits::default()
+        },
+        AgentLimits {
+            max_children_per_agent: 0,
+            ..AgentLimits::default()
+        },
+        AgentLimits {
+            max_live_agents: 0,
+            ..AgentLimits::default()
+        },
+    ] {
+        assert!(matches!(
+            AgentManagerHandle::new(limits),
+            Err(ManagerError::InvalidLimits)
+        ));
+    }
+}
+
+#[test]
+fn backend_poll_holds_physical_permit_while_suspension_races() {
+    smol::block_on(async {
+        let limits = AgentLimits {
+            max_concurrent_agent_turns: 1,
+            ..AgentLimits::default()
+        };
+        let manager = AgentManagerHandle::new(limits).unwrap();
+        let (current_tx, current_rx) = flume::bounded(1);
+        let (checked_tx, checked_rx) = flume::bounded(1);
+        let root = manager
+            .create_root(
+                Vec::new(),
+                None,
+                Box::new(SuspendDuringPollBackend {
+                    current: current_tx,
+                    checked: checked_tx,
+                }),
+            )
+            .unwrap();
+        root.actor()
+            .unwrap()
+            .admit_turn(input(), None, "root".into())
+            .unwrap();
+        let current = current_rx.recv_async().await.unwrap();
+
+        assert!(checked_rx.recv_async().await.unwrap());
+        {
+            let state = current.lease.inner.state.lock().unwrap();
+            assert_eq!(state.suspensions, 1);
+            assert!(state.permit.is_none());
+        }
+        current.lease.inner.retire(u64::MAX);
+
+        root.actor().unwrap().shutdown();
+        loop {
+            let closed = {
+                let state = current.lease.inner.state.lock().unwrap();
+                state.closing && state.watcher_cancels.is_empty()
+            };
+            if closed {
+                break;
+            }
+            smol::future::yield_now().await;
+        }
+        assert!(matches!(
+            manager.spawn_child(
+                &current,
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::boxed(),
+            ),
+            Err(ManagerError::InactiveTurn { .. })
+        ));
+        let permit = manager.0.limiter.acquire_arc().await;
+        drop(permit);
+        let report = manager.shutdown(std::time::Duration::from_secs(1)).await;
+        assert!(report.timed_out.is_empty());
+    });
+}
+
+#[test]
+fn dropping_pending_managed_execution_closes_lease_and_releases_permit() {
+    smol::block_on(async {
+        let limits = AgentLimits {
+            max_concurrent_agent_turns: 1,
+            ..AgentLimits::default()
+        };
+        let manager = AgentManagerHandle::new(limits).unwrap();
+        let root = manager
+            .create_root(Vec::new(), None, TestBackend::boxed())
+            .unwrap();
+        let turn_id = crate::TurnId::generate();
+        let (_cancel, token) = crate::ReasonedCancelToken::new();
+        let (guard, current) =
+            super::enter_managed_turn(&Arc::downgrade(&manager.0), root.id(), turn_id, &token)
+                .await
+                .unwrap();
+        let mut execution = Box::pin(super::manage_execution(
+            Box::pin(std::future::pending()),
+            guard,
+            Arc::clone(&current.lease.inner),
+            token,
+        ));
+        assert!(
+            futures_lite::future::poll_once(&mut execution)
+                .await
+                .is_none()
+        );
+        drop(execution);
+
+        {
+            let state = current.lease.inner.state.lock().unwrap();
+            assert!(state.closing);
+            assert!(state.permit.is_none());
+        }
+        assert!(
+            !manager
+                .lock_graph()
+                .active_turns
+                .contains_key(&(root.id(), turn_id))
+        );
+        let permit = manager.0.limiter.acquire_arc().await;
+        drop(permit);
+        let report = manager.shutdown(std::time::Duration::from_secs(1)).await;
+        assert!(report.timed_out.is_empty());
+    });
 }
 
 #[test]
@@ -622,6 +888,48 @@ fn cancel_agent_is_reusable_and_isolates_siblings() {
 }
 
 #[test]
+fn cancel_subtree_marks_reserved_descendant_and_preserves_reuse() {
+    let (manager, root, current, root_gate) = active_root(AgentLimits::default());
+    let creating = manager.clone();
+    let child_current = current.clone();
+    let (reserved_tx, reserved_rx) = flume::bounded(1);
+    let (release_tx, release_rx) = flume::bounded(1);
+    let factory = std::thread::spawn(move || {
+        creating.spawn_child_with(
+            &child_current,
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            |agent_id| {
+                reserved_tx.send(agent_id).unwrap();
+                release_rx.recv().unwrap();
+                Ok::<_, String>(TestBackend::boxed())
+            },
+        )
+    });
+    let child_id = reserved_rx.recv().unwrap();
+
+    manager.cancel_subtree(root.id()).unwrap();
+    assert!(manager.lock_graph().nodes[&child_id].cancel_on_commit);
+    release_tx.send(()).unwrap();
+    let child = factory.join().unwrap().unwrap();
+    assert!(!manager.lock_graph().nodes[&child_id].cancel_on_commit);
+    let ticket = child
+        .actor()
+        .unwrap()
+        .admit_turn(input(), None, "after-cut".into())
+        .unwrap();
+    assert!(matches!(
+        smol::block_on(ticket.wait()),
+        TurnOutcome::Completed { .. }
+    ));
+
+    root_gate.release(1);
+    let report = smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
+    assert!(report.timed_out.is_empty());
+}
+
+#[test]
 fn descendant_preflight_rejects_before_suspension() {
     let (manager, root, current, gate) = active_root(AgentLimits::default());
     let other = AgentManagerHandle::new(AgentLimits::default()).unwrap();
@@ -754,6 +1062,107 @@ fn parent_waiting_for_child_yields_permit() {
 }
 
 #[test]
+fn parent_cancellation_while_suspended_retires_wait_and_releases_permit() {
+    smol::block_on(async {
+        let limits = AgentLimits {
+            max_concurrent_agent_turns: 1,
+            ..AgentLimits::default()
+        };
+        let manager = AgentManagerHandle::new(limits).unwrap();
+        let (current_tx, current_rx) = flume::bounded(1);
+        let root = manager
+            .create_root(
+                Vec::new(),
+                None,
+                Box::new(ReportingCancellableBackend {
+                    current: current_tx,
+                }),
+            )
+            .unwrap();
+        let root_ticket = root
+            .actor()
+            .unwrap()
+            .admit_turn(input(), None, "root".into())
+            .unwrap();
+        let current = current_rx.recv_async().await.unwrap();
+        let child_gate = Gate::new();
+        let (child_entered_tx, child_entered_rx) = flume::bounded(1);
+        let child = manager
+            .spawn_child(
+                &current,
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::reporting(child_entered_tx, Some(Arc::clone(&child_gate))),
+            )
+            .unwrap();
+        let child_ticket = child
+            .actor()
+            .unwrap()
+            .admit_turn(input(), None, "child".into())
+            .unwrap();
+        let wait = current
+            .lease()
+            .wait_for_descendant(
+                &current,
+                child.id(),
+                &child.actor().unwrap(),
+                child_ticket.clone(),
+                None,
+            )
+            .unwrap();
+        let wait_inner = Arc::clone(&wait.inner);
+        child_entered_rx.recv_async().await.unwrap();
+        assert_eq!(current.lease.inner.state.lock().unwrap().suspensions, 1);
+        let mut child_completion = Box::pin(child_ticket.wait());
+        assert!(
+            futures_lite::future::poll_once(&mut child_completion)
+                .await
+                .is_none()
+        );
+
+        manager.cancel_agent(root.id()).unwrap();
+        assert!(matches!(
+            wait_inner.wait_result().await,
+            Err(super::PromptWaitError::Cancelled)
+        ));
+        let mut cancelled_wait = Box::pin(wait.wait());
+        assert!(
+            futures_lite::future::poll_once(&mut cancelled_wait)
+                .await
+                .is_none()
+        );
+        child_gate.release(1);
+        assert!(matches!(
+            child_completion.await,
+            TurnOutcome::Completed { .. }
+        ));
+        assert!(matches!(
+            cancelled_wait.await,
+            Err(super::PromptWaitError::Cancelled)
+        ));
+        assert!(matches!(
+            root_ticket.wait().await,
+            TurnOutcome::Cancelled {
+                reason: crate::TurnCancellationReason::User,
+                ..
+            }
+        ));
+        {
+            let state = current.lease.inner.state.lock().unwrap();
+            assert!(state.closing);
+            assert_eq!(state.suspensions, 0);
+            assert!(state.watcher_cancels.is_empty());
+        }
+        let permit = manager.0.limiter.acquire_arc().await;
+        drop(permit);
+        child.close_subtree().unwrap();
+        let report = manager.shutdown(std::time::Duration::from_secs(1)).await;
+        assert!(report.timed_out.is_empty());
+    });
+}
+
+#[test]
 fn watcher_registration_failure_cancels_exact_admitted_child_turn() {
     smol::block_on(async {
         let limits = AgentLimits {
@@ -867,6 +1276,7 @@ fn two_child_waits_share_one_parent_suspension() {
                 None,
             )
             .unwrap();
+        let first_wait_inner = Arc::clone(&first_wait.inner);
 
         let second_gate = Gate::new();
         let (second_tx, second_rx) = flume::bounded(1);
@@ -894,9 +1304,19 @@ fn two_child_waits_share_one_parent_suspension() {
                 None,
             )
             .unwrap();
+        {
+            let state = current.lease.inner.state.lock().unwrap();
+            assert_eq!(state.suspensions, 2);
+            assert!(state.permit.is_none());
+            assert_eq!(state.watcher_cancels.len(), 2);
+        }
 
         first_rx.recv_async().await.unwrap();
         first_gate.release(1);
+        assert!(matches!(
+            first_wait_inner.wait_result().await,
+            Ok(TurnOutcome::Completed { .. })
+        ));
         second_rx.recv_async().await.unwrap();
         let mut first_wait = Box::pin(first_wait.wait());
         assert!(
@@ -904,9 +1324,21 @@ fn two_child_waits_share_one_parent_suspension() {
                 .await
                 .is_none()
         );
+        {
+            let state = current.lease.inner.state.lock().unwrap();
+            assert_eq!(state.suspensions, 1);
+            assert!(state.permit.is_none());
+            assert_eq!(state.watcher_cancels.len(), 1);
+        }
         second_gate.release(1);
         assert_eq!(first_wait.await.unwrap().agent_id(), first.id());
         assert_eq!(second_wait.wait().await.unwrap().agent_id(), second.id());
+        {
+            let state = current.lease.inner.state.lock().unwrap();
+            assert_eq!(state.suspensions, 0);
+            assert!(state.permit.is_some());
+            assert!(state.watcher_cancels.is_empty());
+        }
 
         root_gate.release(1);
         let report = manager.shutdown(std::time::Duration::from_secs(1)).await;

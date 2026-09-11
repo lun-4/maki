@@ -85,12 +85,11 @@ pub struct AgentManagerHandle(Arc<ManagerInner>);
 impl AgentManagerHandle {
     pub fn new(limits: AgentLimits) -> Result<Self, ManagerError> {
         if limits.max_concurrent_agent_turns == 0
+            || limits.max_agent_depth == 0
             || limits.max_children_per_agent == 0
             || limits.max_live_agents == 0
         {
-            return Err(ManagerError::Factory(
-                "agent limits must be at least one".into(),
-            ));
+            return Err(ManagerError::InvalidLimits);
         }
         Ok(AgentManagerHandle(Arc::new(ManagerInner {
             generation: NEXT_MANAGER_GENERATION.fetch_add(1, Ordering::Relaxed),
@@ -1141,16 +1140,26 @@ impl Future for ManagedExecutionFuture<'_> {
                 self.acquire = None;
                 return Poll::Pending;
             }
-            if state.permit.is_some() {
+            if let Some(permit) = state.permit.take() {
                 state.wake = Some(context.waker().clone());
                 drop(state);
                 let result = self.backend.as_mut().poll(context);
+                let mut state = self
+                    .lease
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if result.is_pending() && state.suspensions == 0 && !state.closing {
+                    state.permit = Some(permit);
+                }
+                drop(state);
                 if result.is_ready() {
                     self.guard.take();
                 }
                 return result;
             }
             if state.closing {
+                state.wake = Some(context.waker().clone());
                 return Poll::Pending;
             }
             state.wake = Some(context.waker().clone());

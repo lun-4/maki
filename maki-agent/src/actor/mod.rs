@@ -183,7 +183,7 @@ fn terminalize_work(inner: &ActorInner, drained: Vec<ActorWork>, reason: TurnCan
     }
 }
 
-fn cancelled_outcome(
+pub(super) fn cancelled_outcome(
     agent_id: AgentId,
     turn_id: TurnId,
     reason: TurnCancellationReason,

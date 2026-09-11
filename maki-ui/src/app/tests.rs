@@ -7650,6 +7650,50 @@ fn subagent_closed_marks_despawned_and_rejects_input() {
 }
 
 #[test]
+fn subagent_closed_prunes_only_its_delivery_state() {
+    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let agent_id = app.chats[app.active_chat].agent_id.unwrap();
+    let other_agent_id = AgentId::generate();
+    let turn_id = TurnId::generate();
+    let other_turn_id = TurnId::generate();
+    app.delivered_subagent_histories
+        .insert(agent_id, b"closed history".to_vec());
+    app.delivered_subagent_histories
+        .insert(other_agent_id, b"live history".to_vec());
+    app.stamped_subagent_outcomes.insert((agent_id, turn_id));
+    app.stamped_subagent_outcomes
+        .insert((other_agent_id, other_turn_id));
+    let info = subagent_info_for_agent(
+        agent_id,
+        TASK_ID,
+        "research",
+        None,
+        app.subagent_channels[&agent_id].input_tx.clone(),
+    );
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentClosed,
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    assert!(!app.delivered_subagent_histories.contains_key(&agent_id));
+    assert_eq!(
+        app.delivered_subagent_histories.get(&other_agent_id),
+        Some(&b"live history".to_vec())
+    );
+    assert!(
+        !app.stamped_subagent_outcomes
+            .iter()
+            .any(|(stamped_agent_id, _)| *stamped_agent_id == agent_id)
+    );
+    assert!(
+        app.stamped_subagent_outcomes
+            .contains(&(other_agent_id, other_turn_id))
+    );
+}
+
+#[test]
 fn typing_in_subagent_chat_edits_input_and_submits_to_subagent() {
     let (mut app, input_rx) = app_with_subagent_input_tx(TASK_ID);
     // Typing reaches the shared input box on a focused subagent tab.
@@ -7675,15 +7719,13 @@ fn paste_in_subagent_chat_edits_input_and_submits_to_subagent() {
 }
 
 #[test]
-fn subagent_completion_queues_each_history_growth_once() {
+fn subagent_completion_queues_each_distinct_history_once() {
     let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
-    let first_messages = vec![Message {
+    let message = |text: &str| Message {
         role: Role::Assistant,
-        content: vec![ContentBlock::Text {
-            text: "the answer".into(),
-        }],
+        content: vec![ContentBlock::Text { text: text.into() }],
         ..Default::default()
-    }];
+    };
     let history_event = |messages| {
         subagent_msg(
             AgentEvent::SubagentHistory {
@@ -7694,23 +7736,24 @@ fn subagent_completion_queues_each_history_growth_once() {
             None,
         )
     };
+    let first_messages = vec![message("the answer")];
     app.update(history_event(first_messages.clone()));
-    app.update(history_event(first_messages.clone()));
+    app.update(history_event(first_messages));
 
     let first = format!("{SUBAGENT_REPLY_HEADER}{TASK_ID}{SUBAGENT_REPLY_SUFFIX}the answer");
     assert_eq!(app.queue.text_messages(), std::slice::from_ref(&first));
 
-    let mut second_messages = first_messages;
-    second_messages.push(Message {
-        role: Role::Assistant,
-        content: vec![ContentBlock::Text {
-            text: "the follow-up".into(),
-        }],
-        ..Default::default()
-    });
-    app.update(history_event(second_messages));
-    let second = format!("{SUBAGENT_REPLY_HEADER}{TASK_ID}{SUBAGENT_REPLY_SUFFIX}the follow-up");
-    assert_eq!(app.queue.text_messages(), [first, second]);
+    let changed_messages = vec![message("revised answer")];
+    app.update(history_event(changed_messages.clone()));
+    app.update(history_event(changed_messages.clone()));
+    let second = format!("{SUBAGENT_REPLY_HEADER}{TASK_ID}{SUBAGENT_REPLY_SUFFIX}revised answer");
+    assert_eq!(app.queue.text_messages(), [first.clone(), second.clone()]);
+
+    let mut grown_messages = changed_messages;
+    grown_messages.push(message("the follow-up"));
+    app.update(history_event(grown_messages));
+    let third = format!("{SUBAGENT_REPLY_HEADER}{TASK_ID}{SUBAGENT_REPLY_SUFFIX}the follow-up");
+    assert_eq!(app.queue.text_messages(), [first, second, third]);
 }
 
 #[test]

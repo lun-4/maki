@@ -218,5 +218,4 @@ impl Drop for ManagedPromptWait {
 pub enum PromptWaitError {
     Cancelled,
     Timeout,
-    LeaseClosed,
 }

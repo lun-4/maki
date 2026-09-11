@@ -10,15 +10,43 @@ use maki_agent::{
     WorkKind,
 };
 use maki_lua::PluginHost;
-use serde_json::json;
+use maki_providers::provider::{BoxFuture, Provider};
+use maki_providers::{
+    AgentError, Message, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
+};
+use maki_storage::id::SessionRef;
+use serde_json::{Value, json};
 
 mod common;
 
 const TOOL_NAME: &str = "managed_session";
+const TIMEOUT_TOOL_NAME: &str = "managed_session_timeout";
+const TIMEOUT_ERROR: &str = "session prompt timed out after 1s";
 const CORRELATION: &str = "managed-root";
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 const PLUGIN_SRC: &str = r#"
+maki.api.register_tool({
+  name = "managed_session_timeout",
+  description = "time out a managed child prompt",
+  schema = { type = "object", properties = {}, additionalProperties = false },
+  audiences = { "main" },
+  handler = function(_, ctx)
+    local session, err = maki.agent.session(ctx, {
+      name = "managed-timeout-child",
+      inherit_provider = true,
+    })
+    if not session then
+      return { llm_output = err, is_error = true }
+    end
+    local result, prompt_err = session:prompt("wait", { timeout = 1 })
+    if result ~= nil or prompt_err ~= "session prompt timed out after 1s" then
+      return { llm_output = "unexpected timeout result", is_error = true }
+    end
+    return "ok"
+  end,
+})
+
 maki.api.register_tool({
   name = "managed_session",
   description = "create and close a managed child",
@@ -46,6 +74,7 @@ struct LuaToolBackend {
     registry: Arc<ToolRegistry>,
     context: ToolContext,
     completed: flume::Sender<Result<(), String>>,
+    tool_name: &'static str,
 }
 
 impl ActorBackend for LuaToolBackend {
@@ -60,7 +89,7 @@ impl ActorBackend for LuaToolBackend {
             self.context.managed_turn = context.managed_turn;
             let invocation = self
                 .registry
-                .get(TOOL_NAME)
+                .get(self.tool_name)
                 .unwrap()
                 .tool
                 .parse(&json!({}))
@@ -101,6 +130,41 @@ impl ActorBackend for LuaToolBackend {
     }
 }
 
+struct PendingProvider {
+    dropped: flume::Sender<()>,
+}
+
+struct DropSignal(flume::Sender<()>);
+
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+impl Provider for PendingProvider {
+    fn stream_message<'a>(
+        &'a self,
+        _: &'a Model,
+        _: &'a [Message],
+        _: &'a str,
+        _: &'a Value,
+        _: &'a flume::Sender<ProviderEvent>,
+        _: RequestOptions,
+        _: Option<&'a SessionRef>,
+    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+        Box::pin(async move {
+            let _signal = DropSignal(self.dropped.clone());
+            std::future::pending::<()>().await;
+            unreachable!()
+        })
+    }
+
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
 fn input() -> AgentInput {
     AgentInput {
         message: "create child".into(),
@@ -131,6 +195,7 @@ fn managed_session_uses_root_authority_and_closes_its_node() {
                     registry,
                     context,
                     completed: completed_tx,
+                    tool_name: TOOL_NAME,
                 }),
             )
             .unwrap();
@@ -166,6 +231,64 @@ fn managed_session_uses_root_authority_and_closes_its_node() {
             .find(|envelope| matches!(envelope.event, AgentEvent::SubagentHistory { .. }))
             .expect("managed child history envelope");
         assert_eq!(envelope.subagent.unwrap().agent_id, child.agent_id);
+
+        let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        assert!(report.timed_out.is_empty());
+    });
+}
+
+#[test]
+fn managed_prompt_timeout_returns_pair_closes_child_and_resumes_parent() {
+    smol::block_on(async {
+        let registry = Arc::new(ToolRegistry::new());
+        let _host = PluginHost::new(Arc::clone(&registry)).unwrap();
+        _host.load_source("managed-session", PLUGIN_SRC).unwrap();
+        let (dropped_tx, dropped_rx) = flume::bounded(1);
+        let provider = Arc::new(PendingProvider {
+            dropped: dropped_tx,
+        });
+        let (mut context, _events, _cancel) = common::ctx_with_provider(provider);
+        let manager = AgentManagerHandle::new(AgentLimits {
+            max_concurrent_agent_turns: 1,
+            ..AgentLimits::default()
+        })
+        .unwrap();
+        let (completed_tx, completed_rx) = flume::bounded(1);
+        let root = manager
+            .create_root(
+                Vec::new(),
+                None,
+                Box::new(LuaToolBackend {
+                    registry,
+                    context: context.clone(),
+                    completed: completed_tx,
+                    tool_name: TIMEOUT_TOOL_NAME,
+                }),
+            )
+            .unwrap();
+        context.managed_turn = None;
+        let ticket = root
+            .actor()
+            .unwrap()
+            .admit_turn(input(), None, CORRELATION.into())
+            .unwrap();
+
+        assert_eq!(
+            completed_rx.recv_async().await.unwrap(),
+            Ok(()),
+            "{TIMEOUT_ERROR}"
+        );
+        assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+        dropped_rx
+            .recv_async()
+            .await
+            .expect("timed-out managed provider request remained alive");
+        let child = manager
+            .snapshot()
+            .into_iter()
+            .find(|node| node.parent_id == Some(root.id()))
+            .expect("managed timeout child");
+        assert_eq!(child.graph_lifecycle, GraphLifecycle::Closed);
 
         let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
         assert!(report.timed_out.is_empty());
