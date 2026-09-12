@@ -778,13 +778,18 @@ fn close_owns_runner_when_reserved_root_factory_succeeds() {
         factory.join().unwrap(),
         Err(ManagerError::NonLiveAgent(id)) if id == root_id
     ));
-    let node = manager.node(root_id).unwrap();
-    assert_eq!(node.graph_lifecycle, GraphLifecycle::Closed);
-    assert_eq!(node.actor.unwrap().lifecycle, crate::ActorLifecycle::Closed);
+    assert_eq!(
+        manager.node(root_id).unwrap().actor.unwrap().lifecycle,
+        crate::ActorLifecycle::Closed
+    );
     let report = smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
     assert_eq!(report.joined, vec![root_id]);
     assert!(report.timed_out.is_empty());
     assert!(manager.runner_finished(root_id).unwrap());
+    assert_eq!(
+        manager.node(root_id).unwrap().graph_lifecycle,
+        GraphLifecycle::Closed
+    );
 }
 
 #[test]
@@ -884,7 +889,7 @@ fn live_agent_limit_is_atomic() {
 }
 
 #[test]
-fn close_child_preserves_parent_and_releases_capacity() {
+fn closing_idle_child_releases_capacity_on_next_admission() {
     let limits = AgentLimits {
         max_children_per_agent: 1,
         ..AgentLimits::default()
@@ -900,6 +905,11 @@ fn close_child_preserves_parent_and_releases_capacity() {
         )
         .unwrap();
     manager.close_subtree(child.id()).unwrap();
+    smol::block_on(async {
+        while !manager.runner_finished(child.id()).unwrap() {
+            smol::future::yield_now().await;
+        }
+    });
     let replacement = manager
         .spawn_child(
             &current,
@@ -920,6 +930,69 @@ fn close_child_preserves_parent_and_releases_capacity() {
     );
     gate.release(1);
     smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
+}
+
+#[test]
+fn closing_active_child_consumes_capacity_until_runner_finishes() {
+    smol::block_on(async {
+        let limits = AgentLimits {
+            max_children_per_agent: 1,
+            ..AgentLimits::default()
+        };
+        let (manager, _, current, root_gate) = active_root(limits);
+        let child_gate = Gate::new();
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let child = manager
+            .spawn_child(
+                &current,
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::reporting(entered_tx, Some(Arc::clone(&child_gate))),
+            )
+            .unwrap();
+        let ticket = child
+            .actor()
+            .unwrap()
+            .admit_turn(input(), None, "active".into())
+            .unwrap();
+        entered_rx.recv_async().await.unwrap();
+
+        child.close_subtree().unwrap();
+        assert_eq!(
+            child.snapshot().unwrap().graph_lifecycle,
+            GraphLifecycle::Closing
+        );
+        assert!(matches!(
+            manager.spawn_child(
+                &current,
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::boxed(),
+            ),
+            Err(ManagerError::ChildLimit { .. })
+        ));
+
+        child_gate.release(1);
+        ticket.wait().await;
+        while !manager.runner_finished(child.id()).unwrap() {
+            smol::future::yield_now().await;
+        }
+        manager
+            .spawn_child(
+                &current,
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::boxed(),
+            )
+            .unwrap();
+
+        root_gate.release(1);
+        let report = manager.shutdown(std::time::Duration::from_secs(1)).await;
+        assert!(report.timed_out.is_empty());
+    });
 }
 
 #[test]
@@ -1023,6 +1096,69 @@ fn cancel_subtree_marks_reserved_descendant_and_preserves_reuse() {
         .unwrap()
         .admit_turn(input(), None, "after-cut".into())
         .unwrap();
+    assert!(matches!(
+        smol::block_on(ticket.wait()),
+        TurnOutcome::Completed { .. }
+    ));
+
+    root_gate.release(1);
+    let report = smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
+    assert!(report.timed_out.is_empty());
+}
+
+#[test]
+fn reserved_cancellation_precedes_live_publication() {
+    let (manager, root, current, root_gate) = active_root(AgentLimits::default());
+    let creating = manager.clone();
+    let child_current = current.clone();
+    let (reserved_tx, reserved_rx) = flume::bounded(1);
+    let (factory_release_tx, factory_release_rx) = flume::bounded(1);
+    let factory = std::thread::spawn(move || {
+        creating.spawn_child_with(
+            &child_current,
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            |agent_id| {
+                reserved_tx.send(agent_id).unwrap();
+                factory_release_rx.recv().unwrap();
+                Ok::<_, String>(TestBackend::boxed())
+            },
+        )
+    });
+    let child_id = reserved_rx.recv().unwrap();
+
+    manager.cancel_subtree(root.id()).unwrap();
+    let (commit_entered_tx, commit_entered_rx) = flume::bounded(1);
+    let (commit_release_tx, commit_release_rx) = flume::bounded(1);
+    manager.set_commit_gate(commit_entered_tx, commit_release_rx);
+    let observing = manager.clone();
+    let observer = std::thread::spawn(move || {
+        loop {
+            match observing.actor(child_id) {
+                Ok(actor) => {
+                    break actor
+                        .admit_turn(input(), None, "after-publication".into())
+                        .unwrap();
+                }
+                Err(ManagerError::NonLiveAgent(id)) if id == child_id => {
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("unexpected actor lookup error: {error}"),
+            }
+        }
+    });
+
+    factory_release_tx.send(()).unwrap();
+    commit_entered_rx.recv().unwrap();
+    assert!(matches!(
+        manager.actor(child_id),
+        Err(ManagerError::NonLiveAgent(id)) if id == child_id
+    ));
+    commit_release_tx.send(()).unwrap();
+    let child = factory.join().unwrap().unwrap();
+    let ticket = observer.join().unwrap();
+    assert_eq!(child.id(), child_id);
     assert!(matches!(
         smol::block_on(ticket.wait()),
         TurnOutcome::Completed { .. }

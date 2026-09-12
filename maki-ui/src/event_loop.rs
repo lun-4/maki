@@ -66,7 +66,10 @@ use crate::color_compat;
 use crate::command_runtime::{CommandEvent, CommandRuntime};
 use crate::components::arg_completion::{ModelArgSource, ThemeArgSource};
 use crate::components::input::Submission;
-use crate::components::{Action, ExitRequest, Status};
+use crate::components::{
+    Action, ExitRequest, ReplacementPostCommit, SessionReplacementKind, SessionReplacementRequest,
+    Status,
+};
 use crate::input::InputReader;
 use crate::provider_usage::{
     ProviderIdentity, ProviderUsageCoordinator, ProviderUsageFetch, ProviderUsageFetchId,
@@ -92,6 +95,8 @@ const NOT_LIVE_ERR: &str = "session not live";
 const LOCK_LOST_REPLACEMENT_ERR: &str = "session lock was lost; replacement is disabled";
 const LOCK_UNAVAILABLE_REPLACEMENT_ERR: &str =
     "session lock ownership is unavailable; replacement is disabled";
+const REPLACEMENT_PENDING_ERR: &str =
+    "session replacement is already waiting for lock verification";
 
 static NEXT_RUNTIME_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -345,7 +350,7 @@ fn parse_session_id(id: &str) -> Result<MakiId, String> {
 
 enum SessionLockState {
     Held(ClaimedSessionLock),
-    InFlight(smol::Task<HeartbeatCompletion>),
+    InFlight(flume::Receiver<HeartbeatCompletion>),
 }
 
 struct HeartbeatCompletion {
@@ -363,6 +368,7 @@ impl Drop for HeartbeatCompletion {
 
 fn mark_runtime_lock_lost(runtime: &mut SessionRuntime) {
     runtime.session_lock = None;
+    runtime.pending_replacement = None;
     runtime.lock_lost = true;
     runtime
         .app
@@ -384,6 +390,19 @@ fn apply_heartbeat_completion(runtime: &mut SessionRuntime, mut completion: Hear
             runtime.session_lock = Some(SessionLockState::Held(lease));
             warn!(id = %runtime.id(), %error, "session lock heartbeat failed");
         }
+    }
+}
+
+fn complete_runtime_heartbeat(runtime: &mut SessionRuntime) -> Option<PendingReplacement> {
+    let Some(SessionLockState::InFlight(completion_rx)) = runtime.session_lock.take() else {
+        return None;
+    };
+    let completion = collect_heartbeat(completion_rx, None)?;
+    apply_heartbeat_completion(runtime, completion);
+    if runtime.lock_lost {
+        None
+    } else {
+        runtime.pending_replacement.take()
     }
 }
 
@@ -415,33 +434,29 @@ fn start_runtime_heartbeat_with<F>(
     };
     let runtime_generation = runtime.generation;
     let internal_tx = internal_tx.clone();
-    let task = smol::spawn(async move {
+    let (completion_tx, completion_rx) = flume::bounded(1);
+    smol::spawn(async move {
         let (lease, result) = smol::unblock(move || heartbeat(lease)).await;
-        let _ = internal_tx.send(InternalEvent::SessionHeartbeat(runtime_generation));
-        HeartbeatCompletion {
+        let completion = HeartbeatCompletion {
             result,
             lease: Some(lease),
+        };
+        if completion_tx.send(completion).is_ok() {
+            let _ = internal_tx.send(InternalEvent::SessionHeartbeat(runtime_generation));
         }
-    });
-    runtime.session_lock = Some(SessionLockState::InFlight(task));
+    })
+    .detach();
+    runtime.session_lock = Some(SessionLockState::InFlight(completion_rx));
 }
 
 fn collect_heartbeat(
-    task: smol::Task<HeartbeatCompletion>,
+    completion_rx: flume::Receiver<HeartbeatCompletion>,
     timeout: Option<Duration>,
 ) -> Option<HeartbeatCompletion> {
-    smol::block_on(async move {
-        match timeout {
-            Some(timeout) => {
-                futures_lite::future::or(async { Some(task.await) }, async {
-                    smol::Timer::after(timeout).await;
-                    None
-                })
-                .await
-            }
-            None => Some(task.await),
-        }
-    })
+    match timeout {
+        Some(timeout) => completion_rx.recv_timeout(timeout).ok(),
+        None => completion_rx.try_recv().ok(),
+    }
 }
 
 enum LockReleaseOutcome {
@@ -468,14 +483,8 @@ fn release_lock_state_with_timeout(
 ) -> LockReleaseOutcome {
     let (lease, lock_lost) = match state {
         Some(SessionLockState::Held(lease)) => (Some(lease), false),
-        Some(SessionLockState::InFlight(task)) => {
-            let (completion_tx, completion_rx) = flume::bounded(1);
-            smol::spawn(async move {
-                let completion = task.await;
-                let _ = completion_tx.send(completion);
-            })
-            .detach();
-            let Ok(mut completion) = completion_rx.recv_timeout(timeout) else {
+        Some(SessionLockState::InFlight(completion_rx)) => {
+            let Some(mut completion) = collect_heartbeat(completion_rx, Some(timeout)) else {
                 return LockReleaseOutcome::TimedOut;
             };
             let lock_lost = matches!(completion.result, Ok(session_lock::LockBeat::Lost));
@@ -517,6 +526,13 @@ struct SessionRuntime {
     session_lock: Option<SessionLockState>,
     lock_lost: bool,
     restore_pending: bool,
+    pending_replacement: Option<PendingReplacement>,
+}
+
+struct PendingReplacement {
+    prepared: PreparedSessionRuntime,
+    kind: SessionReplacementKind,
+    post_commit: Option<ReplacementPostCommit>,
 }
 
 struct PreparedProvider {
@@ -582,7 +598,25 @@ impl PreparedSessionRuntime {
             session_lock,
             lock_lost: false,
             restore_pending: resumed,
+            pending_replacement: None,
         }
+    }
+}
+
+fn defer_replacement_for_heartbeat(
+    runtime: &mut SessionRuntime,
+    pending: PendingReplacement,
+) -> Option<PendingReplacement> {
+    let same_id = runtime.id() == pending.prepared.app.session_id();
+    if same_id && matches!(runtime.session_lock, Some(SessionLockState::InFlight(_))) {
+        if runtime.pending_replacement.is_none() {
+            runtime.pending_replacement = Some(pending);
+        } else {
+            runtime.app.flash(REPLACEMENT_PENDING_ERR.into());
+        }
+        None
+    } else {
+        Some(pending)
     }
 }
 
@@ -685,9 +719,10 @@ impl SpawnCtx {
     fn prepare_replacement_runtime(
         &self,
         session: AppSession,
+        permissions: &PermissionManager,
     ) -> Result<PreparedSessionRuntime, String> {
         let provider = self.prepare_replacement_provider(&session)?;
-        Ok(self.prepare_runtime_with_provider(session, provider))
+        Ok(self.prepare_runtime_with_provider_and_permissions(session, provider, permissions))
     }
 
     fn prepare_replacement_provider(
@@ -713,13 +748,22 @@ impl SpawnCtx {
         session: AppSession,
         provider: Option<PreparedProvider>,
     ) -> PreparedSessionRuntime {
+        self.prepare_runtime_with_provider_and_permissions(session, provider, &self.permissions)
+    }
+
+    fn prepare_runtime_with_provider_and_permissions(
+        &self,
+        session: AppSession,
+        provider: Option<PreparedProvider>,
+        permissions: &PermissionManager,
+    ) -> PreparedSessionRuntime {
         let resumed = session_has_content(&session);
         let model = provider
             .as_ref()
             .map(|provider| &provider.model)
             .unwrap_or(&self.model_slot.load().model)
             .clone();
-        let permissions = Arc::new(self.permissions.fork());
+        let permissions = Arc::new(permissions.fork());
         let handles = AgentHandles::prepare(
             &self.model_slot,
             session.messages().to_vec(),
@@ -1234,18 +1278,16 @@ impl<'t> EventLoop<'t> {
                 self.handle_provider_usage_outputs(outputs);
             }
             InternalEvent::SessionHeartbeat(runtime_generation) => {
-                let Some(runtime) = self
+                let Some(idx) = self
                     .sessions
-                    .iter_mut()
-                    .find(|runtime| runtime.generation == runtime_generation)
+                    .iter()
+                    .position(|runtime| runtime.generation == runtime_generation)
                 else {
                     return;
                 };
-                let Some(SessionLockState::InFlight(task)) = runtime.session_lock.take() else {
-                    return;
-                };
-                if let Some(completion) = collect_heartbeat(task, None) {
-                    apply_heartbeat_completion(runtime, completion);
+                let pending = complete_runtime_heartbeat(&mut self.sessions[idx]);
+                if let Some(pending) = pending {
+                    self.commit_replacement(idx, pending);
                 }
             }
         }
@@ -2072,7 +2114,9 @@ impl<'t> EventLoop<'t> {
             return Err(LOCK_LOST_REPLACEMENT_ERR.into());
         }
         self.sessions[idx].app.checkpoint_now();
-        let prepared = self.ctx.prepare_replacement_runtime(session)?;
+        let prepared = self
+            .ctx
+            .prepare_replacement_runtime(session, self.sessions[idx].app.permissions.as_ref())?;
         self.replace_prepared_runtime(idx, prepared)
     }
 
@@ -2099,6 +2143,64 @@ impl<'t> EventLoop<'t> {
         drop(app);
         handles.shutdown().detach();
         Ok(())
+    }
+
+    fn prepare_replacement(
+        &self,
+        idx: usize,
+        request: SessionReplacementRequest,
+    ) -> Result<PendingReplacement, String> {
+        let SessionReplacementRequest {
+            session,
+            kind,
+            post_commit,
+        } = request;
+        let prepared = self
+            .ctx
+            .prepare_replacement_runtime(session, self.sessions[idx].app.permissions.as_ref())?;
+        Ok(PendingReplacement {
+            prepared,
+            kind,
+            post_commit,
+        })
+    }
+
+    fn commit_replacement(&mut self, idx: usize, pending: PendingReplacement) {
+        let PendingReplacement {
+            prepared,
+            kind,
+            post_commit,
+        } = pending;
+        match self.replace_prepared_runtime(idx, prepared) {
+            Ok(()) => {
+                if let SessionReplacementKind::Reset { ended_id } = kind {
+                    self.sessions[idx].app.lua_event_handle.fire_autocmd(
+                        "SessionReset",
+                        serde_json::json!({ "session_id": ended_id }),
+                    );
+                }
+                if let Some(post_commit) = post_commit {
+                    let actions = self.sessions[idx]
+                        .app
+                        .apply_replacement_post_commit(post_commit);
+                    self.dispatch(idx, actions);
+                }
+            }
+            Err(error) => self.sessions[idx].app.flash(error),
+        }
+    }
+
+    fn request_replacement(&mut self, idx: usize, request: SessionReplacementRequest) {
+        let pending = match self.prepare_replacement(idx, request) {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.sessions[idx].app.flash(error);
+                return;
+            }
+        };
+        if let Some(pending) = defer_replacement_for_heartbeat(&mut self.sessions[idx], pending) {
+            self.commit_replacement(idx, pending);
+        }
     }
 
     fn set_focused(&mut self, next: usize) {
@@ -2278,35 +2380,7 @@ impl<'t> EventLoop<'t> {
                     .cmd_tx
                     .try_send(AgentCommand::CancelSubagent { tool_use_id });
             }
-            Action::ReplaceSession(request) => {
-                let request = *request;
-                let prepared = match self.ctx.prepare_replacement_runtime(request.session) {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        self.sessions[idx].app.flash(error);
-                        return;
-                    }
-                };
-                match self.replace_prepared_runtime(idx, prepared) {
-                    Ok(()) => {
-                        if let crate::components::SessionReplacementKind::Reset { ended_id } =
-                            request.kind
-                        {
-                            self.sessions[idx].app.lua_event_handle.fire_autocmd(
-                                "SessionReset",
-                                serde_json::json!({ "session_id": ended_id }),
-                            );
-                        }
-                        if let Some(post_commit) = request.post_commit {
-                            let actions = self.sessions[idx]
-                                .app
-                                .apply_replacement_post_commit(post_commit);
-                            self.dispatch(idx, actions);
-                        }
-                    }
-                    Err(error) => self.sessions[idx].app.flash(error),
-                }
-            }
+            Action::ReplaceSession(request) => self.request_replacement(idx, *request),
             Action::ChangeModel(spec) => {
                 if let Err(error) = self.change_model(idx, &spec) {
                     self.sessions[idx].app.flash(error);
@@ -2977,7 +3051,12 @@ mod tests {
         session.model = INVALID_MODEL.into();
 
         runtime.app.checkpoint_now();
-        assert!(harness.ctx().prepare_replacement_runtime(session).is_err());
+        assert!(
+            harness
+                .ctx()
+                .prepare_replacement_runtime(session, runtime.app.permissions.as_ref())
+                .is_err()
+        );
 
         assert_eq!(runtime.id(), current_id);
         assert_eq!(runtime.app.command_target.id(), current_target);
@@ -3034,6 +3113,61 @@ mod tests {
         );
         drop(prepared);
         release_runtime(current);
+    }
+
+    #[test_case(false, true, false ; "rewind_preserves_enabled")]
+    #[test_case(true, false, false ; "rewind_preserves_disabled")]
+    #[test_case(false, true, true ; "reset_preserves_enabled")]
+    #[test_case(true, false, true ; "reset_preserves_disabled")]
+    fn replacement_preserves_outgoing_yolo(startup_yolo: bool, current_yolo: bool, reset: bool) {
+        let harness = RuntimeHarness::new();
+        if startup_yolo {
+            harness.ctx().permissions.toggle_yolo();
+        }
+        let session = harness.session();
+        let mut runtime = harness.runtime(session.clone());
+        if runtime.app.permissions.is_yolo() != current_yolo {
+            runtime.app.permissions.toggle_yolo();
+        }
+        runtime.app.permissions.apply_decision(
+            &maki_config::ToolKey::native("bash"),
+            &["outgoing".into()],
+            &PermissionAnswer::AllowSession,
+        );
+        let mut replacement = if reset { harness.session() } else { session };
+        replacement.meta.session_rules = vec![maki_storage::sessions::StoredRule {
+            tool: "bash".into(),
+            scope: Some("target".into()),
+            effect: maki_storage::sessions::StoredEffect::Allow,
+        }];
+        let prepared = harness.ctx().prepare_runtime_with_provider_and_permissions(
+            replacement,
+            None,
+            runtime.app.permissions.as_ref(),
+        );
+
+        let old = replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        )
+        .unwrap();
+
+        assert_eq!(runtime.app.permissions.is_yolo(), current_yolo);
+        let rules = runtime.app.permissions.session_rules_snapshot();
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule.scope.as_deref() == Some("target"))
+        );
+        assert!(
+            !rules
+                .iter()
+                .any(|rule| rule.scope.as_deref() == Some("outgoing"))
+        );
+        release_runtime(old);
+        release_runtime(runtime);
     }
 
     #[test]
@@ -3228,6 +3362,72 @@ mod tests {
         release_runtime(runtime);
     }
 
+    #[test_case(session_lock::LockBeat::Held ; "held_commits")]
+    #[test_case(session_lock::LockBeat::Lost ; "lost_reports_lock_loss")]
+    fn same_id_replacement_waits_for_in_flight_heartbeat(beat: session_lock::LockBeat) {
+        let harness = RuntimeHarness::new();
+        let session = harness.session();
+        let id = session.id;
+        let mut runtime = harness.runtime(session.clone());
+        let generation = runtime.generation;
+        let (internal_tx, internal_rx) = flume::unbounded();
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        start_runtime_heartbeat_with(&mut runtime, &internal_tx, move |lease| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            (lease, Ok(beat))
+        });
+        entered_rx.recv().unwrap();
+        let prepared = harness.ctx().prepare_runtime_with_provider_and_permissions(
+            session,
+            None,
+            runtime.app.permissions.as_ref(),
+        );
+        let pending = PendingReplacement {
+            prepared,
+            kind: SessionReplacementKind::Rewind,
+            post_commit: None,
+        };
+
+        assert!(defer_replacement_for_heartbeat(&mut runtime, pending).is_none());
+        assert!(runtime.pending_replacement.is_some());
+        assert_eq!(runtime.id(), id);
+
+        release_tx.send(()).unwrap();
+        let InternalEvent::SessionHeartbeat(event_generation) = internal_rx.recv().unwrap() else {
+            panic!("expected heartbeat completion");
+        };
+        assert_eq!(event_generation, generation);
+        assert!(matches!(
+            runtime.session_lock,
+            Some(SessionLockState::InFlight(_))
+        ));
+
+        let pending = complete_runtime_heartbeat(&mut runtime);
+        if beat == session_lock::LockBeat::Held {
+            let old = replace_session_runtime(
+                &mut runtime,
+                pending.expect("replacement remains pending").prepared,
+                &harness.ctx().sessions_dir,
+                &harness.ctx().model_slot,
+            );
+            let old = match old {
+                Ok(old) => old,
+                Err(error) => panic!("verified lease should transfer: {error}"),
+            };
+            assert_eq!(runtime.id(), id);
+            assert!(!runtime.lock_lost);
+            release_runtime(old);
+        } else {
+            assert!(pending.is_none());
+            assert!(runtime.pending_replacement.is_none());
+            assert!(runtime.lock_lost);
+            assert_eq!(runtime.app.exit_request, ExitRequest::Error);
+        }
+        release_runtime(runtime);
+    }
+
     #[test]
     fn graceful_cleanup_joins_in_flight_heartbeat_and_releases_lock() {
         let harness = RuntimeHarness::new();
@@ -3377,7 +3577,7 @@ mod tests {
             .state
             .session_mut()
             .push_message(Message::user(UNSAVED.into()));
-        let (internal_tx, internal_rx) = flume::unbounded();
+        let (internal_tx, _internal_rx) = flume::unbounded();
         let (entered_tx, entered_rx) = flume::bounded(1);
         let (heartbeat_release_tx, heartbeat_release_rx) = flume::bounded(1);
         start_runtime_heartbeat_with(&mut runtime, &internal_tx, move |lease| {
@@ -3401,10 +3601,11 @@ mod tests {
             runtime.app.checkpoint_now();
         }
         heartbeat_release_tx.send(()).unwrap();
-        assert!(matches!(
-            internal_rx.recv().unwrap(),
-            InternalEvent::SessionHeartbeat(generation) if generation == runtime.generation
-        ));
+        smol::block_on(async {
+            while session_lock::open_elsewhere(&harness.ctx().sessions_dir, &id) {
+                smol::future::yield_now().await;
+            }
+        });
 
         let manager = runtime.handles.manager_and_root().0;
         drop(runtime);

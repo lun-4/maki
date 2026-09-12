@@ -68,6 +68,13 @@ struct GraphState {
     shutting_down: bool,
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct CommitGate {
+    entered: flume::Sender<()>,
+    release: flume::Receiver<()>,
+}
+
 pub(crate) struct ManagerInner {
     generation: u64,
     limits: AgentLimits,
@@ -77,6 +84,8 @@ pub(crate) struct ManagerInner {
     next_watcher: AtomicU64,
     shutdown: AtomicBool,
     reaped: Event,
+    #[cfg(test)]
+    commit_gate: Mutex<Option<CommitGate>>,
 }
 
 #[derive(Clone)]
@@ -107,6 +116,8 @@ impl AgentManagerHandle {
             }),
             shutdown: AtomicBool::new(false),
             reaped: Event::new(),
+            #[cfg(test)]
+            commit_gate: Mutex::new(None),
         })))
     }
 }
@@ -232,6 +243,7 @@ impl AgentManagerHandle {
             if graph.shutting_down {
                 return Err(ManagerError::GraphShutdown);
             }
+            Self::reclaim_finished_closings(&mut graph);
             if graph.active_turns.get(&(parent_id, current.turn_id())) != Some(&current.token.nonce)
             {
                 return Err(ManagerError::InactiveTurn {
@@ -494,6 +506,24 @@ impl AgentManagerHandle {
             backend,
             admission,
         );
+        let manager = Arc::downgrade(&self.0);
+        let task = smol::spawn(async move {
+            task.await;
+            let Some(manager) = manager.upgrade() else {
+                return;
+            };
+            let mut graph = manager
+                .graph
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(node) = graph.nodes.get_mut(&agent_id) else {
+                return;
+            };
+            if node.reservation == reservation && node.lifecycle == GraphLifecycle::Closing {
+                node.lifecycle = GraphLifecycle::Closed;
+                graph.revision += 1;
+            }
+        });
         let mut graph = self.lock_graph();
         let can_commit = graph.nodes.get(&agent_id).is_some_and(|node| {
             node.reservation == reservation
@@ -513,42 +543,94 @@ impl AgentManagerHandle {
         let shutting_down = graph.shutting_down;
         let node = graph.nodes.get_mut(&agent_id).unwrap();
         let closing = node.lifecycle == GraphLifecycle::Closing;
+        let cancel_on_commit = std::mem::take(&mut node.cancel_on_commit);
         node.actor = Some(actor.clone());
         node.task = Some(task);
+        if !closing && !cancel_on_commit {
+            node.reservation_pending = false;
+            node.lifecycle = GraphLifecycle::Live;
+            graph.revision += 1;
+            let revision = graph.revision;
+            let depth = graph.nodes[&agent_id].depth;
+            let live_count = graph
+                .nodes
+                .values()
+                .filter(|node| node.lifecycle.consumes_capacity())
+                .count();
+            drop(graph);
+            info!(manager_generation = self.0.generation, %agent_id, depth, revision, live_count, "agent node committed");
+            return Ok(AgentRef {
+                manager: self.clone(),
+                agent_id,
+            });
+        }
+        drop(graph);
+        if closing {
+            if shutting_down {
+                actor.shutdown();
+            } else {
+                actor.close();
+            }
+            self.finish_failed_commit(agent_id, reservation);
+            return Err(if shutting_down {
+                ManagerError::GraphShutdown
+            } else {
+                ManagerError::NonLiveAgent(agent_id)
+            });
+        }
+        actor.cancel_existing();
+        #[cfg(test)]
+        self.wait_at_commit_gate();
+        let mut graph = self.lock_graph();
+        let can_publish = !graph.shutting_down
+            && graph.nodes.get(&agent_id).is_some_and(|node| {
+                node.reservation == reservation
+                    && node.reservation_pending
+                    && node.lifecycle == GraphLifecycle::Reserved
+                    && node.actor.is_some()
+                    && node.task.is_some()
+            });
+        if !can_publish {
+            let shutting_down = graph.shutting_down;
+            drop(graph);
+            if shutting_down {
+                actor.shutdown();
+            } else {
+                actor.close();
+            }
+            self.finish_failed_commit(agent_id, reservation);
+            return Err(if shutting_down {
+                ManagerError::GraphShutdown
+            } else {
+                ManagerError::NonLiveAgent(agent_id)
+            });
+        }
+        let node = graph.nodes.get_mut(&agent_id).unwrap();
         node.reservation_pending = false;
-        node.lifecycle = if closing && !shutting_down {
-            GraphLifecycle::Closed
-        } else if closing {
-            GraphLifecycle::Closing
-        } else {
-            GraphLifecycle::Live
-        };
-        let cancel_on_commit = std::mem::take(&mut node.cancel_on_commit);
+        node.lifecycle = GraphLifecycle::Live;
         graph.revision += 1;
         let revision = graph.revision;
         let depth = graph.nodes[&agent_id].depth;
         let live_count = graph
             .nodes
             .values()
-            .filter(|n| n.lifecycle.consumes_capacity())
+            .filter(|node| node.lifecycle.consumes_capacity())
             .count();
         drop(graph);
-        if closing {
-            if shutting_down {
-                actor.shutdown();
-                return Err(ManagerError::GraphShutdown);
-            }
-            actor.close();
-            return Err(ManagerError::NonLiveAgent(agent_id));
-        }
-        if cancel_on_commit {
-            actor.cancel_existing();
-        }
         info!(manager_generation = self.0.generation, %agent_id, depth, revision, live_count, "agent node committed");
         Ok(AgentRef {
             manager: self.clone(),
             agent_id,
         })
+    }
+
+    fn finish_failed_commit(&self, agent_id: AgentId, reservation: u64) {
+        let mut graph = self.lock_graph();
+        if let Some(node) = graph.nodes.get_mut(&agent_id)
+            && node.reservation == reservation
+        {
+            node.reservation_pending = false;
+        }
     }
 
     pub fn runner_finished(&self, agent_id: AgentId) -> Result<bool, ManagerError> {
@@ -615,16 +697,6 @@ impl AgentManagerHandle {
         for actor in actors {
             actor.close();
         }
-        let mut graph = self.lock_graph();
-        let ids: Vec<_> = Self::subtree_ids(&graph, agent_id).into_iter().collect();
-        for id in ids {
-            if let Some(node) = graph.nodes.get_mut(&id)
-                && !node.reservation_pending
-            {
-                node.lifecycle = GraphLifecycle::Closed;
-            }
-        }
-        graph.revision += 1;
         Ok(())
     }
 
@@ -764,6 +836,20 @@ impl AgentManagerHandle {
         }
     }
 
+    fn reclaim_finished_closings(graph: &mut GraphState) {
+        let mut reclaimed = false;
+        for node in graph.nodes.values_mut() {
+            if node.lifecycle == GraphLifecycle::Closing
+                && !node.reservation_pending
+                && node.task.as_ref().is_some_and(smol::Task::is_finished)
+            {
+                node.lifecycle = GraphLifecycle::Closed;
+                reclaimed = true;
+            }
+        }
+        graph.revision += u64::from(reclaimed);
+    }
+
     fn finished_nodes(&self, ids: &[AgentId]) -> HashSet<AgentId> {
         let mut graph = self.lock_graph();
         let done: HashSet<_> = ids
@@ -873,6 +959,29 @@ impl AgentManagerHandle {
         let value = graph.next_reservation;
         graph.next_reservation += 1;
         value
+    }
+
+    #[cfg(test)]
+    fn set_commit_gate(&self, entered: flume::Sender<()>, release: flume::Receiver<()>) {
+        *self
+            .0
+            .commit_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(CommitGate { entered, release });
+    }
+
+    #[cfg(test)]
+    fn wait_at_commit_gate(&self) {
+        let gate = self
+            .0
+            .commit_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(gate) = gate {
+            gate.entered.send(()).unwrap();
+            gate.release.recv().unwrap();
+        }
     }
 
     fn lock_graph(&self) -> std::sync::MutexGuard<'_, GraphState> {
