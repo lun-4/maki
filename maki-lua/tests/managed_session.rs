@@ -20,7 +20,9 @@ use serde_json::{Value, json};
 mod common;
 
 const TOOL_NAME: &str = "managed_session";
+const SILENT_TOOL_NAME: &str = "managed_session_silent";
 const TIMEOUT_TOOL_NAME: &str = "managed_session_timeout";
+const SILENT_REPLY: &str = "silent child result";
 const RETAIN_TOOL_NAME: &str = "managed_session_retain";
 const OUTSIDE_TIMEOUT_TOOL_NAME: &str = "managed_session_outside_timeout";
 const TIMEOUT_ERROR: &str = "session prompt timed out after 1s";
@@ -98,6 +100,32 @@ maki.api.register_tool({
       return { llm_output = prompt_err, is_error = true }
     end
     return "ok"
+  end,
+})
+
+maki.api.register_tool({
+  name = "managed_session_silent",
+  description = "create and close a silent managed child",
+  schema = { type = "object", properties = {}, additionalProperties = false },
+  audiences = { "main" },
+  handler = function(_, ctx)
+    local session, err = maki.agent.session(ctx, {
+      name = "managed-silent-child",
+      inherit_provider = true,
+      silent = true,
+    })
+    if not session then
+      return { llm_output = err, is_error = true }
+    end
+    local result, prompt_err = session:prompt("reply")
+    session:close()
+    if not result then
+      return { llm_output = prompt_err, is_error = true }
+    end
+    if result.text ~= "silent child result" then
+      return { llm_output = "unexpected silent result: " .. result.text, is_error = true }
+    end
+    return result.text
   end,
 })
 "#;
@@ -263,6 +291,54 @@ fn managed_session_uses_root_authority_and_closes_its_node() {
             .find(|envelope| matches!(envelope.event, AgentEvent::SubagentHistory { .. }))
             .expect("managed child history envelope");
         assert_eq!(envelope.subagent.unwrap().agent_id, child.agent_id);
+
+        let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        assert!(report.timed_out.is_empty());
+    });
+}
+
+#[test]
+fn silent_managed_session_returns_result_without_parent_visibility() {
+    smol::block_on(async {
+        let registry = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&registry)).unwrap();
+        host.load_source("managed-session", PLUGIN_SRC).unwrap();
+        let (context, events, _cancel) =
+            common::ctx_with_replies(vec![common::canned_reply(SILENT_REPLY)]);
+        assert!(events.is_empty(), "parent event stream must start empty");
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let (completed_tx, completed_rx) = flume::bounded(1);
+        let root = manager
+            .create_root(
+                Vec::new(),
+                None,
+                Box::new(LuaToolBackend {
+                    registry,
+                    context,
+                    completed: completed_tx,
+                    tool_name: SILENT_TOOL_NAME,
+                }),
+            )
+            .unwrap();
+        let ticket = root
+            .actor()
+            .unwrap()
+            .admit_turn(input(), None, CORRELATION.into())
+            .unwrap();
+
+        assert_eq!(completed_rx.recv_async().await.unwrap(), Ok(()));
+        assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+        let child = manager
+            .snapshot()
+            .into_iter()
+            .find(|node| node.parent_id == Some(root.id()))
+            .expect("silent managed child");
+        assert_eq!(child.graph_lifecycle, GraphLifecycle::Closed);
+        assert!(
+            events.is_empty(),
+            "silent child emitted parent envelopes: {:?}",
+            events.try_iter().collect::<Vec<_>>()
+        );
 
         let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
         assert!(report.timed_out.is_empty());

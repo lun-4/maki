@@ -111,6 +111,7 @@ struct LuaActorState {
     parent_agent_id: Option<AgentId>,
     parent_is_root: bool,
     auto_deliver: bool,
+    silent: bool,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
     local_tools: LocalTools,
     name: String,
@@ -169,6 +170,9 @@ impl LuaActorState {
     /// Close-time fallback: emit an existing transcript exactly once, but
     /// never an empty snapshot or one belonging to queued-only work.
     fn relay_snapshot_if_pending(&self) {
+        if self.silent {
+            return;
+        }
         if self
             .history_relayed
             .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -1038,6 +1042,7 @@ async fn session(
         parent_agent_id,
         parent_is_root,
         auto_deliver,
+        silent,
         subagent_info: Arc::clone(&subagent_info),
         local_tools: Arc::new(local_map),
         name: name.clone(),
@@ -1282,7 +1287,8 @@ struct LuaSession {
 
 impl LuaSession {
     fn close_controlled(&self) {
-        if let Some(subagent) = self.state.subagent_info.get()
+        if !self.state.silent
+            && let Some(subagent) = self.state.subagent_info.get()
             && !self
                 .state
                 .close_notified
@@ -1979,6 +1985,7 @@ mod tests {
             parent_agent_id: None,
             parent_is_root: false,
             auto_deliver: true,
+            silent: false,
             subagent_info: Arc::new(OnceLock::new()),
             local_tools: LocalTools::default(),
             name: "probe".to_owned(),

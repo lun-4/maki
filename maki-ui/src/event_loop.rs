@@ -444,25 +444,49 @@ fn collect_heartbeat(
     })
 }
 
+enum LockReleaseOutcome {
+    Completed {
+        result: io::Result<()>,
+        lock_lost: bool,
+    },
+    TimedOut,
+}
+
 fn release_lock_state(state: Option<SessionLockState>) -> io::Result<()> {
-    release_lock_state_with_timeout(state, AGENT_SHUTDOWN_TIMEOUT).0
+    match release_lock_state_with_timeout(state, AGENT_SHUTDOWN_TIMEOUT) {
+        LockReleaseOutcome::Completed { result, .. } => result,
+        LockReleaseOutcome::TimedOut => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "session lock heartbeat did not finish before shutdown timeout",
+        )),
+    }
 }
 
 fn release_lock_state_with_timeout(
     state: Option<SessionLockState>,
     timeout: Duration,
-) -> (io::Result<()>, bool) {
+) -> LockReleaseOutcome {
     let (lease, lock_lost) = match state {
         Some(SessionLockState::Held(lease)) => (Some(lease), false),
         Some(SessionLockState::InFlight(task)) => {
-            collect_heartbeat(task, Some(timeout)).map_or((None, false), |mut completion| {
-                let lock_lost = matches!(completion.result, Ok(session_lock::LockBeat::Lost));
-                (completion.lease.take(), lock_lost)
+            let (completion_tx, completion_rx) = flume::bounded(1);
+            smol::spawn(async move {
+                let completion = task.await;
+                let _ = completion_tx.send(completion);
             })
+            .detach();
+            let Ok(mut completion) = completion_rx.recv_timeout(timeout) else {
+                return LockReleaseOutcome::TimedOut;
+            };
+            let lock_lost = matches!(completion.result, Ok(session_lock::LockBeat::Lost));
+            (completion.lease.take(), lock_lost)
         }
         None => (None, false),
     };
-    (lease.map_or(Ok(()), ClaimedSessionLock::release), lock_lost)
+    LockReleaseOutcome::Completed {
+        result: lease.map_or(Ok(()), ClaimedSessionLock::release),
+        lock_lost,
+    }
 }
 
 fn checkpoint_runtime(runtime: &mut SessionRuntime) {
@@ -590,6 +614,9 @@ fn replace_session_runtime(
     let mut runtime = prepared.activate(model_slot, target_lock);
     runtime.app.exit_on_done = exit_on_done;
     let old = std::mem::replace(current, runtime);
+    old.app
+        .command_runtime
+        .finish_theme_preview(old.app.command_target.id(), false);
     current.activate_deferred();
     Ok(old)
 }
@@ -2439,12 +2466,25 @@ impl<'t> EventLoop<'t> {
                 ..
             } = rt;
             let heartbeat_timeout = heartbeat_deadline.saturating_duration_since(Instant::now());
-            let (release_result, heartbeat_lock_lost) =
-                release_lock_state_with_timeout(session_lock, heartbeat_timeout);
-            if let Err(error) = release_result {
-                warn!(id = %app.state.session.id, %error, "session lock release failed");
-            }
-            if !lock_lost && !heartbeat_lock_lost {
+            let lock_released_safely = match release_lock_state_with_timeout(
+                session_lock,
+                heartbeat_timeout,
+            ) {
+                LockReleaseOutcome::Completed {
+                    result,
+                    lock_lost: heartbeat_lock_lost,
+                } => {
+                    if let Err(error) = result {
+                        warn!(id = %app.state.session.id, %error, "session lock release failed");
+                    }
+                    !heartbeat_lock_lost
+                }
+                LockReleaseOutcome::TimedOut => {
+                    warn!(id = %app.state.session.id, "session lock heartbeat timed out during shutdown");
+                    false
+                }
+            };
+            if !lock_lost && lock_released_safely {
                 app.checkpoint_now();
             }
             // `app` drops at the end of this iteration, closing the
@@ -2588,7 +2628,6 @@ fn ring_bell() {
 mod tests {
     use super::*;
     use crate::selection::SelectionZone;
-    use crate::theme::InMemoryThemesProvider;
     use crossterm::event::KeyModifiers;
     use maki_agent::{AgentError, AgentId, DoneReason, SessionMailbox, TurnId, TurnOutcome};
     use maki_config::PermissionsConfig;
@@ -2634,13 +2673,14 @@ mod tests {
             let storage = StateDir::from_path(temp_dir.path().to_path_buf());
             let sessions_dir = storage.ensure_subdir(SESSIONS_DIR).unwrap();
             let available_models = Arc::new(ArcSwapOption::empty());
-            let themes = Arc::new(InMemoryThemesProvider::bundled());
             let command_registry = maki_commands::CommandRegistry::new();
             let command_runtime = Arc::new(CommandRuntime::new_for_test(
                 &[],
                 command_registry,
                 Arc::new(ModelArgSource::new(Arc::clone(&available_models))),
-                Arc::new(ThemeArgSource::new(themes)),
+                Arc::new(ThemeArgSource::new(
+                    crate::theme::default_provider().clone(),
+                )),
             ));
             let model = crate::components::test_model();
             let (model_slot, _provider_change_rx) =
@@ -2927,6 +2967,56 @@ mod tests {
     }
 
     #[test]
+    fn committed_replacement_restores_outgoing_accepted_theme_preview() {
+        const ORIGINAL_THEME: &str = "dracula";
+        const PREVIEW_THEME: &str = "tokyonight";
+
+        let _guard = crate::theme::theme_test_guard();
+        let harness = RuntimeHarness::new();
+        let mut runtime = harness.runtime(harness.session());
+        let provider = Arc::clone(&runtime.app.theme_provider);
+        provider.select(ORIGINAL_THEME);
+        let target = runtime.app.command_target.id();
+        let command = runtime
+            .app
+            .command_runtime
+            .registry
+            .resolve_for(&runtime.app.command_target, "/theme")
+            .unwrap();
+        let completion = runtime
+            .app
+            .command_runtime
+            .registry
+            .open_completion(command, target)
+            .unwrap();
+        let maki_commands::CompletionResult::Items(candidates) = smol::block_on(
+            completion.complete(Arc::from(""), Arc::from(""), 0, Arc::from("insert")),
+        ) else {
+            panic!("expected theme completion items");
+        };
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.item().insertion.as_ref() == PREVIEW_THEME)
+            .unwrap();
+        completion.highlight(candidate).unwrap();
+        completion.accept(candidate.clone()).unwrap();
+        assert_eq!(provider.current_theme_name(), PREVIEW_THEME);
+
+        let prepared = harness.prepare();
+        let old = replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        )
+        .unwrap();
+
+        assert_eq!(provider.current_theme_name(), ORIGINAL_THEME);
+        release_runtime(old);
+        release_runtime(runtime);
+    }
+
+    #[test]
     fn replacement_preserves_exit_on_done() {
         let harness = RuntimeHarness::new();
         let mut runtime = harness.runtime(harness.session());
@@ -3115,8 +3205,11 @@ mod tests {
         assert!(cleanup_done_rx.try_recv().is_err());
 
         release_tx.send(()).unwrap();
-        let (release_result, lock_lost) = cleanup_done_rx.recv().unwrap();
-        release_result.unwrap();
+        let LockReleaseOutcome::Completed { result, lock_lost } = cleanup_done_rx.recv().unwrap()
+        else {
+            panic!("heartbeat cleanup timed out");
+        };
+        result.unwrap();
         assert!(!lock_lost);
         cleanup.join().unwrap();
         assert!(!session_lock::open_elsewhere(
@@ -3169,13 +3262,80 @@ mod tests {
         });
         assert!(cleanup_done_rx.try_recv().is_err());
         heartbeat_release_tx.send(()).unwrap();
-        let (release_result, heartbeat_lock_lost) = cleanup_done_rx.recv().unwrap();
-        release_result.unwrap();
+        let LockReleaseOutcome::Completed {
+            result,
+            lock_lost: heartbeat_lock_lost,
+        } = cleanup_done_rx.recv().unwrap()
+        else {
+            panic!("heartbeat cleanup timed out");
+        };
+        result.unwrap();
         cleanup.join().unwrap();
 
         if !runtime.lock_lost && !heartbeat_lock_lost {
             runtime.app.checkpoint_now();
         }
+        let manager = runtime.handles.manager_and_root().0;
+        drop(runtime);
+        shutdown_manager(&manager);
+        let ctx = harness.ctx.take().unwrap();
+        let storage = ctx.storage.clone();
+        let storage_writer = Arc::clone(&ctx.storage_writer);
+        drop(ctx);
+        Arc::try_unwrap(storage_writer)
+            .unwrap_or_else(|_| panic!("test owns storage writer"))
+            .shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
+
+        let stored = AppSession::load(id, &storage).unwrap();
+        assert_eq!(stored.messages().len(), 1);
+        assert_eq!(stored.messages()[0].user_text(), Some(BASELINE));
+    }
+
+    #[test]
+    fn shutdown_does_not_checkpoint_when_in_flight_heartbeat_times_out() {
+        const BASELINE: &str = "stored before heartbeat";
+        const UNSAVED: &str = "must not reach storage";
+
+        let mut harness = RuntimeHarness::new();
+        let mut session = harness.session();
+        let id = session.id;
+        session.push_message(Message::user(BASELINE.into()));
+        session.save(&harness.ctx().storage).unwrap();
+        let mut runtime = harness.runtime(session);
+        runtime
+            .app
+            .state
+            .session_mut()
+            .push_message(Message::user(UNSAVED.into()));
+        let (internal_tx, internal_rx) = flume::unbounded();
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (heartbeat_release_tx, heartbeat_release_rx) = flume::bounded(1);
+        start_runtime_heartbeat_with(&mut runtime, &internal_tx, move |lease| {
+            entered_tx.send(()).unwrap();
+            heartbeat_release_rx.recv().unwrap();
+            (lease, Ok(session_lock::LockBeat::Held))
+        });
+        entered_rx.recv().unwrap();
+
+        let outcome = release_lock_state_with_timeout(runtime.session_lock.take(), Duration::ZERO);
+        assert!(matches!(&outcome, LockReleaseOutcome::TimedOut));
+        if !runtime.lock_lost
+            && matches!(
+                &outcome,
+                LockReleaseOutcome::Completed {
+                    lock_lost: false,
+                    ..
+                }
+            )
+        {
+            runtime.app.checkpoint_now();
+        }
+        heartbeat_release_tx.send(()).unwrap();
+        assert!(matches!(
+            internal_rx.recv().unwrap(),
+            InternalEvent::SessionHeartbeat(generation) if generation == runtime.generation
+        ));
+
         let manager = runtime.handles.manager_and_root().0;
         drop(runtime);
         shutdown_manager(&manager);
