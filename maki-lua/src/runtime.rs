@@ -1206,17 +1206,18 @@ pub(crate) fn with_live_ctx<R>(lua: &Lua, f: impl FnOnce(&LiveCtx) -> R) -> Opti
 
 pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), mlua::Error> {
     let handle = lua.app_data_ref::<TaskHandle>();
-    let (cancel, live_ctx, command_depth, command_invocation) = match &handle {
+    let (cancel, live_ctx, managed_turn, command_depth, command_invocation) = match &handle {
         Some(h) => {
             let cell = lock_cell(h);
             (
                 cell.cancel.clone(),
                 cell.live.clone(),
+                cell.managed_turn.clone(),
                 cell.command_depth,
                 cell.command_invocation.clone(),
             )
         }
-        None => (CancelToken::none(), None, 0, None),
+        None => (CancelToken::none(), None, None, 0, None),
     };
 
     let mut task = PendingAsyncTask {
@@ -1225,6 +1226,7 @@ pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), 
         deadline: Some(Instant::now() + ASYNC_RUN_DEFAULT_DEADLINE),
         live_ctx,
         owner: None,
+        managed_turn,
         command_depth,
         command_invocation,
         timer_id: None,
@@ -1382,6 +1384,7 @@ pub(crate) struct PendingAsyncTask {
     pub deadline: Option<Instant>,
     pub live_ctx: Option<LiveCtx>,
     pub owner: Option<Arc<BufsClaim>>,
+    pub managed_turn: Option<maki_agent::CurrentManagedTurn>,
     pub command_depth: u8,
     pub command_invocation: Option<CommandTaskInvocation>,
     /// Timer fires pass their id as the first callback argument.
@@ -1498,6 +1501,7 @@ fn spawn_async_task(
         let _gate_guard = g.acquire().await;
 
         let mut cell = TaskCell::new(task.cancel.clone(), task.deadline, task.live_ctx.clone());
+        cell.managed_turn = task.managed_turn;
         cell.command_depth = task.command_depth;
         cell.command_invocation = task.command_invocation;
         let scope = TaskScope::new(&lua, cell);
@@ -4523,6 +4527,7 @@ mod tests {
             deadline,
             live_ctx: None,
             owner: None,
+            managed_turn: None,
             command_depth: 0,
             command_invocation: None,
             timer_id: None,
@@ -5056,6 +5061,7 @@ mod tests {
             deadline: None,
             live_ctx: None,
             owner: None,
+            managed_turn: None,
             command_depth: 0,
             command_invocation: None,
             timer_id: None,

@@ -25,7 +25,11 @@ const TIMEOUT_TOOL_NAME: &str = "managed_session_timeout";
 const SILENT_REPLY: &str = "silent child result";
 const RETAIN_TOOL_NAME: &str = "managed_session_retain";
 const OUTSIDE_TIMEOUT_TOOL_NAME: &str = "managed_session_outside_timeout";
+const JOIN_TOOL_NAME: &str = "managed_session_join";
+const RETAIN_ASYNC_TOOL_NAME: &str = "managed_session_retain_async";
+const RELEASE_ASYNC_TOOL_NAME: &str = "managed_session_release_async";
 const TIMEOUT_ERROR: &str = "session prompt timed out after 1s";
+const INACTIVE_TURN_FRAGMENT: &str = "is no longer active";
 const NESTED_RESULT: &str = "nested child result";
 const MANAGED_NESTED_SPAWN_ERR: &str = "managed general subagents must use the blocking task tool";
 const CORRELATION: &str = "managed-root";
@@ -56,6 +60,74 @@ end
 
 const PLUGIN_SRC: &str = r#"
 local retained_session
+local release_async_worker
+local finish_async_wait
+
+maki.api.register_tool({
+  name = "managed_session_join",
+  description = "prompt an existing child from a joined worker",
+  schema = { type = "object", properties = {}, additionalProperties = false },
+  audiences = { "main" },
+  handler = function(_, ctx)
+    local session = assert(maki.agent.session(ctx, {
+      name = "managed-joined-child",
+      inherit_provider = true,
+    }))
+    local result, prompt_err
+    maki.async.join(1, {
+      function()
+        result, prompt_err = session:prompt("reply")
+      end,
+    })
+    session:close()
+    if not result then
+      return { llm_output = prompt_err, is_error = true }
+    end
+    return result.text
+  end,
+})
+
+maki.api.register_tool({
+  name = "managed_session_retain_async",
+  description = "retain a worker past its managed invocation",
+  schema = { type = "object", properties = {}, additionalProperties = false },
+  audiences = { "main" },
+  handler = function(_, ctx)
+    retained_session = assert(maki.agent.session(ctx, {
+      name = "managed-async-retained-child",
+      inherit_provider = true,
+    }))
+    maki.async.await(1, function(worker_started)
+      maki.async.run(function()
+        maki.async.await(1, function(done)
+          release_async_worker = done
+          worker_started()
+        end)
+        local result, err = retained_session:prompt("stale")
+        finish_async_wait(result, err)
+      end)
+    end)
+    return "ok"
+  end,
+})
+
+maki.api.register_tool({
+  name = "managed_session_release_async",
+  description = "release and await the retained worker",
+  schema = { type = "object", properties = {}, additionalProperties = false },
+  audiences = { "main" },
+  handler = function()
+    local result, err = maki.async.await(1, function(done)
+      finish_async_wait = done
+      release_async_worker()
+    end)
+    retained_session:close()
+    if result ~= nil or not string.find(err, "is no longer active", 1, true) then
+      return { llm_output = "unexpected stale worker result: " .. tostring(err), is_error = true }
+    end
+    return "ok"
+  end,
+})
 
 maki.api.register_tool({
   name = "managed_session_retain",
@@ -486,7 +558,14 @@ fn managed_nested_blocking_task_completes_before_parent_turn_ends_at_capacity_on
             .find(|node| node.parent_id == Some(parent.id()))
             .expect("managed nested child B");
         assert_eq!(nested.depth, 2);
-        assert_eq!(nested.graph_lifecycle, GraphLifecycle::Closed);
+        let nested_id = nested.agent_id;
+        while !manager.runner_finished(nested_id).unwrap() {
+            smol::future::yield_now().await;
+        }
+        assert_eq!(
+            manager.node(nested_id).unwrap().graph_lifecycle,
+            GraphLifecycle::Closed
+        );
 
         release_tx.send(()).unwrap();
         assert!(matches!(
@@ -548,6 +627,122 @@ fn managed_nested_task_spawn_rejects_before_creating_child() {
 }
 
 #[test]
+fn managed_join_worker_prompts_existing_child_at_capacity_one() {
+    smol::block_on(async {
+        let registry = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&registry)).unwrap();
+        host.load_source("managed-session", PLUGIN_SRC).unwrap();
+        let (context, _events, _cancel) =
+            common::ctx_with_replies(vec![common::canned_reply(SILENT_REPLY)]);
+        let manager = AgentManagerHandle::new(AgentLimits {
+            max_concurrent_agent_turns: 1,
+            ..AgentLimits::default()
+        })
+        .unwrap();
+        let (completed_tx, completed_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let (parent, parent_ticket) = spawn_managed_parent(
+            &manager,
+            Box::new(NestedTaskBackend {
+                registry,
+                context,
+                tool_name: JOIN_TOOL_NAME,
+                input: json!({}),
+                completed: completed_tx,
+                release: release_rx,
+            }),
+        )
+        .await;
+
+        let completed = futures_lite::future::race(
+            async { Some(completed_rx.recv_async().await.unwrap()) },
+            async {
+                smol::Timer::after(SHUTDOWN_TIMEOUT).await;
+                None
+            },
+        )
+        .await
+        .expect("joined child starved behind its parent's turn permit");
+        assert_eq!(completed, Ok(SILENT_REPLY.into()));
+        assert!(parent_ticket.peek().is_none());
+        assert!(
+            manager
+                .snapshot()
+                .iter()
+                .any(|node| node.parent_id == Some(parent.id())),
+            "managed joined child missing"
+        );
+
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            parent_ticket.wait().await,
+            TurnOutcome::Completed { .. }
+        ));
+        let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        assert!(report.timed_out.is_empty());
+    });
+}
+
+#[test]
+fn managed_async_worker_outliving_turn_keeps_stale_authority() {
+    smol::block_on(async {
+        let registry = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&registry)).unwrap();
+        host.load_source("managed-session", PLUGIN_SRC).unwrap();
+        let (mut context, _events, _cancel) = common::ctx_with_canned_provider();
+        let manager = AgentManagerHandle::new(AgentLimits {
+            max_concurrent_agent_turns: 1,
+            ..AgentLimits::default()
+        })
+        .unwrap();
+        let (first_tx, first_rx) = flume::bounded(1);
+        let root = manager
+            .create_root(
+                Vec::new(),
+                None,
+                Box::new(LuaToolBackend {
+                    registry: Arc::clone(&registry),
+                    context: context.clone(),
+                    completed: first_tx,
+                    tool_name: RETAIN_ASYNC_TOOL_NAME,
+                }),
+            )
+            .unwrap();
+        let first_ticket = root
+            .actor()
+            .unwrap()
+            .admit_turn(input(), None, CORRELATION.into())
+            .unwrap();
+        assert_eq!(first_rx.recv_async().await.unwrap(), Ok(()));
+        assert!(matches!(
+            first_ticket.wait().await,
+            TurnOutcome::Completed { .. }
+        ));
+
+        context.managed_turn = None;
+        let invocation = registry
+            .get(RELEASE_ASYNC_TOOL_NAME)
+            .unwrap()
+            .tool
+            .parse(&json!({}))
+            .unwrap();
+        let completed = futures_lite::future::race(
+            async { Some(invocation.execute(&context).await.output.map(|_| ())) },
+            async {
+                smol::Timer::after(SHUTDOWN_TIMEOUT).await;
+                None
+            },
+        )
+        .await
+        .expect("stale async worker fell back to a blocking unmanaged wait");
+        assert_eq!(completed, Ok(()), "{INACTIVE_TURN_FRAGMENT}");
+
+        let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        assert!(report.timed_out.is_empty());
+    });
+}
+
+#[test]
 fn managed_session_uses_root_authority_and_closes_its_node() {
     smol::block_on(async {
         let registry = Arc::new(ToolRegistry::new());
@@ -594,7 +789,14 @@ fn managed_session_uses_root_authority_and_closes_its_node() {
         assert_eq!(root_node.children, vec![child.agent_id]);
         assert_eq!(child.root_id, root.id());
         assert_eq!(child.depth, 1);
-        assert_eq!(child.graph_lifecycle, GraphLifecycle::Closed);
+        let child_id = child.agent_id;
+        while !manager.runner_finished(child_id).unwrap() {
+            smol::future::yield_now().await;
+        }
+        assert_eq!(
+            manager.node(child_id).unwrap().graph_lifecycle,
+            GraphLifecycle::Closed
+        );
         let envelope = events
             .try_iter()
             .find(|envelope| matches!(envelope.event, AgentEvent::SubagentHistory { .. }))
@@ -637,12 +839,19 @@ fn silent_managed_session_returns_result_without_parent_visibility() {
 
         assert_eq!(completed_rx.recv_async().await.unwrap(), Ok(()));
         assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
-        let child = manager
+        let child_id = manager
             .snapshot()
             .into_iter()
             .find(|node| node.parent_id == Some(root.id()))
-            .expect("silent managed child");
-        assert_eq!(child.graph_lifecycle, GraphLifecycle::Closed);
+            .expect("silent managed child")
+            .agent_id;
+        while !manager.runner_finished(child_id).unwrap() {
+            smol::future::yield_now().await;
+        }
+        assert_eq!(
+            manager.node(child_id).unwrap().graph_lifecycle,
+            GraphLifecycle::Closed
+        );
         assert!(
             events.is_empty(),
             "silent child emitted parent envelopes: {:?}",
@@ -701,12 +910,19 @@ fn retained_managed_prompt_timeout_outside_invocation_closes_graph_node() {
             .recv_async()
             .await
             .expect("timed-out retained provider request remained alive");
-        let child = manager
+        let child_id = manager
             .snapshot()
             .into_iter()
             .find(|node| node.parent_id == Some(root.id()))
-            .expect("retained managed child");
-        assert_eq!(child.graph_lifecycle, GraphLifecycle::Closed);
+            .expect("retained managed child")
+            .agent_id;
+        while !manager.runner_finished(child_id).unwrap() {
+            smol::future::yield_now().await;
+        }
+        assert_eq!(
+            manager.node(child_id).unwrap().graph_lifecycle,
+            GraphLifecycle::Closed
+        );
 
         let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
         assert!(report.timed_out.is_empty());

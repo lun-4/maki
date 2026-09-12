@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::TurnTicket;
-
-use crate::{ActorSnapshot, AgentActorHandle, AgentId, TurnId};
+use crate::{
+    ActorSnapshot, AgentActorHandle, AgentId, AgentInput, EventSender, TurnId, TurnTicket,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentLimits {
@@ -157,6 +157,12 @@ pub(crate) struct ManagedTurnToken {
     pub(crate) nonce: u64,
 }
 
+pub struct PromptAdmission {
+    pub input: AgentInput,
+    pub event_sender: Option<EventSender>,
+    pub correlation: String,
+}
+
 #[derive(Clone)]
 pub struct TurnPermitLease {
     pub(crate) inner: Arc<super::LeaseInner>,
@@ -175,21 +181,49 @@ impl TurnPermitLease {
         &self,
         current: &CurrentManagedTurn,
         child_id: AgentId,
-        actor: &AgentActorHandle,
+        _actor: &AgentActorHandle,
         ticket: TurnTicket,
         timeout: Option<Duration>,
     ) -> Result<ManagedPromptWait, super::ManagerError> {
+        current
+            .token
+            .manager
+            .register_prompt_wait(current, self, child_id, ticket, timeout)
+    }
+
+    pub fn admit_and_wait_for_descendant(
+        &self,
+        current: &CurrentManagedTurn,
+        child_id: AgentId,
+        actor: &AgentActorHandle,
+        admission: PromptAdmission,
+        timeout: Option<Duration>,
+    ) -> Result<Option<(TurnId, ManagedPromptWait)>, super::ManagerError> {
+        if !Arc::ptr_eq(&self.inner, &current.lease.inner) {
+            return Err(super::ManagerError::WrongManager);
+        }
+        current
+            .token
+            .manager
+            .validate_descendant(current, child_id)?;
+        let Ok(ticket) = actor.admit_turn(
+            admission.input,
+            admission.event_sender,
+            admission.correlation,
+        ) else {
+            return Ok(None);
+        };
         let turn_id = ticket.turn_id();
+        #[cfg(test)]
+        current.token.manager.wait_at_prompt_admission_gate(turn_id);
         match current
             .token
             .manager
             .register_prompt_wait(current, self, child_id, ticket, timeout)
         {
-            Ok(wait) => Ok(wait),
-            Err((error, cancel_ticket)) => {
-                if cancel_ticket {
-                    let _ = actor.cancel_turn(turn_id);
-                }
+            Ok(wait) => Ok(Some((turn_id, wait))),
+            Err(error) => {
+                let _ = actor.cancel_turn(turn_id);
                 Err(error)
             }
         }

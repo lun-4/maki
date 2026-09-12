@@ -636,18 +636,38 @@ fn raising_prompt_does_not_exhaust_semaphore() {
 // --- Four-tool async lifecycle (AC.1 - AC.5, AC.7) --------------------------
 
 #[test]
-fn task_tools_allow_general_children_but_not_research_children() {
-    let (reg, _host) = load_task_host();
-    for name in [
-        "task",
-        "task_spawn",
-        "task_get",
-        "task_send",
-        "task_despawn",
-    ] {
-        let audience = reg.get(name).unwrap().tool.audience();
-        assert!(audience.contains(ToolAudience::GENERAL_SUB), "{name}");
-        assert!(!audience.contains(ToolAudience::RESEARCH_SUB), "{name}");
+fn unmanaged_general_child_cannot_send_to_or_despawn_sibling_tasks() {
+    let provider = Arc::new(common::CannedProvider::new(vec![
+        common::canned_tool_use(
+            "task_send",
+            json!({ "task_id": "sibling", "message": "mutate" }),
+        ),
+        common::canned_tool_use("task_despawn", json!({ "task_id": "sibling" })),
+        common::canned_reply("done"),
+    ]));
+    let (ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
+    let (reg, _host) = load_real_driver_host("build");
+
+    let mut input = task_input(SCENARIO_PLAIN, None);
+    input["subagent_type"] = json!("general");
+    let output = run_task(&reg, &ctx, input)
+        .expect("general child should complete after rejected mutation attempts");
+    assert_eq!(output, "done");
+
+    let captured = provider.captured_tools();
+    assert_eq!(
+        captured.len(),
+        3,
+        "the driver must process both mutation attempts before the final reply"
+    );
+    for tools in captured {
+        let names = common::tool_names(&tools);
+        for name in ["task_send", "task_despawn"] {
+            assert!(
+                !names.iter().any(|available| available == name),
+                "unmanaged sibling can invoke {name}"
+            );
+        }
     }
 }
 

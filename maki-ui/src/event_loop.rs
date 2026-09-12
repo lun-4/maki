@@ -647,6 +647,10 @@ fn replace_session_runtime(
     };
     let mut runtime = prepared.activate(model_slot, target_lock);
     runtime.app.exit_on_done = exit_on_done;
+    runtime
+        .app
+        .input_box
+        .replace_history_from(&mut current.app.input_box);
     let old = std::mem::replace(current, runtime);
     old.app
         .command_runtime
@@ -658,6 +662,23 @@ fn replace_session_runtime(
 impl SessionRuntime {
     fn id(&self) -> MakiId {
         self.app.state.session.id
+    }
+
+    fn update(&mut self, msg: Msg) -> Vec<Action> {
+        if self.pending_replacement.is_some() && matches!(msg, Msg::Key(_) | Msg::Paste(_)) {
+            return Vec::new();
+        }
+        self.app.update(msg)
+    }
+
+    fn submit_text(&mut self, text: String) -> Result<SubmitOutcome, String> {
+        if self.pending_replacement.is_some() {
+            return Err(REPLACEMENT_PENDING_ERR.into());
+        }
+        Ok(self.app.submit_prompt(QueuedMessage {
+            text,
+            images: Vec::new(),
+        }))
     }
 
     fn activate_deferred(&mut self) {
@@ -2064,17 +2085,13 @@ impl<'t> EventLoop<'t> {
     }
 
     fn submit_text(&mut self, idx: usize, text: String) -> UiReply {
-        let msg = QueuedMessage {
-            text,
-            images: Vec::new(),
-        };
-        match self.sessions[idx].app.submit_prompt(msg) {
+        match self.sessions[idx].submit_text(text)? {
             SubmitOutcome::Started(actions) => {
                 self.dispatch(idx, actions);
                 Ok(json!("started"))
             }
             SubmitOutcome::Queued => Ok(json!("queued")),
-            SubmitOutcome::Rejected(e) => Err(e),
+            SubmitOutcome::Rejected(error) => Err(error),
         }
     }
 
@@ -2249,7 +2266,7 @@ impl<'t> EventLoop<'t> {
         while let Some(ev) = pending.take() {
             let (msg, leftover) = self.translate(ev);
             if let Some(msg) = msg {
-                let actions = self.sessions[self.focused].app.update(msg);
+                let actions = self.sessions[self.focused].update(msg);
                 self.dispatch(self.focused, actions);
                 if self.sessions[self.focused].app.take_pending_bell() {
                     ring_bell();
@@ -3170,6 +3187,33 @@ mod tests {
         release_runtime(runtime);
     }
 
+    #[test_case(false ; "rewind")]
+    #[test_case(true ; "reset")]
+    fn replacement_preserves_unsaved_input_history(reset: bool) {
+        const PROMPT: &str = "not saved to disk";
+
+        let harness = RuntimeHarness::new();
+        let session = harness.session();
+        let mut runtime = harness.runtime(session.clone());
+        runtime.app.input_box.set_input(PROMPT.into());
+        assert_eq!(runtime.app.input_box.submit().unwrap().text, PROMPT);
+        let replacement = if reset { harness.session() } else { session };
+        let prepared = harness.ctx().prepare_runtime(replacement);
+
+        let old = replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        )
+        .unwrap();
+        runtime.app.input_box.history_up();
+
+        assert_eq!(runtime.app.input_box.buffer.value(), PROMPT);
+        release_runtime(old);
+        release_runtime(runtime);
+    }
+
     #[test]
     fn committed_replacement_restores_outgoing_accepted_theme_preview() {
         const ORIGINAL_THEME: &str = "dracula";
@@ -3365,10 +3409,16 @@ mod tests {
     #[test_case(session_lock::LockBeat::Held ; "held_commits")]
     #[test_case(session_lock::LockBeat::Lost ; "lost_reports_lock_loss")]
     fn same_id_replacement_waits_for_in_flight_heartbeat(beat: session_lock::LockBeat) {
+        const OUTGOING_DRAFT: &str = "draft before replacement";
+        const PROGRAMMATIC_PROMPT: &str = "programmatic submission";
+        const RESTORED_DRAFT: &str = "replacement restored prompt";
+
         let harness = RuntimeHarness::new();
-        let session = harness.session();
+        let mut session = harness.session();
         let id = session.id;
         let mut runtime = harness.runtime(session.clone());
+        runtime.app.input_box.set_input(OUTGOING_DRAFT.into());
+        session.meta.input_draft = Some(RESTORED_DRAFT.into());
         let generation = runtime.generation;
         let (internal_tx, internal_rx) = flume::unbounded();
         let (entered_tx, entered_rx) = flume::bounded(1);
@@ -3394,6 +3444,22 @@ mod tests {
         assert!(runtime.pending_replacement.is_some());
         assert_eq!(runtime.id(), id);
 
+        let edit_actions = runtime.update(Msg::Key(crate::components::key(
+            crossterm::event::KeyCode::Char('x'),
+        )));
+        assert!(edit_actions.is_empty());
+        assert_eq!(runtime.app.input_box.buffer.value(), OUTGOING_DRAFT);
+        let submit_actions = runtime.update(Msg::Key(crate::components::key(
+            crossterm::event::KeyCode::Enter,
+        )));
+        assert!(submit_actions.is_empty());
+        assert_eq!(runtime.app.input_box.buffer.value(), OUTGOING_DRAFT);
+        assert!(matches!(
+            runtime.submit_text(PROGRAMMATIC_PROMPT.into()),
+            Err(ref error) if error == REPLACEMENT_PENDING_ERR
+        ));
+        assert!(runtime.handles.queue.is_empty());
+
         release_tx.send(()).unwrap();
         let InternalEvent::SessionHeartbeat(event_generation) = internal_rx.recv().unwrap() else {
             panic!("expected heartbeat completion");
@@ -3418,6 +3484,14 @@ mod tests {
             };
             assert_eq!(runtime.id(), id);
             assert!(!runtime.lock_lost);
+            assert_eq!(runtime.app.input_box.buffer.value(), RESTORED_DRAFT);
+            let actions = runtime.update(Msg::Key(crate::components::key(
+                crossterm::event::KeyCode::Enter,
+            )));
+            assert!(matches!(
+                actions.as_slice(),
+                [Action::SendMessage(input)] if input.message == RESTORED_DRAFT
+            ));
             release_runtime(old);
         } else {
             assert!(pending.is_none());

@@ -1398,35 +1398,35 @@ async fn prompt(
         return Ok(err_pair("timeout must be greater than zero"));
     }
     drop(this);
-    let Ok(ticket) = actor.admit_turn(
-        AgentInput {
-            message,
-            mode: AgentMode::Build,
-            images: Vec::new(),
-            preamble: Vec::new(),
-            thinking: state.thinking,
-            fast: state.fast,
-            workflow: false,
-            prompt: None,
-        },
-        None,
-        String::new(),
-    ) else {
-        return Ok((None, Some(SESSION_CLOSED_ERR.to_owned())));
+    let input = AgentInput {
+        message,
+        mode: AgentMode::Build,
+        images: Vec::new(),
+        preamble: Vec::new(),
+        thinking: state.thinking,
+        fast: state.fast,
+        workflow: false,
+        prompt: None,
     };
-    let turn_id = ticket.turn_id();
-    let outcome = if let Some((current, child_id)) = managed_wait {
-        let wait = match current.lease().wait_for_descendant(
+    let (turn_id, outcome) = if let Some((current, child_id)) = managed_wait {
+        let admission = maki_agent::manager::PromptAdmission {
+            input,
+            event_sender: None,
+            correlation: String::new(),
+        };
+        let admitted = match current.lease().admit_and_wait_for_descendant(
             &current,
             child_id,
             &actor,
-            ticket,
+            admission,
             timeout.map(Duration::from_secs),
         ) {
-            Ok(wait) => wait,
+            Ok(Some(admitted)) => admitted,
+            Ok(None) => return Ok((None, Some(SESSION_CLOSED_ERR.to_owned()))),
             Err(error) => return Ok(err_pair(error.to_string())),
         };
-        match wait.wait().await {
+        let (turn_id, wait) = admitted;
+        let outcome = match wait.wait().await {
             Ok(outcome) => outcome,
             Err(maki_agent::PromptWaitError::Timeout) => {
                 let seconds = timeout.expect("managed timeout requires a configured duration");
@@ -1437,9 +1437,14 @@ async fn prompt(
             Err(maki_agent::PromptWaitError::Cancelled) => {
                 return Ok(err_pair(CANCELLED_MSG));
             }
-        }
+        };
+        (turn_id, outcome)
     } else {
-        match timeout {
+        let Ok(ticket) = actor.admit_turn(input, None, String::new()) else {
+            return Ok((None, Some(SESSION_CLOSED_ERR.to_owned())));
+        };
+        let turn_id = ticket.turn_id();
+        let outcome = match timeout {
             Some(seconds) => {
                 let outcome =
                     futures_lite::future::race(async { Some(ticket.wait().await) }, async {
@@ -1463,7 +1468,8 @@ async fn prompt(
                 outcome
             }
             None => ticket.wait().await,
-        }
+        };
+        (turn_id, outcome)
     };
     // The actor retains every outcome and accumulates usage before the ticket
     // resolves, so the snapshot's cumulative usage is the per-session total the

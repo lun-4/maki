@@ -13,7 +13,7 @@ mod types;
 pub use manager_error::ManagerError;
 pub use types::{
     AgentLimits, AgentMetadata, AgentNodeSnapshot, AgentRef, CurrentManagedTurn, GraphLifecycle,
-    ManagedPromptWait, PromptWaitError, ShutdownReport, TurnPermitLease,
+    ManagedPromptWait, PromptAdmission, PromptWaitError, ShutdownReport, TurnPermitLease,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -70,8 +70,15 @@ struct GraphState {
 
 #[cfg(test)]
 #[derive(Clone)]
-struct CommitGate {
+struct TestGate {
     entered: flume::Sender<()>,
+    release: flume::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct PromptAdmissionGate {
+    admitted: flume::Sender<TurnId>,
     release: flume::Receiver<()>,
 }
 
@@ -85,7 +92,9 @@ pub(crate) struct ManagerInner {
     shutdown: AtomicBool,
     reaped: Event,
     #[cfg(test)]
-    commit_gate: Mutex<Option<CommitGate>>,
+    commit_gate: Mutex<Option<TestGate>>,
+    #[cfg(test)]
+    prompt_admission_gate: Mutex<Option<PromptAdmissionGate>>,
 }
 
 #[derive(Clone)]
@@ -118,6 +127,8 @@ impl AgentManagerHandle {
             reaped: Event::new(),
             #[cfg(test)]
             commit_gate: Mutex::new(None),
+            #[cfg(test)]
+            prompt_admission_gate: Mutex::new(None),
         })))
     }
 }
@@ -392,19 +403,15 @@ impl AgentManagerHandle {
         child_id: AgentId,
         ticket: crate::TurnTicket,
         timeout: Option<Duration>,
-    ) -> Result<ManagedPromptWait, (ManagerError, bool)> {
+    ) -> Result<ManagedPromptWait, ManagerError> {
         if !Arc::ptr_eq(&lease.inner, &current.lease.inner) {
-            return Err((ManagerError::WrongManager, false));
+            return Err(ManagerError::WrongManager);
         }
-        self.validate_descendant(current, child_id)
-            .map_err(|error| (error, false))?;
+        self.validate_descendant(current, child_id)?;
 
         let watcher_id = self.0.next_watcher.fetch_add(1, Ordering::Relaxed);
         let (cancel, cancel_token) = crate::ReasonedCancelToken::new();
-        lease
-            .inner
-            .suspend(watcher_id, cancel.clone())
-            .map_err(|error| (error, true))?;
+        lease.inner.suspend(watcher_id, cancel.clone())?;
         let wait = Arc::new(PromptWaitInner {
             lease: Arc::clone(&lease.inner),
             manager: Arc::downgrade(&self.0),
@@ -634,7 +641,8 @@ impl AgentManagerHandle {
     }
 
     pub fn runner_finished(&self, agent_id: AgentId) -> Result<bool, ManagerError> {
-        let graph = self.lock_graph();
+        let mut graph = self.lock_graph();
+        Self::reclaim_finished_closings(&mut graph);
         let node = graph
             .nodes
             .get(&agent_id)
@@ -967,14 +975,45 @@ impl AgentManagerHandle {
             .0
             .commit_gate
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(CommitGate { entered, release });
+            .unwrap_or_else(|error| error.into_inner()) = Some(TestGate { entered, release });
     }
 
     #[cfg(test)]
     fn wait_at_commit_gate(&self) {
+        self.wait_at_test_gate(&self.0.commit_gate);
+    }
+
+    #[cfg(test)]
+    fn set_prompt_admission_gate(
+        &self,
+        admitted: flume::Sender<TurnId>,
+        release: flume::Receiver<()>,
+    ) {
+        *self
+            .0
+            .prompt_admission_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            Some(PromptAdmissionGate { admitted, release });
+    }
+
+    #[cfg(test)]
+    fn wait_at_prompt_admission_gate(&self, turn_id: TurnId) {
         let gate = self
             .0
-            .commit_gate
+            .prompt_admission_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(gate) = gate {
+            gate.admitted.send(turn_id).unwrap();
+            gate.release.recv().unwrap();
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_at_test_gate(&self, slot: &Mutex<Option<TestGate>>) {
+        let gate = slot
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take();

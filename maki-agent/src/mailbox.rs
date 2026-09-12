@@ -48,10 +48,11 @@ impl SessionMailbox {
     }
 
     pub fn prepare(session_id: MakiId) -> PreparedSessionMailbox {
-        PreparedSessionMailbox(Self {
-            session_id,
-            state: Arc::new(Mutex::new(State::default())),
-        })
+        let state = lock(&MAILBOXES)
+            .get(&session_id)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| Arc::new(Mutex::new(State::default())));
+        PreparedSessionMailbox(Self { session_id, state })
     }
 
     pub fn notify(session_id: MakiId, text: String, wake: bool) -> Result<(), MailboxError> {
@@ -143,6 +144,26 @@ mod tests {
         drop(SessionMailbox::prepare(id));
 
         assert!(SessionMailbox::notify(id, "late".into(), false).is_err());
+    }
+
+    #[test]
+    fn same_id_activation_preserves_notifications_exactly_once_and_wake() {
+        let id = MakiId::generate();
+        let current = SessionMailbox::register(id);
+        SessionMailbox::notify(id, "before".into(), true).unwrap();
+        let prepared = SessionMailbox::prepare(id);
+        SessionMailbox::notify(id, "during".into(), false).unwrap();
+
+        let replacement = prepared.activate();
+        drop(current);
+
+        let messages = replacement.claim_wake();
+        assert_eq!(
+            messages.iter().map(text).collect::<Vec<_>>(),
+            ["before", "during"]
+        );
+        assert!(replacement.claim_wake().is_empty());
+        assert!(replacement.drain().is_empty());
     }
 
     #[test]

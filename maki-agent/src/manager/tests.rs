@@ -1403,68 +1403,74 @@ fn parent_cancellation_while_suspended_retires_wait_and_releases_permit() {
 }
 
 #[test]
-fn watcher_registration_failure_cancels_exact_admitted_child_turn() {
-    smol::block_on(async {
-        let limits = AgentLimits {
-            max_concurrent_agent_turns: 1,
-            ..AgentLimits::default()
-        };
-        let (manager, root, current, root_gate) = active_root(limits);
-        let child = manager
-            .spawn_child(
-                &current,
-                AgentMetadata::default(),
-                Vec::new(),
-                None,
-                TestBackend::boxed(),
-            )
-            .unwrap();
-        let actor = child.actor().unwrap();
-        let cancelled = actor.admit_turn(input(), None, "cancelled".into()).unwrap();
-        let cancelled_id = cancelled.turn_id();
-        let lease = current.lease();
-        {
-            let mut state = lease
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            state.closing = true;
-        }
+fn authority_revoked_after_prompt_admission_cancels_only_that_ticket() {
+    let limits = AgentLimits {
+        max_concurrent_agent_turns: 1,
+        ..AgentLimits::default()
+    };
+    let (manager, _, current, root_gate) = active_root(limits);
+    let child_gate = Gate::new();
+    let child = manager
+        .spawn_child(
+            &current,
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            Box::new(TestBackend {
+                current: None,
+                gate: Some(Arc::clone(&child_gate)),
+            }),
+        )
+        .unwrap();
+    let actor = child.actor().unwrap();
+    let surviving = actor.admit_turn(input(), None, "surviving".into()).unwrap();
+    let (admitted_tx, admitted_rx) = flume::bounded(1);
+    let (register_tx, register_rx) = flume::bounded(1);
+    manager.set_prompt_admission_gate(admitted_tx, register_rx);
 
-        let Err(error) =
-            lease.wait_for_descendant(&current, child.id(), &actor, cancelled.clone(), None)
-        else {
-            panic!("closing lease accepted a watcher");
-        };
-        assert!(matches!(error, ManagerError::InactiveTurn { .. }));
-        assert!(matches!(
-            cancelled.wait().await,
-            TurnOutcome::Cancelled {
-                turn_id,
-                reason: crate::TurnCancellationReason::User,
-                ..
-            } if turn_id == cancelled_id
-        ));
-
-        {
-            let mut state = lease
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            state.closing = false;
-        }
-        root_gate.release(1);
-        let surviving = actor.admit_turn(input(), None, "surviving".into()).unwrap();
-        assert!(matches!(
-            surviving.wait().await,
-            TurnOutcome::Completed { .. }
-        ));
-        let report = manager.shutdown(std::time::Duration::from_secs(1)).await;
-        assert!(report.timed_out.is_empty());
-        assert_eq!(root.id(), current.agent_id());
+    let lease = current.lease();
+    let prompt_current = current.clone();
+    let prompt_actor = actor.clone();
+    let prompt_child_id = child.id();
+    let prompt = std::thread::spawn(move || {
+        lease.admit_and_wait_for_descendant(
+            &prompt_current,
+            prompt_child_id,
+            &prompt_actor,
+            super::PromptAdmission {
+                input: input(),
+                event_sender: None,
+                correlation: "cancelled".into(),
+            },
+            None,
+        )
     });
+    let cancelled_id = admitted_rx.recv().unwrap();
+
+    root_gate.release(1);
+    while current.validate_descendant(child.id()).is_ok() {
+        std::thread::yield_now();
+    }
+    register_tx.send(()).unwrap();
+    assert!(matches!(
+        prompt.join().unwrap(),
+        Err(ManagerError::InactiveTurn { .. })
+    ));
+    assert!(matches!(
+        smol::block_on(actor.wait_outcome(cancelled_id)).unwrap(),
+        TurnOutcome::Cancelled {
+            reason: crate::TurnCancellationReason::User,
+            ..
+        }
+    ));
+    child_gate.release(1);
+    assert!(matches!(
+        smol::block_on(surviving.wait()),
+        TurnOutcome::Completed { .. }
+    ));
+
+    let report = smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
+    assert!(report.timed_out.is_empty());
 }
 
 #[test]
