@@ -35,7 +35,7 @@ use crate::agent::LoadedInstructions;
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
-use crate::{AgentConfig, AgentMode, EventSender, SharedBuf};
+use crate::{AgentConfig, AgentMode, CurrentManagedTurn, EventSender, SharedBuf};
 use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::Model;
 use maki_providers::RequestOptions;
@@ -263,7 +263,7 @@ pub struct ToolContext {
     /// while sibling dispatches stay independent. Serves as the reentry
     /// check input only and is never used for filesystem access.
     pub(crate) write_lock_chain: Arc<Vec<u64>>,
-    pub managed_turn: Option<crate::CurrentManagedTurn>,
+    pub managed_turn: Option<CurrentManagedTurn>,
 }
 
 impl ToolContext {

@@ -21,7 +21,9 @@ use maki_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
 use maki_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
 };
-use maki_agent::{BufferSnapshot, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
+use maki_agent::{
+    BufferSnapshot, CurrentManagedTurn, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
+};
 use mlua::{Chunk, ChunkMode, Compiler, Function, Lua, RegistryKey, Table, Value as LuaValue, ffi};
 
 use crate::coalesced_latest::{CoalescedLatest, CoalescedWork};
@@ -446,7 +448,7 @@ enum KillReason {
 pub(crate) struct TaskCell {
     pub(crate) id: u64,
     pub(crate) cancel: CancelToken,
-    pub(crate) managed_turn: Option<maki_agent::CurrentManagedTurn>,
+    pub(crate) managed_turn: Option<CurrentManagedTurn>,
     /// End of the current kill grace, armed by the first watchdog poke that
     /// sees a doomed task and cleared at every yield.
     kill_at: Cell<Option<Instant>>,
@@ -1135,7 +1137,7 @@ impl<F: Future> Future for ScopedFuture<F> {
     }
 }
 
-pub(crate) fn current_managed_turn(lua: &Lua) -> Option<maki_agent::CurrentManagedTurn> {
+pub(crate) fn current_managed_turn(lua: &Lua) -> Option<CurrentManagedTurn> {
     lock_cell(&active_task(lua)).managed_turn.clone()
 }
 
@@ -1384,7 +1386,7 @@ pub(crate) struct PendingAsyncTask {
     pub deadline: Option<Instant>,
     pub live_ctx: Option<LiveCtx>,
     pub owner: Option<Arc<BufsClaim>>,
-    pub managed_turn: Option<maki_agent::CurrentManagedTurn>,
+    pub managed_turn: Option<CurrentManagedTurn>,
     pub command_depth: u8,
     pub command_invocation: Option<CommandTaskInvocation>,
     /// Timer fires pass their id as the first callback argument.
