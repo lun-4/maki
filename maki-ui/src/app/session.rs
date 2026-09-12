@@ -322,6 +322,7 @@ impl App {
         let kept = estimate_message_tokens(session.messages());
         session.meta.context_size = if kept == 0 { 0 } else { baseline + kept };
         session.meta.input_draft = Some(entry.prompt_text);
+        session.meta.queued_messages.clear();
         vec![Action::ReplaceSession(Box::new(
             SessionReplacementRequest {
                 session,

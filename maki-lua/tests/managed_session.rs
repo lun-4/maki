@@ -3,11 +3,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use maki_agent::tools::{ToolContext, ToolRegistry};
+use maki_agent::tools::{ToolAudience, ToolContext, ToolRegistry};
 use maki_agent::{
-    ActorBackend, AgentEvent, AgentInput, AgentLimits, AgentManagerHandle, AgentMode,
-    BackendResult, ControlWork, DoneReason, GraphLifecycle, History, TurnContext, TurnOutcome,
-    WorkKind,
+    ActorBackend, AgentEvent, AgentInput, AgentLimits, AgentManagerHandle, AgentMetadata,
+    AgentMode, AgentRef, BackendResult, ControlWork, DoneReason, GraphLifecycle, History,
+    ToolOutput, TurnContext, TurnOutcome, TurnTicket, WorkKind,
 };
 use maki_lua::PluginHost;
 use maki_providers::provider::{BoxFuture, Provider};
@@ -26,8 +26,33 @@ const SILENT_REPLY: &str = "silent child result";
 const RETAIN_TOOL_NAME: &str = "managed_session_retain";
 const OUTSIDE_TIMEOUT_TOOL_NAME: &str = "managed_session_outside_timeout";
 const TIMEOUT_ERROR: &str = "session prompt timed out after 1s";
+const NESTED_RESULT: &str = "nested child result";
+const MANAGED_NESTED_SPAWN_ERR: &str = "managed general subagents must use the blocking task tool";
 const CORRELATION: &str = "managed-root";
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/task/init.lua");
+const TASK_PRELUDE: &str = r#"
+maki.api.mode.get = function() return "build" end
+
+local real_session = maki.agent.session
+maki.agent.session = function(ctx, opts)
+  opts.inherit_provider = true
+  return real_session(ctx, opts)
+end
+
+maki.agent.resolve_model = function()
+  return { spec = "anthropic/claude-sonnet-4-20250514" }
+end
+
+maki.agent.system_prompt = function()
+  return "sys"
+end
+
+maki.agent.tools = function()
+  return nil
+end
+"#;
 
 const PLUGIN_SRC: &str = r#"
 local retained_session
@@ -190,6 +215,183 @@ impl ActorBackend for LuaToolBackend {
     }
 }
 
+struct NestedTaskBackend {
+    registry: Arc<ToolRegistry>,
+    context: ToolContext,
+    tool_name: &'static str,
+    input: Value,
+    completed: flume::Sender<Result<String, String>>,
+    release: flume::Receiver<()>,
+}
+
+impl ActorBackend for NestedTaskBackend {
+    fn run_turn<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        context: TurnContext,
+        _: AgentInput,
+        _: WorkKind,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async move {
+            self.context.managed_turn = context.managed_turn;
+            self.context.audience = ToolAudience::GENERAL_SUB;
+            let invocation = self
+                .registry
+                .get(self.tool_name)
+                .unwrap()
+                .tool
+                .parse(&self.input)
+                .unwrap();
+            let result = invocation
+                .execute(&self.context)
+                .await
+                .output
+                .map(|output| {
+                    let (ToolOutput::Plain(output) | ToolOutput::Markdown(output)) = output else {
+                        panic!("unexpected nested task output")
+                    };
+                    output.text
+                });
+            let _ = self.completed.send(result.clone());
+            self.release.recv_async().await.unwrap();
+            if result.is_err() {
+                return BackendResult::SetupFailed {
+                    agent_id: context.agent_id,
+                    turn_id: context.turn_id.unwrap(),
+                };
+            }
+            BackendResult::EnteredRun(TurnOutcome::Completed {
+                agent_id: context.agent_id,
+                turn_id: context.turn_id.unwrap(),
+                usage: Default::default(),
+                num_turns: 1,
+                reason: DoneReason::EndTurn,
+            })
+        })
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: &'a ControlWork,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::ControlDone })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::CompactDone })
+    }
+}
+
+struct SpawnManagedChildBackend {
+    child_backend: Option<Box<dyn ActorBackend>>,
+    child: flume::Sender<(AgentRef, TurnTicket)>,
+}
+
+impl ActorBackend for SpawnManagedChildBackend {
+    fn run_turn<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        context: TurnContext,
+        _: AgentInput,
+        _: WorkKind,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async move {
+            let current = context.managed_turn.unwrap();
+            let child = current
+                .spawn_child(
+                    AgentMetadata::default(),
+                    Vec::new(),
+                    None,
+                    self.child_backend.take().unwrap(),
+                )
+                .unwrap();
+            let ticket = child
+                .actor()
+                .unwrap()
+                .admit_turn(input(), None, CORRELATION.into())
+                .unwrap();
+            self.child.send((child, ticket)).unwrap();
+            BackendResult::EnteredRun(TurnOutcome::Completed {
+                agent_id: context.agent_id,
+                turn_id: context.turn_id.unwrap(),
+                usage: Default::default(),
+                num_turns: 1,
+                reason: DoneReason::EndTurn,
+            })
+        })
+    }
+
+    fn run_control<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+        _: &'a ControlWork,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::ControlDone })
+    }
+
+    fn run_compact<'a>(
+        &'a mut self,
+        _: &'a mut History,
+        _: TurnContext,
+    ) -> Pin<Box<dyn Future<Output = BackendResult> + Send + 'a>> {
+        Box::pin(async { BackendResult::CompactDone })
+    }
+}
+
+fn task_input() -> Value {
+    json!({
+        "description": "nested-child",
+        "prompt": "nested prompt",
+        "subagent_type": "general",
+    })
+}
+
+fn load_task_host() -> (Arc<ToolRegistry>, PluginHost) {
+    let registry = Arc::new(ToolRegistry::new());
+    let host = PluginHost::new(Arc::clone(&registry)).unwrap();
+    host.load_source(
+        "managed-nested-task",
+        &format!("{TASK_PRELUDE}\n{TASK_PLUGIN_SRC}"),
+    )
+    .unwrap();
+    (registry, host)
+}
+
+async fn spawn_managed_parent(
+    manager: &AgentManagerHandle,
+    child_backend: Box<dyn ActorBackend>,
+) -> (AgentRef, TurnTicket) {
+    let (child_tx, child_rx) = flume::bounded(1);
+    let root = manager
+        .create_root(
+            Vec::new(),
+            None,
+            Box::new(SpawnManagedChildBackend {
+                child_backend: Some(child_backend),
+                child: child_tx,
+            }),
+        )
+        .unwrap();
+    let root_ticket = root
+        .actor()
+        .unwrap()
+        .admit_turn(input(), None, CORRELATION.into())
+        .unwrap();
+    let child = child_rx.recv_async().await.unwrap();
+    assert!(matches!(
+        root_ticket.wait().await,
+        TurnOutcome::Completed { .. }
+    ));
+    child
+}
+
 struct PendingProvider {
     dropped: flume::Sender<()>,
 }
@@ -236,6 +438,113 @@ fn input() -> AgentInput {
         workflow: false,
         prompt: None,
     }
+}
+
+#[test]
+fn managed_nested_blocking_task_completes_before_parent_turn_ends_at_capacity_one() {
+    smol::block_on(async {
+        let (registry, _host) = load_task_host();
+        let (context, _events, _cancel) =
+            common::ctx_with_replies(vec![common::canned_reply(NESTED_RESULT)]);
+        let manager = AgentManagerHandle::new(AgentLimits {
+            max_concurrent_agent_turns: 1,
+            ..AgentLimits::default()
+        })
+        .unwrap();
+        let (completed_tx, completed_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let (parent, parent_ticket) = spawn_managed_parent(
+            &manager,
+            Box::new(NestedTaskBackend {
+                registry,
+                context,
+                tool_name: "task",
+                input: task_input(),
+                completed: completed_tx,
+                release: release_rx,
+            }),
+        )
+        .await;
+
+        let completed = futures_lite::future::race(
+            async { Some(completed_rx.recv_async().await.unwrap()) },
+            async {
+                smol::Timer::after(SHUTDOWN_TIMEOUT).await;
+                None
+            },
+        )
+        .await
+        .expect("nested child B starved behind parent A's turn permit");
+        assert_eq!(completed, Ok(NESTED_RESULT.into()));
+        assert!(
+            parent_ticket.peek().is_none(),
+            "parent A turn ended before inspection"
+        );
+        let nested = manager
+            .snapshot()
+            .into_iter()
+            .find(|node| node.parent_id == Some(parent.id()))
+            .expect("managed nested child B");
+        assert_eq!(nested.depth, 2);
+        assert_eq!(nested.graph_lifecycle, GraphLifecycle::Closed);
+
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            parent_ticket.wait().await,
+            TurnOutcome::Completed { .. }
+        ));
+        let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        assert!(report.timed_out.is_empty());
+    });
+}
+
+#[test]
+fn managed_nested_task_spawn_rejects_before_creating_child() {
+    smol::block_on(async {
+        let (registry, _host) = load_task_host();
+        let (context, _events, _cancel) = common::ctx_with_canned_provider();
+        let manager = AgentManagerHandle::new(AgentLimits {
+            max_concurrent_agent_turns: 1,
+            ..AgentLimits::default()
+        })
+        .unwrap();
+        let (completed_tx, completed_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let (_parent, parent_ticket) = spawn_managed_parent(
+            &manager,
+            Box::new(NestedTaskBackend {
+                registry,
+                context,
+                tool_name: "task_spawn",
+                input: task_input(),
+                completed: completed_tx,
+                release: release_rx,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            completed_rx.recv_async().await.unwrap(),
+            Err(MANAGED_NESTED_SPAWN_ERR.into())
+        );
+        assert!(
+            parent_ticket.peek().is_none(),
+            "parent A turn ended before inspection"
+        );
+        assert_eq!(
+            manager.snapshot().len(),
+            2,
+            "nested child was created before rejection"
+        );
+
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            parent_ticket.wait().await,
+            TurnOutcome::Failed { .. }
+        ));
+        let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        assert!(report.timed_out.is_empty());
+    });
 }
 
 #[test]

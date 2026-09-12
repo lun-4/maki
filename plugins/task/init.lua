@@ -9,8 +9,9 @@
 --   task_send    -> { queued = true }           (queue a message / nudge)
 --   task_despawn -> { ok = true }               (cancel + flush history)
 -- A direct child of the root agent returns its result automatically when it
--- finishes. Nested general subagents must poll task_get. The unified `task` tool
--- remains as a blocking composite over the four.
+-- finishes. Managed general subagents must use the blocking `task` tool so
+-- `session:prompt` yields their turn permit. Unmanaged callers retain the four-tool
+-- lifecycle for compatibility.
 --
 -- Rust exposes primitives only (`maki.agent.session`, `maki.json.schema_validator`,
 -- `maki.async.semaphore`).
@@ -41,6 +42,7 @@ local INVALID_INPUT_PREFIX =
 local UNKNOWN_TASK_ERR = "unknown task_id"
 local TASK_ACCESS_ERR = "task is owned by another agent branch"
 local RECURSIVE_UNMANAGED_TASK_ERR = "blocking task is unavailable from an unmanaged subagent; use task_spawn"
+local MANAGED_NESTED_SPAWN_ERR = "managed general subagents must use the blocking task tool"
 local TASK_CLOSED_ERR = "task was despawned before its message was admitted"
 local BODY_INDENT_COLS = 4
 local MIN_MD_WIDTH = 20
@@ -55,11 +57,10 @@ Subagent types (set via `subagent_type`):
 
 Subagents run in the background, so the main agent is never blocked by one. Use
 `task_spawn` to start a subagent. A direct child of the root agent returns its
-result automatically, so the root may wait for that reply. A nested general
-subagent receives no automatic delivery and must poll `task_get` until the task
-finishes. Use `task_send` to queue more work and `task_despawn` to cancel a
-running subagent. The unified `task` tool is a blocking composite over those four
-and keeps working for one-shot use.
+result automatically, so the root may wait for that reply. A managed general
+subagent must use the blocking `task` tool for nested work so its turn capacity is
+yielded while the child runs. Unmanaged callers retain `task_spawn`, `task_get`,
+`task_send`, and `task_despawn` compatibility.
 
 Notes:
 1. Launch multiple tasks concurrently when possible.
@@ -346,6 +347,9 @@ local spawn_schema = {
 }
 
 local function spawn_handler(input, ctx)
+  if ctx:audience() == "general_sub" and ctx:_maki_managed() then
+    return { llm_output = MANAGED_NESTED_SPAWN_ERR, is_error = true }
+  end
   local spec, err = prepare(input, ctx)
   if err then
     return err
@@ -545,7 +549,7 @@ end
 
 maki.api.register_tool({
   name = "task_spawn",
-  description = "Start a background subagent and return its task_id immediately. Each task's messages run FIFO, acquiring concurrency capacity only when each turn starts. Direct children of the root agent are delivered automatically, so the root may wait for the reply. Nested general subagents are not delivered automatically and must poll task_get until completion. Queue messages with task_send and finish with task_despawn. Also callable from a code_execution script as a Python async function.",
+  description = "Start a background subagent and return its task_id immediately. Each task's messages run FIFO, acquiring concurrency capacity only when each turn starts. Direct children of the root agent are delivered automatically, so the root may wait for the reply. Managed general subagents must use the blocking task tool for nested work so their turn capacity is yielded while the child runs. Unmanaged callers retain task_spawn/task_get compatibility. Queue messages with task_send and finish with task_despawn. Also callable from a code_execution script as a Python async function.",
   kind = "execute",
   audiences = { "main", "general_sub", "interpreter", "workflow" },
   examples = {},
@@ -557,7 +561,7 @@ maki.api.register_tool({
 
 maki.api.register_tool({
   name = "task_get",
-  description = 'Poll a background subagent. Returns { status = "running" | "done" | "closed", result?, error? }. Nested general subagents must use task_get because their spawned tasks are not delivered automatically. Direct children of the root agent are delivered automatically, so the root may wait for the reply. Does not block the caller. Also callable from a code_execution script as a Python async function.',
+  description = 'Poll a background subagent. Returns { status = "running" | "done" | "closed", result?, error? }. Managed general subagents cannot spawn background nested tasks and must use the blocking task tool instead. Unmanaged callers retain task_spawn/task_get compatibility. Direct children of the root agent are delivered automatically, so the root may wait for the reply. Does not block the caller. Also callable from a code_execution script as a Python async function.',
   kind = "execute",
   audiences = { "main", "general_sub", "interpreter", "workflow" },
   examples = {},

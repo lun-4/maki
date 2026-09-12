@@ -2845,6 +2845,76 @@ mod tests {
     }
 
     #[test]
+    fn committed_rewind_does_not_restore_failed_turn_queue() {
+        const RECOVERY_TEXT: &str = "retained after failure";
+        const REWOUND_TEXT: &str = "rewound prompt";
+
+        let harness = RuntimeHarness::new();
+        let mut session = harness.session();
+        session.push_message(Message::user(REWOUND_TEXT.into()));
+        let mut app = crate::app::tests::test_app();
+        app.apply_loaded_session(session.clone(), &harness.ctx().model_slot.load().model);
+        app.status = Status::Streaming;
+        app.run_id = 1;
+        assert!(matches!(
+            app.submit_prompt(QueuedMessage {
+                text: RECOVERY_TEXT.into(),
+                images: Vec::new(),
+            }),
+            SubmitOutcome::Queued
+        ));
+        app.update(Msg::Agent(Box::new(Envelope {
+            event: AgentEvent::ControlError {
+                message: "failed".into(),
+            },
+            subagent: None,
+            run_id: 1,
+        })));
+
+        app.update(Msg::Key(crate::components::key(
+            crossterm::event::KeyCode::Esc,
+        )));
+        app.update(Msg::Key(crate::components::key(
+            crossterm::event::KeyCode::Esc,
+        )));
+        let actions = app.update(Msg::Key(crate::components::key(
+            crossterm::event::KeyCode::Enter,
+        )));
+        let Action::ReplaceSession(request) = actions.into_iter().next().unwrap() else {
+            panic!("expected replacement request");
+        };
+        let mut runtime = harness.runtime(session);
+        let prepared = harness.ctx().prepare_runtime(request.session);
+        let old = replace_session_runtime(
+            &mut runtime,
+            prepared,
+            &harness.ctx().sessions_dir,
+            &harness.ctx().model_slot,
+        )
+        .unwrap();
+
+        assert!(runtime.handles.queue.is_empty());
+        assert!(
+            runtime
+                .handles
+                .agent_rx
+                .recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT)
+                .is_err()
+        );
+
+        let actions = runtime.app.update(Msg::Key(crate::components::key(
+            crossterm::event::KeyCode::Enter,
+        )));
+        let Action::SendMessage(input) = actions.into_iter().next().unwrap() else {
+            panic!("expected send message action");
+        };
+        assert_eq!(input.message, REWOUND_TEXT);
+
+        release_runtime(old);
+        release_runtime(runtime);
+    }
+
+    #[test]
     fn empty_history_replacement_restores_and_checkpoints_draft() {
         const DRAFT: &str = "first prompt";
 

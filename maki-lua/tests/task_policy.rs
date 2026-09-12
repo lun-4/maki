@@ -662,7 +662,7 @@ fn spawn_returns_task_id_immediately() {
 }
 
 #[test]
-fn nested_spawn_contract_requires_polling_and_keeps_failed_result() {
+fn nested_spawn_contract_directs_managed_callers_to_blocking_task() {
     let (reg, _host) = load_task_host();
     let filter = ToolFilter::All;
     let description_ctx = DescriptionContext {
@@ -674,11 +674,16 @@ fn nested_spawn_contract_requires_polling_and_keeps_failed_result() {
     let spawn_description = spawn_tool.tool.description(&description_ctx);
     let get_tool = reg.get("task_get").unwrap();
     let get_description = get_tool.tool.description(&description_ctx);
-    assert!(spawn_description.contains("Nested general subagents are not delivered automatically"));
-    assert!(spawn_description.contains("must poll task_get"));
-    assert!(get_description.contains("Nested general subagents must use task_get"));
-    assert!(!get_description.contains("Normally unnecessary"));
+    assert!(spawn_description.contains("must use the blocking task tool"));
+    assert!(
+        spawn_description.contains("Unmanaged callers retain task_spawn/task_get compatibility")
+    );
+    assert!(get_description.contains("must use the blocking task tool instead"));
+}
 
+#[test]
+fn unmanaged_nested_spawn_and_get_remain_compatible() {
+    let (reg, _host) = load_task_host();
     let mut ctx = stub_ctx(&AgentMode::Build);
     ctx.audience = ToolAudience::GENERAL_SUB;
     let spawned = exec_tool_json_with_ctx(
