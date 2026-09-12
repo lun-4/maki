@@ -1651,7 +1651,10 @@ impl mlua::UserData for LuaTaskOwner {
             let Some(current) = crate::runtime::current_managed_turn(lua) else {
                 return Ok(false);
             };
-            Ok(current.agent_id() == owner_id || current.validate_descendant(owner_id).is_ok())
+            if current.agent_id() == owner_id {
+                return Ok(current.validate_active().is_ok());
+            }
+            Ok(current.validate_descendant(owner_id).is_ok())
         });
     }
 }

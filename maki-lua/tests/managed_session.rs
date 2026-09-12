@@ -29,7 +29,6 @@ const JOIN_TOOL_NAME: &str = "managed_session_join";
 const RETAIN_ASYNC_TOOL_NAME: &str = "managed_session_retain_async";
 const RELEASE_ASYNC_TOOL_NAME: &str = "managed_session_release_async";
 const TIMEOUT_ERROR: &str = "session prompt timed out after 1s";
-const INACTIVE_TURN_FRAGMENT: &str = "is no longer active";
 const NESTED_RESULT: &str = "nested child result";
 const MANAGED_NESTED_SPAWN_ERR: &str = "managed general subagents must use the blocking task tool";
 const CORRELATION: &str = "managed-root";
@@ -37,6 +36,13 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/task/init.lua");
 const TASK_PRELUDE: &str = r#"
+test_task_handlers = {}
+local real_register_tool = maki.api.register_tool
+maki.api.register_tool = function(spec)
+  test_task_handlers[spec.name] = spec.handler
+  return real_register_tool(spec)
+end
+
 maki.api.mode.get = function() return "build" end
 
 local real_session = maki.agent.session
@@ -60,6 +66,8 @@ end
 
 const PLUGIN_SRC: &str = r#"
 local retained_session
+local retained_task_id
+local managed_authority_turn = 0
 local release_async_worker
 local finish_async_wait
 
@@ -89,22 +97,43 @@ maki.api.register_tool({
 
 maki.api.register_tool({
   name = "managed_session_retain_async",
-  description = "retain a worker past its managed invocation",
+  description = "retain task authority past a managed invocation",
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function(_, ctx)
-    retained_session = assert(maki.agent.session(ctx, {
-      name = "managed-async-retained-child",
-      inherit_provider = true,
-    }))
+    managed_authority_turn = managed_authority_turn + 1
+    if managed_authority_turn == 2 then
+      local sent = test_task_handlers.task_send({
+        task_id = retained_task_id,
+        message = "valid later turn",
+      })
+      if sent.is_error then
+        return sent
+      end
+      return "ok"
+    end
+
+    local spawned = test_task_handlers.task_spawn({
+      description = "retained-child",
+      prompt = "initial child turn",
+      subagent_type = "general",
+    }, ctx)
+    if spawned.is_error then
+      return spawned
+    end
+    retained_task_id = maki.json.decode(spawned.llm_output).task_id
     maki.async.await(1, function(worker_started)
       maki.async.run(function()
         maki.async.await(1, function(done)
           release_async_worker = done
           worker_started()
         end)
-        local result, err = retained_session:prompt("stale")
-        finish_async_wait(result, err)
+        local sent = test_task_handlers.task_send({
+          task_id = retained_task_id,
+          message = "stale turn",
+        })
+        local despawned = test_task_handlers.task_despawn({ task_id = retained_task_id })
+        finish_async_wait(sent.llm_output, sent.is_error, despawned.llm_output, despawned.is_error)
       end)
     end)
     return "ok"
@@ -113,17 +142,19 @@ maki.api.register_tool({
 
 maki.api.register_tool({
   name = "managed_session_release_async",
-  description = "release and await the retained worker",
+  description = "release and await retained stale task authority",
   schema = { type = "object", properties = {}, additionalProperties = false },
   audiences = { "main" },
   handler = function()
-    local result, err = maki.async.await(1, function(done)
+    local send_err, send_is_error, despawn_err, despawn_is_error = maki.async.await(1, function(done)
       finish_async_wait = done
       release_async_worker()
     end)
-    retained_session:close()
-    if result ~= nil or not string.find(err, "is no longer active", 1, true) then
-      return { llm_output = "unexpected stale worker result: " .. tostring(err), is_error = true }
+    if send_err ~= "task is owned by another agent branch" or send_is_error ~= true then
+      return { llm_output = "unexpected stale task_send result: " .. tostring(send_err), is_error = true }
+    end
+    if despawn_err ~= "task is owned by another agent branch" or despawn_is_error ~= true then
+      return { llm_output = "unexpected stale task_despawn result: " .. tostring(despawn_err), is_error = true }
     end
     return "ok"
   end,
@@ -684,11 +715,15 @@ fn managed_join_worker_prompts_existing_child_at_capacity_one() {
 }
 
 #[test]
-fn managed_async_worker_outliving_turn_keeps_stale_authority() {
+fn managed_async_worker_outliving_turn_loses_stale_task_authority() {
     smol::block_on(async {
         let registry = Arc::new(ToolRegistry::new());
         let host = PluginHost::new(Arc::clone(&registry)).unwrap();
-        host.load_source("managed-session", PLUGIN_SRC).unwrap();
+        host.load_source(
+            "managed-session",
+            &format!("{TASK_PRELUDE}\n{TASK_PLUGIN_SRC}\n{PLUGIN_SRC}"),
+        )
+        .unwrap();
         let (mut context, _events, _cancel) = common::ctx_with_canned_provider();
         let manager = AgentManagerHandle::new(AgentLimits {
             max_concurrent_agent_turns: 1,
@@ -718,6 +753,33 @@ fn managed_async_worker_outliving_turn_keeps_stale_authority() {
             first_ticket.wait().await,
             TurnOutcome::Completed { .. }
         ));
+        let child_id = manager
+            .snapshot()
+            .into_iter()
+            .find(|node| node.parent_id == Some(root.id()))
+            .unwrap()
+            .agent_id;
+        let child_before = futures_lite::future::race(
+            async {
+                loop {
+                    let child = manager.node(child_id).unwrap();
+                    if child
+                        .actor
+                        .as_ref()
+                        .is_some_and(|actor| actor.latest.is_some())
+                    {
+                        break Some(child);
+                    }
+                    smol::future::yield_now().await;
+                }
+            },
+            async {
+                smol::Timer::after(SHUTDOWN_TIMEOUT).await;
+                None
+            },
+        )
+        .await
+        .expect("managed task child did not settle");
 
         context.managed_turn = None;
         let invocation = registry
@@ -734,8 +796,30 @@ fn managed_async_worker_outliving_turn_keeps_stale_authority() {
             },
         )
         .await
-        .expect("stale async worker fell back to a blocking unmanaged wait");
-        assert_eq!(completed, Ok(()), "{INACTIVE_TURN_FRAGMENT}");
+        .expect("stale async worker did not finish task authorization checks");
+        assert_eq!(completed, Ok(()));
+
+        let child_after = manager.node(child_id).unwrap();
+        assert_eq!(child_after.graph_lifecycle, child_before.graph_lifecycle);
+        let before_actor = child_before.actor.unwrap();
+        let after_actor = child_after.actor.unwrap();
+        assert_eq!(after_actor.lifecycle, before_actor.lifecycle);
+        assert_eq!(after_actor.status, before_actor.status);
+        assert_eq!(after_actor.active_turn, before_actor.active_turn);
+        assert_eq!(after_actor.queued, before_actor.queued);
+        assert_eq!(after_actor.latest, before_actor.latest);
+        assert_eq!(after_actor.cumulative_usage, before_actor.cumulative_usage);
+
+        let second_ticket = root
+            .actor()
+            .unwrap()
+            .admit_turn(input(), None, CORRELATION.into())
+            .unwrap();
+        assert_eq!(first_rx.recv_async().await.unwrap(), Ok(()));
+        assert!(matches!(
+            second_ticket.wait().await,
+            TurnOutcome::Completed { .. }
+        ));
 
         let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
         assert!(report.timed_out.is_empty());

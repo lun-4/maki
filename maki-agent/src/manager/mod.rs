@@ -353,6 +353,33 @@ impl AgentManagerHandle {
         )
     }
 
+    fn validate_active(&self, current: &CurrentManagedTurn) -> Result<(), ManagerError> {
+        if !Arc::ptr_eq(&self.0, &current.token.manager.0)
+            || current.token.generation != self.0.generation
+        {
+            return Err(ManagerError::WrongManager);
+        }
+        let graph = self.lock_graph();
+        if graph
+            .active_turns
+            .get(&(current.agent_id(), current.turn_id()))
+            != Some(&current.token.nonce)
+        {
+            return Err(ManagerError::InactiveTurn {
+                agent_id: current.agent_id(),
+                turn_id: current.turn_id(),
+            });
+        }
+        let node = graph
+            .nodes
+            .get(&current.agent_id())
+            .ok_or(ManagerError::UnknownAgent(current.agent_id()))?;
+        if node.lifecycle != GraphLifecycle::Live {
+            return Err(ManagerError::NonLiveAgent(current.agent_id()));
+        }
+        Ok(())
+    }
+
     fn validate_descendant(
         &self,
         current: &CurrentManagedTurn,

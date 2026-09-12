@@ -135,6 +135,10 @@ impl CurrentManagedTurn {
         self.lease.clone()
     }
 
+    pub fn validate_active(&self) -> Result<(), super::ManagerError> {
+        self.token.manager.validate_active(self)
+    }
+
     pub fn validate_descendant(&self, child_id: AgentId) -> Result<(), super::ManagerError> {
         self.token.manager.validate_descendant(self, child_id)
     }
