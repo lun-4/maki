@@ -65,7 +65,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpSnapshotReader, SharedBuf,
-    SharedMessages, SubagentInfo,
+    SharedMessages, SubagentInfo, TurnCompleteEvent,
 };
 use maki_commands::{
     AgentTurn, BuiltinOperation, CommandAttachment, CommandContent, CommandError,
@@ -1786,14 +1786,20 @@ impl App {
 
         if let Some(subagent) = &envelope.subagent {
             if self.terminal_subagents.contains(&subagent.agent_id) {
-                if let AgentEvent::SubagentHistory {
-                    tool_use_id,
-                    messages,
-                } = envelope.event
-                {
-                    self.state
+                match envelope.event {
+                    AgentEvent::SubagentHistory {
+                        tool_use_id,
+                        messages,
+                    } => self
+                        .state
                         .session_mut()
-                        .set_subagent_messages(tool_use_id, messages);
+                        .set_subagent_messages(tool_use_id, messages),
+                    AgentEvent::TurnComplete(turn) => {
+                        if let Some(&chat_idx) = self.live_chat_index.get(&subagent.agent_id) {
+                            self.account_turn_complete(chat_idx, &turn);
+                        }
+                    }
+                    _ => {}
                 }
                 return vec![];
             }
@@ -2013,11 +2019,7 @@ impl App {
         self.retry_info = None;
 
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
-            self.state.token_usage += tc.usage;
-            add_cost(&mut self.chats[chat_idx].cost, tc.cost);
-            self.state
-                .session_mut()
-                .add_model_usage(&tc.model, tc.usage.billed(tc.cost));
+            self.account_turn_complete(chat_idx, tc);
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
             self.chats[chat_idx].context_size = ctx_size;
             if chat_idx == 0 {
@@ -2121,6 +2123,14 @@ impl App {
             }
         }
         actions
+    }
+
+    fn account_turn_complete(&mut self, chat_idx: usize, turn: &TurnCompleteEvent) {
+        self.state.token_usage += turn.usage;
+        add_cost(&mut self.chats[chat_idx].cost, turn.cost);
+        self.state
+            .session_mut()
+            .add_model_usage(&turn.model, turn.usage.billed(turn.cost));
     }
 
     /// Shared `UiAction::OpenWin` path. Returns `true` when the window went

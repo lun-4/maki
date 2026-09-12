@@ -7743,6 +7743,57 @@ fn final_history_after_subagent_closed_only_persists_messages() {
 }
 
 #[test]
+fn turn_complete_after_subagent_closed_only_accounts_usage() {
+    const MODEL: &str = "delayed-model";
+    const COST: f64 = 0.125;
+
+    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let chat_idx = app.active_chat;
+    let chat_count = app.chats.len();
+    let agent_id = app.chats[chat_idx].agent_id.unwrap();
+    let info = subagent_info_for_agent(
+        agent_id,
+        TASK_ID,
+        "research",
+        None,
+        app.subagent_channels[&agent_id].input_tx.clone(),
+    );
+    let usage = TokenUsage {
+        input: 100,
+        output: 25,
+        cache_creation: 10,
+        cache_read: 5,
+    };
+    app.chats[chat_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentClosed,
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: turn_complete(usage, MODEL, Some(COST)),
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    assert_eq!(app.state.token_usage, usage);
+    assert_eq!(app.chats[chat_idx].cost, Some(COST));
+    assert_eq!(app.chats.len(), chat_count);
+    assert!(app.chats[chat_idx].is_finished());
+    assert!(app.active_subagent_closed());
+    assert!(app.queue.text_messages().is_empty());
+
+    let tmp = TempDir::new().unwrap();
+    let dir = StateDir::from_path(tmp.path().to_path_buf());
+    let session_id = app.state.session.id;
+    app.state.session_mut().save(&dir).unwrap();
+    let persisted = AppSession::load(session_id, &dir).unwrap();
+    assert_eq!(persisted.usage_by_model().len(), 1);
+    assert_eq!(persisted.usage_by_model()[MODEL], usage.billed(Some(COST)));
+}
+
+#[test]
 fn progress_after_subagent_closed_does_not_reopen_chat() {
     const LATE_PROGRESS: &str = "late progress";
 
