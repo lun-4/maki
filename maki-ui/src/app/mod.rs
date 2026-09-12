@@ -1795,9 +1795,8 @@ impl App {
                         .session_mut()
                         .set_subagent_messages(tool_use_id, messages),
                     AgentEvent::TurnComplete(turn) => {
-                        if let Some(&chat_idx) = self.live_chat_index.get(&subagent.agent_id) {
-                            self.account_turn_complete(chat_idx, &turn);
-                        }
+                        let chat_idx = self.live_chat_index.get(&subagent.agent_id).copied();
+                        self.account_turn_complete(chat_idx, &turn);
                     }
                     _ => {}
                 }
@@ -2019,7 +2018,7 @@ impl App {
         self.retry_info = None;
 
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
-            self.account_turn_complete(chat_idx, tc);
+            self.account_turn_complete(Some(chat_idx), tc);
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
             self.chats[chat_idx].context_size = ctx_size;
             if chat_idx == 0 {
@@ -2125,9 +2124,11 @@ impl App {
         actions
     }
 
-    fn account_turn_complete(&mut self, chat_idx: usize, turn: &TurnCompleteEvent) {
+    fn account_turn_complete(&mut self, chat_idx: Option<usize>, turn: &TurnCompleteEvent) {
         self.state.token_usage += turn.usage;
-        add_cost(&mut self.chats[chat_idx].cost, turn.cost);
+        if let Some(chat_idx) = chat_idx {
+            add_cost(&mut self.chats[chat_idx].cost, turn.cost);
+        }
         self.state
             .session_mut()
             .add_model_usage(&turn.model, turn.usage.billed(turn.cost));

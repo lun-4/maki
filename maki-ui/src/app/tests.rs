@@ -7794,6 +7794,46 @@ fn turn_complete_after_subagent_closed_only_accounts_usage() {
 }
 
 #[test]
+fn turn_complete_after_root_cancel_accounts_without_restoring_child() {
+    const MODEL: &str = "cancelled-child-model";
+    const COST: f64 = 0.25;
+
+    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let chat_idx = app.active_chat;
+    let agent_id = app.chats[chat_idx].agent_id.unwrap();
+    let info = subagent_info_for_agent(
+        agent_id,
+        TASK_ID,
+        "research",
+        None,
+        app.subagent_channels[&agent_id].input_tx.clone(),
+    );
+    let usage = TokenUsage {
+        input: 80,
+        output: 20,
+        cache_creation: 4,
+        cache_read: 2,
+    };
+
+    app.handle_cancel();
+    assert!(app.live_chat_index.is_empty());
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: turn_complete(usage, MODEL, Some(COST)),
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    assert_eq!(app.state.token_usage, usage);
+    assert_eq!(
+        app.state.session.usage_by_model()[MODEL],
+        usage.billed(Some(COST))
+    );
+    assert!(app.live_chat_index.is_empty());
+    assert!(app.chats[chat_idx].is_finished());
+    assert!(app.queue.text_messages().is_empty());
+}
+
+#[test]
 fn progress_after_subagent_closed_does_not_reopen_chat() {
     const LATE_PROGRESS: &str = "late progress";
 
