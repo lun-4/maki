@@ -1148,6 +1148,70 @@ fn cancel_subtree_marks_reserved_descendant_and_preserves_reuse() {
 }
 
 #[test]
+fn root_snapshot_does_not_block_atomic_correlation_cancel_cut() {
+    const COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+    let (manager, root, current, root_gate) = active_root(AgentLimits::default());
+    let root_actor = root.actor().unwrap();
+    let (snapshot_entered, snapshot_release) = root_actor.pause_before_next_snapshot_state();
+    let (snapshot_done_tx, snapshot_done_rx) = flume::bounded(1);
+    let snapshot_manager = manager.clone();
+    let root_id = root.id();
+    let snapshot = std::thread::spawn(move || {
+        let result = snapshot_manager.node(root_id);
+        snapshot_done_tx.send(()).unwrap();
+        result
+    });
+    snapshot_entered.recv().unwrap();
+
+    let (cut_entered_tx, cut_entered_rx) = flume::bounded(1);
+    let (cut_release_tx, cut_release_rx) = flume::bounded(1);
+    manager.set_descendant_cut_gate(cut_entered_tx, cut_release_rx);
+    let (cancel_done_tx, cancel_done_rx) = flume::bounded(1);
+    let cancel_manager = manager.clone();
+    let cancel_actor = root_actor.clone();
+    let cancel = std::thread::spawn(move || {
+        cancel_actor.cancel_correlation_with_active(
+            "root",
+            crate::TurnCancellationReason::User,
+            |turn_id| {
+                cancel_manager
+                    .close_descendants_for_turn(root_id, turn_id)
+                    .unwrap();
+            },
+        );
+        cancel_done_tx.send(()).unwrap();
+    });
+
+    cut_entered_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
+    assert!(matches!(
+        manager.spawn_child(
+            &current,
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            TestBackend::boxed(),
+        ),
+        Err(ManagerError::InactiveTurn { agent_id, turn_id })
+            if agent_id == root.id() && turn_id == current.turn_id()
+    ));
+    cut_release_tx.send(()).unwrap();
+    cancel_done_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
+    snapshot_release.send(()).unwrap();
+    snapshot_done_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap();
+
+    cancel.join().unwrap();
+    let snapshot = snapshot.join().unwrap().unwrap();
+    assert_eq!(snapshot.agent_id, root.id());
+    assert_eq!(snapshot.graph_lifecycle, GraphLifecycle::Live);
+    assert!(snapshot.actor.is_some());
+
+    root_gate.release(1);
+    let report = smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
+    assert!(report.timed_out.is_empty());
+}
+
+#[test]
 fn turn_descendant_cut_rejects_post_cut_spawn_and_preserves_later_turn() {
     smol::block_on(async {
         let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();

@@ -53,6 +53,32 @@ struct Node {
     cancel_on_commit: bool,
 }
 
+struct CapturedNodeSnapshot {
+    agent_id: AgentId,
+    parent_id: Option<AgentId>,
+    root_id: AgentId,
+    depth: usize,
+    children: Vec<AgentId>,
+    graph_lifecycle: GraphLifecycle,
+    actor: Option<AgentActorHandle>,
+    metadata: AgentMetadata,
+}
+
+impl CapturedNodeSnapshot {
+    fn snapshot(self) -> AgentNodeSnapshot {
+        AgentNodeSnapshot {
+            agent_id: self.agent_id,
+            parent_id: self.parent_id,
+            root_id: self.root_id,
+            depth: self.depth,
+            children: self.children,
+            graph_lifecycle: self.graph_lifecycle,
+            actor: self.actor.map(|actor| actor.snapshot()),
+            metadata: self.metadata,
+        }
+    }
+}
+
 #[derive(Default)]
 struct WatcherRegistry {
     tasks: HashMap<u64, smol::Task<()>>,
@@ -723,21 +749,30 @@ impl AgentManagerHandle {
     }
 
     pub fn node(&self, agent_id: AgentId) -> Result<AgentNodeSnapshot, ManagerError> {
-        let graph = self.lock_graph();
-        let node = graph
-            .nodes
-            .get(&agent_id)
-            .ok_or(ManagerError::UnknownAgent(agent_id))?;
-        Ok(Self::snapshot_node(agent_id, node))
+        let node = {
+            let graph = self.lock_graph();
+            let node = graph
+                .nodes
+                .get(&agent_id)
+                .ok_or(ManagerError::UnknownAgent(agent_id))?;
+            Self::capture_node_snapshot(agent_id, node)
+        };
+        Ok(node.snapshot())
     }
 
     pub fn snapshot(&self) -> Vec<AgentNodeSnapshot> {
-        let graph = self.lock_graph();
-        let mut nodes: Vec<_> = graph
-            .nodes
-            .iter()
-            .map(|(&id, node)| Self::snapshot_node(id, node))
-            .collect();
+        let nodes = {
+            let graph = self.lock_graph();
+            graph
+                .nodes
+                .iter()
+                .map(|(&id, node)| Self::capture_node_snapshot(id, node))
+                .collect::<Vec<_>>()
+        };
+        let mut nodes = nodes
+            .into_iter()
+            .map(CapturedNodeSnapshot::snapshot)
+            .collect::<Vec<_>>();
         nodes.sort_by_key(|node| (node.depth, node.agent_id.to_string()));
         nodes
     }
@@ -1044,15 +1079,15 @@ impl AgentManagerHandle {
         result
     }
 
-    fn snapshot_node(agent_id: AgentId, node: &Node) -> AgentNodeSnapshot {
-        AgentNodeSnapshot {
+    fn capture_node_snapshot(agent_id: AgentId, node: &Node) -> CapturedNodeSnapshot {
+        CapturedNodeSnapshot {
             agent_id,
             parent_id: node.parent_id,
             root_id: node.root_id,
             depth: node.depth,
             children: node.children.clone(),
             graph_lifecycle: node.lifecycle,
-            actor: node.actor.as_ref().map(AgentActorHandle::snapshot),
+            actor: node.actor.clone(),
             metadata: node.metadata.clone(),
         }
     }

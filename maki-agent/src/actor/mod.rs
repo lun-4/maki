@@ -68,6 +68,8 @@ pub(crate) struct ActorInner {
     pub(crate) after_pop: Mutex<Option<(flume::Sender<()>, flume::Receiver<()>)>>,
     #[cfg(test)]
     pub(crate) after_finalization_retire: Mutex<Option<(flume::Sender<()>, flume::Receiver<()>)>>,
+    #[cfg(test)]
+    before_snapshot_state: Mutex<Option<(flume::Sender<()>, flume::Receiver<()>)>>,
 }
 
 /// Lifecycle, run status, and the active turn's cancellation wiring. One
@@ -280,6 +282,8 @@ impl AgentActorHandle {
             after_pop: Mutex::new(None),
             #[cfg(test)]
             after_finalization_retire: Mutex::new(None),
+            #[cfg(test)]
+            before_snapshot_state: Mutex::new(None),
         });
         let wake = Arc::new(runner::WakeFlag::new());
         let handle = Self {
@@ -312,6 +316,20 @@ impl AgentActorHandle {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some((popped_tx, release_rx));
         (popped_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_before_next_snapshot_state(
+        &self,
+    ) -> (flume::Receiver<()>, flume::Sender<()>) {
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        *self
+            .inner
+            .before_snapshot_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
     }
 
     #[cfg(test)]
@@ -690,6 +708,17 @@ impl AgentActorHandle {
     }
 
     pub fn snapshot(&self) -> ActorSnapshot {
+        #[cfg(test)]
+        if let Some((entered, release)) = self
+            .inner
+            .before_snapshot_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            entered.send(()).unwrap();
+            release.recv().unwrap();
+        }
         let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let lifecycle = state.lifecycle;
         let status = state.status;
