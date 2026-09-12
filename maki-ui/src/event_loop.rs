@@ -445,20 +445,24 @@ fn collect_heartbeat(
 }
 
 fn release_lock_state(state: Option<SessionLockState>) -> io::Result<()> {
-    release_lock_state_with_timeout(state, AGENT_SHUTDOWN_TIMEOUT)
+    release_lock_state_with_timeout(state, AGENT_SHUTDOWN_TIMEOUT).0
 }
 
 fn release_lock_state_with_timeout(
     state: Option<SessionLockState>,
     timeout: Duration,
-) -> io::Result<()> {
-    let lease = match state {
-        Some(SessionLockState::Held(lease)) => Some(lease),
-        Some(SessionLockState::InFlight(task)) => collect_heartbeat(task, Some(timeout))
-            .and_then(|mut completion| completion.lease.take()),
-        None => None,
+) -> (io::Result<()>, bool) {
+    let (lease, lock_lost) = match state {
+        Some(SessionLockState::Held(lease)) => (Some(lease), false),
+        Some(SessionLockState::InFlight(task)) => {
+            collect_heartbeat(task, Some(timeout)).map_or((None, false), |mut completion| {
+                let lock_lost = matches!(completion.result, Ok(session_lock::LockBeat::Lost));
+                (completion.lease.take(), lock_lost)
+            })
+        }
+        None => (None, false),
     };
-    lease.map_or(Ok(()), ClaimedSessionLock::release)
+    (lease.map_or(Ok(()), ClaimedSessionLock::release), lock_lost)
 }
 
 fn checkpoint_runtime(runtime: &mut SessionRuntime) {
@@ -2435,10 +2439,12 @@ impl<'t> EventLoop<'t> {
                 ..
             } = rt;
             let heartbeat_timeout = heartbeat_deadline.saturating_duration_since(Instant::now());
-            if let Err(error) = release_lock_state_with_timeout(session_lock, heartbeat_timeout) {
+            let (release_result, heartbeat_lock_lost) =
+                release_lock_state_with_timeout(session_lock, heartbeat_timeout);
+            if let Err(error) = release_result {
                 warn!(id = %app.state.session.id, %error, "session lock release failed");
             }
-            if !lock_lost {
+            if !lock_lost && !heartbeat_lock_lost {
                 app.checkpoint_now();
             }
             // `app` drops at the end of this iteration, closing the
@@ -2697,7 +2703,9 @@ mod tests {
 
     impl Drop for RuntimeHarness {
         fn drop(&mut self) {
-            let ctx = self.ctx.take().unwrap();
+            let Some(ctx) = self.ctx.take() else {
+                return;
+            };
             let storage_writer = Arc::clone(&ctx.storage_writer);
             drop(ctx);
             let Ok(storage_writer) = Arc::try_unwrap(storage_writer) else {
@@ -3100,14 +3108,16 @@ mod tests {
         let (cleanup_done_tx, cleanup_done_rx) = flume::bounded(1);
         let cleanup = std::thread::spawn(move || {
             cleanup_started_tx.send(()).unwrap();
-            let result = release_lock_state(state);
+            let result = release_lock_state_with_timeout(state, AGENT_SHUTDOWN_TIMEOUT);
             cleanup_done_tx.send(result).unwrap();
         });
         cleanup_started_rx.recv().unwrap();
         assert!(cleanup_done_rx.try_recv().is_err());
 
         release_tx.send(()).unwrap();
-        cleanup_done_rx.recv().unwrap().unwrap();
+        let (release_result, lock_lost) = cleanup_done_rx.recv().unwrap();
+        release_result.unwrap();
+        assert!(!lock_lost);
         cleanup.join().unwrap();
         assert!(!session_lock::open_elsewhere(
             &harness.ctx().sessions_dir,
@@ -3119,6 +3129,67 @@ mod tests {
             .release()
             .unwrap();
         release_runtime(runtime);
+    }
+
+    #[test]
+    fn shutdown_does_not_checkpoint_after_in_flight_heartbeat_loses_lock() {
+        const BASELINE: &str = "stored before heartbeat";
+        const UNSAVED: &str = "must not reach storage";
+
+        let mut harness = RuntimeHarness::new();
+        let mut session = harness.session();
+        let id = session.id;
+        session.push_message(Message::user(BASELINE.into()));
+        session.save(&harness.ctx().storage).unwrap();
+        let mut runtime = harness.runtime(session);
+        runtime
+            .app
+            .state
+            .session_mut()
+            .push_message(Message::user(UNSAVED.into()));
+        let (internal_tx, _internal_rx) = flume::unbounded();
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (heartbeat_release_tx, heartbeat_release_rx) = flume::bounded(1);
+        start_runtime_heartbeat_with(&mut runtime, &internal_tx, move |lease| {
+            entered_tx.send(()).unwrap();
+            heartbeat_release_rx.recv().unwrap();
+            (lease, Ok(session_lock::LockBeat::Lost))
+        });
+        entered_rx.recv().unwrap();
+
+        let state = runtime.session_lock.take();
+        let (cleanup_done_tx, cleanup_done_rx) = flume::bounded(1);
+        let cleanup = std::thread::spawn(move || {
+            cleanup_done_tx
+                .send(release_lock_state_with_timeout(
+                    state,
+                    AGENT_SHUTDOWN_TIMEOUT,
+                ))
+                .unwrap();
+        });
+        assert!(cleanup_done_rx.try_recv().is_err());
+        heartbeat_release_tx.send(()).unwrap();
+        let (release_result, heartbeat_lock_lost) = cleanup_done_rx.recv().unwrap();
+        release_result.unwrap();
+        cleanup.join().unwrap();
+
+        if !runtime.lock_lost && !heartbeat_lock_lost {
+            runtime.app.checkpoint_now();
+        }
+        let manager = runtime.handles.manager_and_root().0;
+        drop(runtime);
+        shutdown_manager(&manager);
+        let ctx = harness.ctx.take().unwrap();
+        let storage = ctx.storage.clone();
+        let storage_writer = Arc::clone(&ctx.storage_writer);
+        drop(ctx);
+        Arc::try_unwrap(storage_writer)
+            .unwrap_or_else(|_| panic!("test owns storage writer"))
+            .shutdown(RUNTIME_SHUTDOWN_TIMEOUT);
+
+        let stored = AppSession::load(id, &storage).unwrap();
+        assert_eq!(stored.messages().len(), 1);
+        assert_eq!(stored.messages()[0].user_text(), Some(BASELINE));
     }
 
     #[test]

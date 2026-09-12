@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use maki_agent::tools::test_support::stub_ctx;
-use maki_agent::tools::{ToolAudience, ToolContext, ToolRegistry};
+use maki_agent::tools::{DescriptionContext, ToolAudience, ToolContext, ToolFilter, ToolRegistry};
 use maki_agent::{AgentMode, ToolOutput};
 use maki_lua::PluginHost;
 use maki_providers::provider::{BoxFuture, Provider};
@@ -55,6 +55,7 @@ const SCENARIO_INVALID_THEN_VALID: &str = "invalid_then_valid";
 const SCENARIO_NEVER_STRUCTURED: &str = "never_structured";
 const SCENARIO_INVALID_ONLY: &str = "invalid_only";
 const SCENARIO_PROMPT_ERROR: &str = "prompt_error";
+const SCENARIO_NESTED_FAILED: &str = "nested_failed";
 const SCENARIO_PARTIAL_ERROR: &str = "partial_error";
 const SCENARIO_RAISE: &str = "raise";
 const SCENARIO_NO_SUMMARY: &str = "no_summary";
@@ -119,6 +120,13 @@ behaviors.prompt_error = function(sess, msg)
   return nil, "@PROMPT_ERR@"
 end
 
+behaviors.nested_failed = function(sess, msg)
+  if #recorder.prompts == 1 then
+    return { text = "started" }
+  end
+  return nil, "@PROMPT_ERR@"
+end
+
 behaviors.partial_error = function(sess, msg)
   return { text = "@PARTIAL_TEXT@" }, "@CANCELLED_ERR@"
 end
@@ -141,6 +149,7 @@ end
 maki.agent.session = function(ctx, opts)
   recorder.sessions = recorder.sessions + 1
   recorder.has_local_tools = opts.local_tools ~= nil
+  recorder.auto_deliver = opts.auto_deliver
   local sess = { opts = opts }
   function sess:prompt(msg)
     recorder.prompts[#recorder.prompts + 1] = msg
@@ -154,7 +163,8 @@ maki.agent.session = function(ctx, opts)
     return self:prompt(msg)
   end
   function sess:status()
-    return { status = "done", result = sess:prompt(recorder.last or "") }
+    local result, err = sess:prompt(recorder.last or "")
+    return { status = "done", result = result, error = err }
   end
   function sess:session_id()
     return opts.name
@@ -202,6 +212,7 @@ maki.api.register_tool({
       closed = recorder.closed,
       prompt_count = #recorder.prompts,
       has_local_tools = recorder.has_local_tools,
+      auto_deliver = recorder.auto_deliver,
       first_ack = recorder.first_ack,
       first_err = recorder.first_err,
       second_ack = recorder.second_ack,
@@ -648,6 +659,39 @@ fn spawn_returns_task_id_immediately() {
         out.get("task_id").and_then(Value::as_str).is_some(),
         "task_spawn must return a task_id: {out}"
     );
+}
+
+#[test]
+fn nested_spawn_contract_requires_polling_and_keeps_failed_result() {
+    let (reg, _host) = load_task_host();
+    let filter = ToolFilter::All;
+    let description_ctx = DescriptionContext {
+        filter: &filter,
+        audience: ToolAudience::GENERAL_SUB,
+        workflow: false,
+    };
+    let spawn_tool = reg.get("task_spawn").unwrap();
+    let spawn_description = spawn_tool.tool.description(&description_ctx);
+    let get_tool = reg.get("task_get").unwrap();
+    let get_description = get_tool.tool.description(&description_ctx);
+    assert!(spawn_description.contains("Nested general subagents are not delivered automatically"));
+    assert!(spawn_description.contains("must poll task_get"));
+    assert!(get_description.contains("Nested general subagents must use task_get"));
+    assert!(!get_description.contains("Normally unnecessary"));
+
+    let mut ctx = stub_ctx(&AgentMode::Build);
+    ctx.audience = ToolAudience::GENERAL_SUB;
+    let spawned = exec_tool_json_with_ctx(
+        &reg,
+        &ctx,
+        "task_spawn",
+        task_input(SCENARIO_NESTED_FAILED, None),
+    );
+    let task_id = spawned["task_id"].as_str().unwrap();
+    let status = exec_tool_json_with_ctx(&reg, &ctx, "task_get", json!({ "task_id": task_id }));
+    assert_eq!(status["status"], json!("done"));
+    assert_eq!(status["error"], json!(PROMPT_ERR_MSG));
+    assert!(status.get("result").is_none());
 }
 
 #[test]
