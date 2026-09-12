@@ -279,11 +279,7 @@ impl AgentManagerHandle {
         let parent_id = current.agent_id();
         let child_id = AgentId::generate();
         let reservation = {
-            if !Arc::ptr_eq(&self.0, &current.token.manager.0)
-                || current.token.generation != self.0.generation
-            {
-                return Err(ManagerError::WrongManager);
-            }
+            self.validate_manager(current)?;
             let mut graph = self.lock_graph();
             if graph.shutting_down {
                 return Err(ManagerError::GraphShutdown);
@@ -387,12 +383,18 @@ impl AgentManagerHandle {
         )
     }
 
-    fn validate_active(&self, current: &CurrentManagedTurn) -> Result<(), ManagerError> {
-        if !Arc::ptr_eq(&self.0, &current.token.manager.0)
-            || current.token.generation != self.0.generation
+    fn validate_manager(&self, current: &CurrentManagedTurn) -> Result<(), ManagerError> {
+        if Arc::ptr_eq(&self.0, &current.token.manager.0)
+            && current.token.generation == self.0.generation
         {
-            return Err(ManagerError::WrongManager);
+            Ok(())
+        } else {
+            Err(ManagerError::WrongManager)
         }
+    }
+
+    fn validate_active(&self, current: &CurrentManagedTurn) -> Result<(), ManagerError> {
+        self.validate_manager(current)?;
         let graph = self.lock_graph();
         if graph
             .active_turns
@@ -419,11 +421,7 @@ impl AgentManagerHandle {
         current: &CurrentManagedTurn,
         child_id: AgentId,
     ) -> Result<(), ManagerError> {
-        if !Arc::ptr_eq(&self.0, &current.token.manager.0)
-            || current.token.generation != self.0.generation
-        {
-            return Err(ManagerError::WrongManager);
-        }
+        self.validate_manager(current)?;
         let graph = self.lock_graph();
         if graph
             .active_turns
