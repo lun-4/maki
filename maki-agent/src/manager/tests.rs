@@ -1148,6 +1148,72 @@ fn cancel_subtree_marks_reserved_descendant_and_preserves_reuse() {
 }
 
 #[test]
+fn turn_descendant_cut_rejects_post_cut_spawn_and_preserves_later_turn() {
+    smol::block_on(async {
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let (current_tx, current_rx) = flume::unbounded();
+        let root_gate = Gate::new();
+        let root = manager
+            .create_root(
+                Vec::new(),
+                None,
+                TestBackend::reporting(current_tx, Some(Arc::clone(&root_gate))),
+            )
+            .unwrap();
+        let root_actor = root.actor().unwrap();
+        let first = root_actor
+            .admit_turn(input(), None, "first".into())
+            .unwrap();
+        let first_current = current_rx.recv_async().await.unwrap();
+        let (cut_tx, cut_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        manager.set_descendant_cut_gate(cut_tx, release_rx);
+        let cutting = manager.clone();
+        let root_id = root.id();
+        let turn_id = first_current.turn_id();
+        let cut = std::thread::spawn(move || cutting.close_descendants_for_turn(root_id, turn_id));
+
+        cut_rx.recv().unwrap();
+        assert!(matches!(
+            manager.spawn_child(
+                &first_current,
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::boxed(),
+            ),
+            Err(ManagerError::InactiveTurn { agent_id, turn_id: rejected })
+                if agent_id == root.id() && rejected == turn_id
+        ));
+        release_tx.send(()).unwrap();
+        cut.join().unwrap().unwrap();
+        assert!(root.snapshot().unwrap().children.is_empty());
+
+        root_gate.release(1);
+        assert!(matches!(first.wait().await, TurnOutcome::Completed { .. }));
+        let later = root_actor
+            .admit_turn(input(), None, "later".into())
+            .unwrap();
+        let later_current = current_rx.recv_async().await.unwrap();
+        let child = manager
+            .spawn_child(
+                &later_current,
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::boxed(),
+            )
+            .unwrap();
+        assert_eq!(child.snapshot().unwrap().parent_id, Some(root.id()));
+        root_gate.release(1);
+        assert!(matches!(later.wait().await, TurnOutcome::Completed { .. }));
+
+        let report = manager.shutdown(std::time::Duration::from_secs(1)).await;
+        assert!(report.timed_out.is_empty());
+    });
+}
+
+#[test]
 fn close_descendants_rejects_reserved_child_and_preserves_root() {
     let (manager, root, current, root_gate) = active_root(AgentLimits::default());
     let creating = manager.clone();

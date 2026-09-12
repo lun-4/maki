@@ -29,8 +29,14 @@ pub(super) fn spawn_command_router(
         while let Ok(cmd) = cmd_rx.recv_async().await {
             match cmd {
                 AgentCommand::Cancel { run_id } => {
-                    let _ = manager.close_descendants(root_id);
-                    actor.cancel_correlation(&correlation(run_id), TurnCancellationReason::User);
+                    let correlation = correlation(run_id);
+                    actor.cancel_correlation_with_active(
+                        &correlation,
+                        TurnCancellationReason::User,
+                        |turn_id| {
+                            let _ = manager.close_descendants_for_turn(root_id, turn_id);
+                        },
+                    );
                 }
                 AgentCommand::CancelAll => {
                     if let Some(trigger) = init_trigger.take() {

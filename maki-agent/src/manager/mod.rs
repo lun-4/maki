@@ -95,6 +95,8 @@ pub(crate) struct ManagerInner {
     commit_gate: Mutex<Option<TestGate>>,
     #[cfg(test)]
     prompt_admission_gate: Mutex<Option<PromptAdmissionGate>>,
+    #[cfg(test)]
+    descendant_cut_gate: Mutex<Option<TestGate>>,
 }
 
 #[derive(Clone)]
@@ -129,6 +131,8 @@ impl AgentManagerHandle {
             commit_gate: Mutex::new(None),
             #[cfg(test)]
             prompt_admission_gate: Mutex::new(None),
+            #[cfg(test)]
+            descendant_cut_gate: Mutex::new(None),
         })))
     }
 }
@@ -770,6 +774,25 @@ impl AgentManagerHandle {
         Ok(())
     }
 
+    pub fn close_descendants_for_turn(
+        &self,
+        agent_id: AgentId,
+        turn_id: TurnId,
+    ) -> Result<(), ManagerError> {
+        let actors = {
+            let mut graph = self.lock_graph();
+            let actors = Self::capture_subtree_locked(&mut graph, agent_id, false)?;
+            graph.active_turns.remove(&(agent_id, turn_id));
+            actors
+        };
+        #[cfg(test)]
+        self.wait_at_descendant_cut_gate();
+        for actor in actors {
+            actor.close();
+        }
+        Ok(())
+    }
+
     pub async fn shutdown(&self, timeout: Duration) -> ShutdownReport {
         let (ids, actors) = {
             let mut graph = self.lock_graph();
@@ -978,6 +1001,14 @@ impl AgentManagerHandle {
         include_root: bool,
     ) -> Result<Vec<AgentActorHandle>, ManagerError> {
         let mut graph = self.lock_graph();
+        Self::capture_subtree_locked(&mut graph, agent_id, include_root)
+    }
+
+    fn capture_subtree_locked(
+        graph: &mut GraphState,
+        agent_id: AgentId,
+        include_root: bool,
+    ) -> Result<Vec<AgentActorHandle>, ManagerError> {
         let node = graph
             .nodes
             .get(&agent_id)
@@ -985,7 +1016,7 @@ impl AgentManagerHandle {
         if !node.lifecycle.consumes_capacity() {
             return Err(ManagerError::NonLiveAgent(agent_id));
         }
-        let mut ids = Self::subtree_ids(&graph, agent_id);
+        let mut ids = Self::subtree_ids(graph, agent_id);
         if !include_root {
             ids.remove(0);
         }
@@ -1044,6 +1075,20 @@ impl AgentManagerHandle {
     #[cfg(test)]
     fn wait_at_commit_gate(&self) {
         self.wait_at_test_gate(&self.0.commit_gate);
+    }
+
+    #[cfg(test)]
+    fn set_descendant_cut_gate(&self, entered: flume::Sender<()>, release: flume::Receiver<()>) {
+        *self
+            .0
+            .descendant_cut_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(TestGate { entered, release });
+    }
+
+    #[cfg(test)]
+    fn wait_at_descendant_cut_gate(&self) {
+        self.wait_at_test_gate(&self.0.descendant_cut_gate);
     }
 
     #[cfg(test)]
