@@ -179,12 +179,7 @@ fn open_existing_locked(path: &Path) -> io::Result<Option<File>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    if let Err(error) = file.try_lock_exclusive() {
-        if error.kind() == io::ErrorKind::WouldBlock {
-            return Ok(None);
-        }
-        return Err(error);
-    }
+    file.try_lock_exclusive()?;
     Ok(Some(file))
 }
 
@@ -462,6 +457,23 @@ mod tests {
         assert!(!open_elsewhere(dir.path(), &id));
         assert!(lock_path(dir.path(), &id).exists());
         assert_eq!(holder_pid(&lock_path(dir.path(), &id)), Some(FAKE_PID));
+    }
+
+    #[test]
+    fn heartbeat_contention_does_not_report_ownership_loss() {
+        let dir = tempdir().unwrap();
+        let id = MakiId::generate();
+        let path = lock_path(dir.path(), &id);
+        let mut lease = claim(dir.path(), &id).unwrap().unwrap();
+        let blocker = File::options().read(true).write(true).open(path).unwrap();
+        blocker.lock_exclusive().unwrap();
+
+        assert_eq!(
+            lease.heartbeat().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        blocker.unlock().unwrap();
+        assert_eq!(lease.heartbeat().unwrap(), LockBeat::Held);
     }
 
     #[test]

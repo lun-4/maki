@@ -885,6 +885,7 @@ impl AgentManagerHandle {
 
 struct LeaseState {
     permit: Option<SemaphoreGuardArc>,
+    owns_permit: bool,
     suspensions: usize,
     closing: bool,
     wake: Option<std::task::Waker>,
@@ -916,6 +917,7 @@ impl LeaseInner {
         state.suspensions += 1;
         if state.suspensions == 1 {
             state.permit.take();
+            state.owns_permit = false;
         }
         if let Some(wake) = state.wake.take() {
             wake.wake();
@@ -953,6 +955,7 @@ impl LeaseInner {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             state.closing = true;
             state.permit.take();
+            state.owns_permit = false;
             if let Some(wake) = state.wake.take() {
                 wake.wake();
             }
@@ -971,7 +974,7 @@ impl LeaseInner {
             let listener = self.owned.listen();
             let ready = {
                 let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-                state.closing || (state.suspensions == 0 && state.permit.is_some())
+                state.closing || (state.suspensions == 0 && state.owns_permit)
             };
             if ready {
                 return;
@@ -1149,10 +1152,16 @@ impl Future for ManagedExecutionFuture<'_> {
                     .state
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
-                if result.is_pending() && state.suspensions == 0 && !state.closing {
+                let restored_ownership =
+                    result.is_pending() && state.suspensions == 0 && !state.closing;
+                if restored_ownership {
                     state.permit = Some(permit);
+                    state.owns_permit = true;
                 }
                 drop(state);
+                if restored_ownership {
+                    self.lease.owned.notify(usize::MAX);
+                }
                 if result.is_ready() {
                     self.guard.take();
                 }
@@ -1180,6 +1189,7 @@ impl Future for ManagedExecutionFuture<'_> {
                 .unwrap_or_else(|error| error.into_inner());
             if state.suspensions == 0 && !state.closing {
                 state.permit = Some(permit);
+                state.owns_permit = true;
                 self.lease.owned.notify(usize::MAX);
             }
         }
@@ -1249,6 +1259,7 @@ pub(crate) async fn enter_managed_turn(
         limiter: Arc::clone(&inner.limiter),
         state: Mutex::new(LeaseState {
             permit: Some(permit),
+            owns_permit: true,
             suspensions: 0,
             closing: false,
             wake: None,

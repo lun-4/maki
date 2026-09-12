@@ -206,6 +206,21 @@ impl Future for SuspendDuringPollFuture {
     }
 }
 
+struct BlockingPendingFuture {
+    entered: flume::Sender<()>,
+    release: flume::Receiver<()>,
+}
+
+impl Future for BlockingPendingFuture {
+    type Output = BackendResult;
+
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        self.entered.send(()).unwrap();
+        self.release.recv().unwrap();
+        Poll::Pending
+    }
+}
+
 impl ActorBackend for SuspendDuringPollBackend {
     fn run_turn<'a>(
         &'a mut self,
@@ -409,6 +424,49 @@ fn backend_poll_holds_physical_permit_while_suspension_races() {
         ));
         let permit = manager.0.limiter.acquire_arc().await;
         drop(permit);
+        let report = manager.shutdown(std::time::Duration::from_secs(1)).await;
+        assert!(report.timed_out.is_empty());
+    });
+}
+
+#[test]
+fn completed_waiter_observes_ownership_during_backend_poll() {
+    smol::block_on(async {
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let root = manager
+            .create_root(Vec::new(), None, TestBackend::boxed())
+            .unwrap();
+        let turn_id = crate::TurnId::generate();
+        let (_cancel, token) = crate::ReasonedCancelToken::new();
+        let (guard, current) =
+            super::enter_managed_turn(&Arc::downgrade(&manager.0), root.id(), turn_id, &token)
+                .await
+                .unwrap();
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let mut execution = Box::pin(super::manage_execution(
+            Box::pin(BlockingPendingFuture {
+                entered: entered_tx,
+                release: release_rx,
+            }),
+            guard,
+            Arc::clone(&current.lease.inner),
+            token,
+        ));
+        let poll_task =
+            smol::spawn(async move { futures_lite::future::poll_once(&mut execution).await });
+        entered_rx.recv_async().await.unwrap();
+        let (wait_cancel, _) = crate::ReasonedCancelToken::new();
+        current.lease.inner.suspend(u64::MAX, wait_cancel).unwrap();
+        current.lease.inner.retire(u64::MAX);
+
+        let mut owned = Box::pin(current.lease.inner.wait_until_owned());
+        assert!(futures_lite::future::poll_once(&mut owned).await.is_none());
+        release_tx.send(()).unwrap();
+        assert!(poll_task.await.is_none());
+        owned.await;
+
+        root.actor().unwrap().shutdown();
         let report = manager.shutdown(std::time::Duration::from_secs(1)).await;
         assert!(report.timed_out.is_empty());
     });
