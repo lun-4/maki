@@ -1786,6 +1786,15 @@ impl App {
 
         if let Some(subagent) = &envelope.subagent {
             if self.terminal_subagents.contains(&subagent.agent_id) {
+                if let AgentEvent::SubagentHistory {
+                    tool_use_id,
+                    messages,
+                } = envelope.event
+                {
+                    self.state
+                        .session_mut()
+                        .set_subagent_messages(tool_use_id, messages);
+                }
                 return vec![];
             }
             if matches!(&envelope.event, AgentEvent::SubagentClosed) {

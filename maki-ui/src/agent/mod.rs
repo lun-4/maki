@@ -558,6 +558,8 @@ fn spawn_agent_internal(
     spawn_command_router(
         cmd_rx,
         Arc::clone(&actor),
+        manager.clone(),
+        root_id,
         Arc::clone(&subagent_cancels),
         init_trigger,
     );

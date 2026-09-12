@@ -7694,6 +7694,55 @@ fn subagent_closed_marks_despawned_and_rejects_input() {
 }
 
 #[test]
+fn final_history_after_subagent_closed_only_persists_messages() {
+    const FINAL_REPLY: &str = "final reply";
+
+    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let chat_idx = app.active_chat;
+    let chat_count = app.chats.len();
+    let agent_id = app.chats[chat_idx].agent_id.unwrap();
+    let info = subagent_info_for_agent(
+        agent_id,
+        TASK_ID,
+        "research",
+        None,
+        app.subagent_channels[&agent_id].input_tx.clone(),
+    );
+    let messages = vec![Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text {
+            text: FINAL_REPLY.into(),
+        }],
+        ..Default::default()
+    }];
+    app.chats[chat_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentClosed,
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentHistory {
+            tool_use_id: TASK_ID.into(),
+            messages: messages.clone(),
+        },
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    assert_eq!(
+        serde_json::to_value(app.state.session.subagent_messages()[TASK_ID].as_ref()).unwrap(),
+        serde_json::to_value(&messages).unwrap()
+    );
+    assert_eq!(app.chats.len(), chat_count);
+    assert_eq!(app.live_chat_index.get(&agent_id), Some(&chat_idx));
+    assert!(app.chats[chat_idx].is_finished());
+    assert!(app.active_subagent_closed());
+    assert!(app.queue.text_messages().is_empty());
+}
+
+#[test]
 fn progress_after_subagent_closed_does_not_reopen_chat() {
     const LATE_PROGRESS: &str = "late progress";
 
