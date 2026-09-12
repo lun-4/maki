@@ -199,26 +199,38 @@ impl LuaActorState {
         };
     }
 
-    fn notify_closed(&self) {
-        if !self.silent
-            && let Some(subagent) = self.subagent_info.get()
-            && !self
+    fn take_close_notification(&self) -> Option<Envelope> {
+        let subagent = self.subagent_info.get()?;
+        if self.silent
+            || self
                 .close_notified
                 .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
-            let _ = self.parent_event_tx.send_envelope(Envelope {
-                event: AgentEvent::SubagentClosed,
-                subagent: Some(subagent.clone()),
-                run_id: self.parent_event_tx.run_id(),
-            });
+            return None;
+        }
+        Some(Envelope {
+            event: AgentEvent::SubagentClosed,
+            subagent: Some(subagent.clone()),
+            run_id: self.parent_event_tx.run_id(),
+        })
+    }
+
+    fn notify_closed_direct(&self) {
+        if let Some(envelope) = self.take_close_notification() {
+            let _ = self.parent_event_tx.send_envelope(envelope);
         }
     }
 
-    /// Idempotent close: retire the actor, resolving queued/parked waiters as
-    /// Closed and rejecting later work. An executing backend relays its own
-    /// transcript when it settles; close never races it with a stale fallback.
+    fn notify_closed_ordered(&self) {
+        if let Some(envelope) = self.take_close_notification() {
+            let _ = self.chip_event_tx.send_envelope(envelope);
+        }
+    }
+
+    /// Idempotent cancellation close: notify the UI immediately, retire the
+    /// actor, and resolve queued/parked waiters as Closed.
     fn close_with(&self, actor: &AgentActorHandle) {
-        self.notify_closed();
+        self.notify_closed_direct();
         actor.close();
         if !self
             .execution_started
@@ -249,7 +261,7 @@ impl LuaActorBackend {
 
 impl Drop for LuaActorBackend {
     fn drop(&mut self) {
-        self.state.notify_closed();
+        self.state.notify_closed_direct();
     }
 }
 
@@ -440,7 +452,11 @@ async fn relay_session_events(
     subagent_info: Arc<OnceLock<SubagentInfo>>,
     live_sink: Option<flume::Sender<ToolLive>>,
     silent: bool,
+    relay_gate: Option<flume::Receiver<()>>,
 ) {
+    if let Some(gate) = relay_gate {
+        let _ = gate.recv_async().await;
+    }
     let mut cost = None;
     while let Ok(mut envelope) = sub_rx.recv_async().await {
         if silent {
@@ -987,6 +1003,7 @@ async fn session(
         Arc::clone(&subagent_info),
         agent_ctx.live_sink.clone(),
         silent,
+        None,
     ))
     .detach();
 
@@ -1141,6 +1158,7 @@ async fn session(
             SessionControl::Unmanaged { .. } => None,
         };
         let child_cancel = state.child_cancel.clone();
+        let close_state = Arc::clone(&state);
         smol::spawn(async move {
             select(
                 Box::pin(async move { child_cancel.cancelled().await }),
@@ -1149,6 +1167,7 @@ async fn session(
                 }),
             )
             .await;
+            close_state.notify_closed_direct();
             if let Some(agent) = managed_agent {
                 let _ = agent.close_subtree();
             } else {
@@ -1317,7 +1336,7 @@ struct LuaSession {
 
 impl LuaSession {
     fn close_controlled(&self) {
-        self.state.notify_closed();
+        self.state.notify_closed_ordered();
         let _ = self.relay_stop_tx.try_send(());
         match &self.control {
             SessionControl::Managed { agent, .. } => {
@@ -1911,7 +1930,7 @@ mod tests {
         LuaSession,
         flume::Receiver<Envelope>,
     ) {
-        session_with_provider(Arc::new(HangingProvider), semaphore)
+        session_with_provider(Arc::new(HangingProvider), semaphore, None)
     }
 
     /// A provider whose turns answer with one canned reply.
@@ -1955,6 +1974,7 @@ mod tests {
     fn session_with_provider(
         provider: Arc<dyn Provider>,
         semaphore: Option<Arc<async_lock::Semaphore>>,
+        relay_gate: Option<flume::Receiver<()>>,
     ) -> (
         Arc<AgentActorHandle>,
         Arc<LuaActorState>,
@@ -1962,6 +1982,13 @@ mod tests {
         flume::Receiver<Envelope>,
     ) {
         let (parent_raw_tx, parent_rx) = flume::unbounded();
+        let (chip_raw_tx, relay) = match relay_gate {
+            Some(gate) => {
+                let (sub_tx, sub_rx) = flume::unbounded();
+                (sub_tx, Some((sub_rx, gate)))
+            }
+            None => (parent_raw_tx.clone(), None),
+        };
         let (answer_tx, answer_rx) = flume::unbounded();
         let (input_tx, _input_rx) = flume::unbounded::<String>();
         let (relay_stop_tx, _relay_stop_rx) = flume::bounded::<()>(1);
@@ -2001,12 +2028,12 @@ mod tests {
             thinking: ThinkingConfig::Off,
             fast: false,
             mcp: None,
-            chip_event_tx: EventSender::new(parent_raw_tx.clone(), RUN_ID),
+            chip_event_tx: EventSender::new(chip_raw_tx, RUN_ID),
             child_cancel,
             answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
             answer_tx: Some(answer_tx),
             ui_id: ui_id.clone(),
-            parent_event_tx: EventSender::new(parent_raw_tx, RUN_ID),
+            parent_event_tx: EventSender::new(parent_raw_tx.clone(), RUN_ID),
             input_tx,
             cancel: SubagentCancel::new(|| {}),
             parent_agent_id: None,
@@ -2025,6 +2052,17 @@ mod tests {
             relay_snapshot: Mutex::new(Vec::new()),
             presentation: Mutex::new(HashMap::new()),
         });
+        if let Some((sub_rx, gate)) = relay {
+            smol::spawn(relay_session_events(
+                sub_rx,
+                EventSender::new(parent_raw_tx.clone(), RUN_ID),
+                Arc::clone(&state.subagent_info),
+                None,
+                false,
+                Some(gate),
+            ))
+            .detach();
+        }
         let (actor, task) = AgentActorHandle::spawn(
             agent_id,
             Vec::new(),
@@ -2174,7 +2212,7 @@ mod tests {
         let provider: Arc<dyn Provider> = Arc::new(StreamOnceProvider::new_replies(vec![
             canned_reply_with_usage("done", FIRST_USAGE),
         ]));
-        let (actor, state, sess, parent_rx) = session_with_provider(provider, None);
+        let (actor, state, sess, parent_rx) = session_with_provider(provider, None, None);
         let ticket = admit(&state, &actor, "run me");
         assert!(matches!(
             smol::block_on(ticket.wait()),
@@ -2194,6 +2232,98 @@ mod tests {
             1,
             "close notification must be emitted once"
         );
+    }
+
+    #[test]
+    fn normal_close_follows_completed_child_events_through_relay() {
+        const REPLY: &str = "ordered reply";
+
+        smol::block_on(async {
+            let (release_tx, release_rx) = flume::bounded(1);
+            let provider: Arc<dyn Provider> = Arc::new(StreamOnceProvider::new_replies(vec![
+                canned_reply_with_usage(REPLY, FIRST_USAGE),
+            ]));
+            let (actor, state, sess, parent_rx) =
+                session_with_provider(provider, None, Some(release_rx));
+            let ticket = admit(&state, &actor, "run me");
+
+            assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+            let before_close = parent_rx.drain().collect::<Vec<_>>();
+            assert!(
+                before_close
+                    .iter()
+                    .all(|envelope| matches!(envelope.event, AgentEvent::SubagentHistory { .. }))
+            );
+
+            sess.close_controlled();
+            sess.close_controlled();
+            assert!(matches!(actor.snapshot().lifecycle, ActorLifecycle::Closed));
+            assert!(
+                actor
+                    .admit_turn(
+                        AgentInput {
+                            message: "rejected".into(),
+                            mode: AgentMode::Build,
+                            images: Vec::new(),
+                            preamble: Vec::new(),
+                            thinking: state.thinking,
+                            fast: state.fast,
+                            workflow: false,
+                            prompt: None,
+                        },
+                        None,
+                        String::new(),
+                    )
+                    .is_err()
+            );
+            assert!(
+                parent_rx.is_empty(),
+                "normal close must not bypass the relay"
+            );
+
+            release_tx.send(()).unwrap();
+            let mut forwarded = Vec::new();
+            loop {
+                let envelope = parent_rx.recv_async().await.unwrap();
+                let closed = matches!(envelope.event, AgentEvent::SubagentClosed);
+                forwarded.push(envelope);
+                if closed {
+                    break;
+                }
+            }
+
+            let text = forwarded.iter().find_map(|envelope| match &envelope.event {
+                AgentEvent::TextDelta { text } => Some(text.as_str()),
+                AgentEvent::TurnComplete(turn) => turn.message.content.iter().find_map(|block| {
+                    if let ContentBlock::Text { text } = block {
+                        Some(text.as_str())
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            });
+            assert_eq!(text, Some(REPLY));
+            assert!(forwarded.iter().any(|envelope| matches!(
+                envelope.event,
+                AgentEvent::TurnOutcome(TurnOutcome::Completed { .. })
+            )));
+            assert!(matches!(
+                forwarded.last().map(|envelope| &envelope.event),
+                Some(AgentEvent::SubagentClosed)
+            ));
+            assert_eq!(
+                forwarded
+                    .iter()
+                    .filter(|envelope| matches!(envelope.event, AgentEvent::SubagentClosed))
+                    .count(),
+                1
+            );
+
+            drop(sess);
+            smol::future::yield_now().await;
+            assert!(parent_rx.is_empty(), "drop must not publish a second close");
+        });
     }
 
     #[test]
@@ -2227,7 +2357,7 @@ mod tests {
             canned_reply_with_usage("the answer", FIRST_USAGE),
             canned_reply_with_usage("the follow-up", SECOND_USAGE),
         ]));
-        let (actor, state, sess, parent_rx) = session_with_provider(provider, None);
+        let (actor, state, sess, parent_rx) = session_with_provider(provider, None, None);
         let first = admit(&state, &actor, "run me");
         let first_id = first.turn_id();
         let first_outcome = smol::block_on(first.wait());
@@ -2273,7 +2403,7 @@ mod tests {
     fn failed_turn_keeps_session_open_for_later_turn() {
         let fail = Arc::new(FailOnceProvider::default());
         let provider: Arc<dyn Provider> = fail.clone();
-        let (actor, state, sess, parent_rx) = session_with_provider(provider, None);
+        let (actor, state, sess, parent_rx) = session_with_provider(provider, None, None);
 
         let ticket = admit(&state, &actor, "fail this turn");
         let turn_id = ticket.turn_id();
@@ -2439,6 +2569,7 @@ mod tests {
             subagent_info,
             Some(live_tx),
             false,
+            None,
         ));
 
         let live = live_rx
@@ -2520,6 +2651,7 @@ mod tests {
             parent_info,
             None,
             false,
+            None,
         ));
 
         let forwarded = parent_rx.recv().unwrap();
