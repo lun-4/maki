@@ -1148,6 +1148,49 @@ fn cancel_subtree_marks_reserved_descendant_and_preserves_reuse() {
 }
 
 #[test]
+fn close_descendants_rejects_reserved_child_and_preserves_root() {
+    let (manager, root, current, root_gate) = active_root(AgentLimits::default());
+    let creating = manager.clone();
+    let child_current = current.clone();
+    let (reserved_tx, reserved_rx) = flume::bounded(1);
+    let (release_tx, release_rx) = flume::bounded(1);
+    let factory = std::thread::spawn(move || {
+        creating.spawn_child_with(
+            &child_current,
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            |agent_id| {
+                reserved_tx.send(agent_id).unwrap();
+                release_rx.recv().unwrap();
+                Ok::<_, String>(TestBackend::boxed())
+            },
+        )
+    });
+    let child_id = reserved_rx.recv().unwrap();
+
+    manager.close_descendants(root.id()).unwrap();
+    assert_eq!(
+        manager.node(root.id()).unwrap().graph_lifecycle,
+        GraphLifecycle::Live
+    );
+    assert_eq!(
+        manager.node(child_id).unwrap().graph_lifecycle,
+        GraphLifecycle::Closing
+    );
+    release_tx.send(()).unwrap();
+    assert!(matches!(
+        factory.join().unwrap(),
+        Err(ManagerError::NonLiveAgent(id)) if id == child_id
+    ));
+    assert!(root.actor().is_ok());
+
+    root_gate.release(1);
+    let report = smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
+    assert!(report.timed_out.is_empty());
+}
+
+#[test]
 fn reserved_cancellation_precedes_live_publication() {
     let (manager, root, current, root_gate) = active_root(AgentLimits::default());
     let creating = manager.clone();

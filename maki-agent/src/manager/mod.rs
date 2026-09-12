@@ -762,6 +762,14 @@ impl AgentManagerHandle {
         Ok(())
     }
 
+    pub fn close_descendants(&self, agent_id: AgentId) -> Result<(), ManagerError> {
+        let actors = self.capture_subtree(agent_id, false)?;
+        for actor in actors {
+            actor.close();
+        }
+        Ok(())
+    }
+
     pub async fn shutdown(&self, timeout: Duration) -> ShutdownReport {
         let (ids, actors) = {
             let mut graph = self.lock_graph();
@@ -967,7 +975,7 @@ impl AgentManagerHandle {
     fn capture_subtree(
         &self,
         agent_id: AgentId,
-        close: bool,
+        include_root: bool,
     ) -> Result<Vec<AgentActorHandle>, ManagerError> {
         let mut graph = self.lock_graph();
         let node = graph
@@ -977,15 +985,16 @@ impl AgentManagerHandle {
         if !node.lifecycle.consumes_capacity() {
             return Err(ManagerError::NonLiveAgent(agent_id));
         }
-        let ids = Self::subtree_ids(&graph, agent_id);
-        if close {
-            for id in &ids {
-                if let Some(node) = graph.nodes.get_mut(id) {
-                    node.lifecycle = GraphLifecycle::Closing;
-                }
-            }
-            graph.revision += 1;
+        let mut ids = Self::subtree_ids(&graph, agent_id);
+        if !include_root {
+            ids.remove(0);
         }
+        for id in &ids {
+            if let Some(node) = graph.nodes.get_mut(id) {
+                node.lifecycle = GraphLifecycle::Closing;
+            }
+        }
+        graph.revision += u64::from(!ids.is_empty());
         Ok(ids
             .into_iter()
             .filter_map(|id| graph.nodes.get(&id)?.actor.clone())
