@@ -59,7 +59,8 @@ use crate::agent::{
 };
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{
-    App, Msg, Notification, PreparedApp, QueuedMessage, SubmitOutcome, turn_response,
+    App, Msg, Notification, PreparedApp, QueuedMessage, SubmitOutcome, session_has_content,
+    turn_response,
 };
 use crate::color_compat;
 use crate::command_runtime::{CommandEvent, CommandRuntime};
@@ -650,12 +651,38 @@ impl SpawnCtx {
         self.prepare_runtime_with_provider(session, None)
     }
 
+    fn prepare_replacement_runtime(
+        &self,
+        session: AppSession,
+    ) -> Result<PreparedSessionRuntime, String> {
+        let provider = self.prepare_replacement_provider(&session)?;
+        Ok(self.prepare_runtime_with_provider(session, provider))
+    }
+
+    fn prepare_replacement_provider(
+        &self,
+        session: &AppSession,
+    ) -> Result<Option<PreparedProvider>, String> {
+        let model_spec = &session.model;
+        if model_spec == &self.model_slot.load().model.spec()
+            || !self.model_policy.allows(model_spec)
+        {
+            return Ok(None);
+        }
+        let mut model = Model::from_spec(model_spec).map_err(|error| error.to_string())?;
+        let provider = from_model(&mut model, self.timeouts).map_err(|error| error.to_string())?;
+        Ok(Some(PreparedProvider {
+            model,
+            provider: Arc::from(provider),
+        }))
+    }
+
     fn prepare_runtime_with_provider(
         &self,
         session: AppSession,
         provider: Option<PreparedProvider>,
     ) -> PreparedSessionRuntime {
-        let resumed = !session.messages().is_empty();
+        let resumed = session_has_content(&session);
         let model = provider
             .as_ref()
             .map(|provider| &provider.model)
@@ -2009,31 +2036,12 @@ impl<'t> EventLoop<'t> {
         idx
     }
 
-    fn prepare_replacement_provider(
-        &self,
-        session: &AppSession,
-    ) -> Result<Option<PreparedProvider>, String> {
-        let model_spec = &session.model;
-        if model_spec == &self.ctx.model_slot.load().model.spec()
-            || !self.ctx.model_policy.allows(model_spec)
-        {
-            return Ok(None);
-        }
-        let mut model = Model::from_spec(model_spec).map_err(|error| error.to_string())?;
-        let provider =
-            from_model(&mut model, self.ctx.timeouts).map_err(|error| error.to_string())?;
-        Ok(Some(PreparedProvider {
-            model,
-            provider: Arc::from(provider),
-        }))
-    }
-
     fn replace_runtime(&mut self, idx: usize, session: AppSession) -> Result<(), String> {
         if self.sessions[idx].lock_lost {
             return Err(LOCK_LOST_REPLACEMENT_ERR.into());
         }
         self.sessions[idx].app.checkpoint_now();
-        let prepared = self.ctx.prepare_runtime(session);
+        let prepared = self.ctx.prepare_replacement_runtime(session)?;
         self.replace_prepared_runtime(idx, prepared)
     }
 
@@ -2241,16 +2249,13 @@ impl<'t> EventLoop<'t> {
             }
             Action::ReplaceSession(request) => {
                 let request = *request;
-                let provider = match self.prepare_replacement_provider(&request.session) {
-                    Ok(provider) => provider,
+                let prepared = match self.ctx.prepare_replacement_runtime(request.session) {
+                    Ok(prepared) => prepared,
                     Err(error) => {
                         self.sessions[idx].app.flash(error);
                         return;
                     }
                 };
-                let prepared = self
-                    .ctx
-                    .prepare_runtime_with_provider(request.session, provider);
                 match self.replace_prepared_runtime(idx, prepared) {
                     Ok(()) => {
                         if let crate::components::SessionReplacementKind::Reset { ended_id } =
@@ -2792,6 +2797,87 @@ mod tests {
     }
 
     #[test]
+    fn empty_history_replacement_restores_and_checkpoints_draft() {
+        const DRAFT: &str = "first prompt";
+
+        let harness = RuntimeHarness::new();
+        let mut session = harness.session();
+        session.meta.input_draft = Some(DRAFT.into());
+        let prepared = harness.ctx().prepare_runtime(session);
+        let mut runtime = prepared.activate(&harness.ctx().model_slot, None);
+
+        assert!(runtime.restore_pending);
+        runtime.activate_deferred();
+        assert_eq!(runtime.app.input_box.buffer.value(), DRAFT);
+
+        runtime.app.checkpoint_now();
+        assert_eq!(
+            runtime.app.state.session.meta.input_draft.as_deref(),
+            Some(DRAFT)
+        );
+
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn replacement_preparation_installs_the_session_provider_on_activation() {
+        const REPLACEMENT_MODEL: &str = "synthetic/hf:test-model";
+
+        let harness = RuntimeHarness::new();
+        let previous_provider = harness.ctx().model_slot.load().provider.identity();
+        let mut session = harness.session();
+        session.model = REPLACEMENT_MODEL.into();
+        let provider = PreparedProvider {
+            model: Model::from_spec(REPLACEMENT_MODEL).unwrap(),
+            provider: Arc::new(StubProvider),
+        };
+        let prepared = harness
+            .ctx()
+            .prepare_runtime_with_provider(session, Some(provider));
+        let runtime = prepared.activate(&harness.ctx().model_slot, None);
+        let installed = harness.ctx().model_slot.load();
+
+        assert_eq!(runtime.app.state.model.spec(), REPLACEMENT_MODEL);
+        assert_eq!(installed.model.spec(), REPLACEMENT_MODEL);
+        assert_ne!(installed.provider.identity(), previous_provider);
+
+        drop(installed);
+        release_runtime(runtime);
+    }
+
+    #[test]
+    fn failed_replacement_provider_preparation_preserves_current_runtime() {
+        const INVALID_MODEL: &str = "unsupported-provider/test-model";
+
+        let harness = RuntimeHarness::new();
+        let mut runtime = harness.runtime(harness.session());
+        let current_id = runtime.id();
+        let current_target = runtime.app.command_target.id();
+        let (current_manager, current_root) = runtime.handles.manager_and_root();
+        let current_provider = harness.ctx().model_slot.load().provider.identity();
+        let mut session = harness.session();
+        session.model = INVALID_MODEL.into();
+
+        runtime.app.checkpoint_now();
+        assert!(harness.ctx().prepare_replacement_runtime(session).is_err());
+
+        assert_eq!(runtime.id(), current_id);
+        assert_eq!(runtime.app.command_target.id(), current_target);
+        assert_eq!(
+            runtime.handles.manager_and_root().0.generation(),
+            current_manager.generation()
+        );
+        assert_eq!(runtime.handles.manager_and_root().1, current_root);
+        assert!(runtime.session_lock.is_some());
+        assert_eq!(
+            harness.ctx().model_slot.load().provider.identity(),
+            current_provider
+        );
+
+        release_runtime(runtime);
+    }
+
+    #[test]
     fn one_manager_per_runtime() {
         let harness = RuntimeHarness::new();
         let first = harness.prepare();
@@ -3160,7 +3246,7 @@ mod tests {
         let target = harness.session();
         let target_id = target.id;
         let target_path = session_lock::lock_path(&harness.ctx().sessions_dir, &target_id);
-        std::fs::write(&target_path, "4294967294 foreign-owner").unwrap();
+        std::fs::write(&target_path, "4294967294").unwrap();
         let prepared = harness.ctx().prepare_runtime(target);
         let (_, _, candidate_manager, _) = prepared.snapshot();
 
@@ -3191,10 +3277,7 @@ mod tests {
         );
         assert_eq!(harness.target_count(), old_target_count);
         assert_eq!(std::fs::read(&old_lock_path).unwrap(), old_owner);
-        assert_eq!(
-            std::fs::read_to_string(&target_path).unwrap(),
-            "4294967294 foreign-owner"
-        );
+        assert_eq!(std::fs::read_to_string(&target_path).unwrap(), "4294967294");
         shutdown_manager(&candidate_manager);
         std::fs::remove_file(target_path).unwrap();
         release_runtime(runtime);

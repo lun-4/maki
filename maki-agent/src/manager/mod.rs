@@ -430,8 +430,8 @@ impl AgentManagerHandle {
             {
                 let _ = AgentManagerHandle(manager).close_subtree(child_id);
             }
-            watcher_wait.complete(outcome);
             drop(suspension);
+            watcher_wait.complete(outcome);
             watcher_wait.mark_reapable();
         });
         let task = {
@@ -557,7 +557,7 @@ impl AgentManagerHandle {
             .nodes
             .get(&agent_id)
             .ok_or(ManagerError::UnknownAgent(agent_id))?;
-        Ok(node.task.as_ref().is_none_or(smol::Task::is_finished))
+        Ok(!node.reservation_pending && node.task.as_ref().is_none_or(smol::Task::is_finished))
     }
 
     pub fn actor(&self, agent_id: AgentId) -> Result<AgentActorHandle, ManagerError> {
@@ -1100,7 +1100,7 @@ pub(crate) struct ManagedExecutionFuture<'a> {
     guard: Option<ManagedTurnGuard>,
     lease: Arc<LeaseInner>,
     acquire: Option<Pin<Box<dyn Future<Output = SemaphoreGuardArc> + Send + 'static>>>,
-    cancel: crate::ReasonedCancelToken,
+    cancellation: Pin<Box<dyn Future<Output = crate::TurnCancellationReason> + Send + 'static>>,
     cancellation_observed: bool,
 }
 
@@ -1109,7 +1109,9 @@ impl Future for ManagedExecutionFuture<'_> {
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
-            if !self.cancellation_observed && self.cancel.is_cancelled() {
+            let cancellation_ready =
+                !self.cancellation_observed && self.cancellation.as_mut().poll(context).is_ready();
+            if cancellation_ready {
                 self.cancellation_observed = true;
                 self.lease.cancel_waiters();
                 if let Some(manager) = self
@@ -1209,12 +1211,13 @@ pub(crate) fn manage_execution<'a>(
     lease: Arc<LeaseInner>,
     cancel: crate::ReasonedCancelToken,
 ) -> ManagedExecutionFuture<'a> {
+    let cancellation = Box::pin(async move { cancel.cancelled().await });
     ManagedExecutionFuture {
         backend,
         guard: Some(guard),
         lease,
         acquire: None,
-        cancel,
+        cancellation,
         cancellation_observed: false,
     }
 }

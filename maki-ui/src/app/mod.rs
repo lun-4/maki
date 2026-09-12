@@ -1819,14 +1819,19 @@ impl App {
                 }
                 maki_agent::TurnOutcome::Failed { failure, .. } => {
                     self.chats[chat_idx].mark_failed(&failure.user_message);
-                    let text = format!(
-                        "{SUBAGENT_REPLY_HEADER}{tool_use_id}{SUBAGENT_REPLY_SUFFIX}failed: {}",
-                        truncate_snippet(&failure.user_message)
-                    );
-                    self.queue_and_notify(QueuedMessage {
-                        text,
-                        images: Vec::new(),
-                    });
+                    if subagent.auto_deliver
+                        && subagent.parent_is_root
+                        && subagent.input_tx.is_some()
+                    {
+                        let text = format!(
+                            "{SUBAGENT_REPLY_HEADER}{tool_use_id}{SUBAGENT_REPLY_SUFFIX}failed: {}",
+                            truncate_snippet(&failure.user_message)
+                        );
+                        self.queue_and_notify(QueuedMessage {
+                            text,
+                            images: Vec::new(),
+                        });
+                    }
                 }
             }
             self.sync_task_picker();

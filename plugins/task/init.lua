@@ -39,6 +39,8 @@ local NUDGE_SUMMARY =
 local INVALID_INPUT_PREFIX =
   "Input does not match the required schema. Fix the errors and call structured_output again:\n"
 local UNKNOWN_TASK_ERR = "unknown task_id"
+local TASK_ACCESS_ERR = "task is owned by another agent branch"
+local RECURSIVE_UNMANAGED_TASK_ERR = "blocking task is unavailable from an unmanaged subagent; use task_spawn"
 local TASK_CLOSED_ERR = "task was despawned before its message was admitted"
 local BODY_INDENT_COLS = 4
 local MIN_MD_WIDTH = 20
@@ -315,6 +317,7 @@ local function spawn(spec, input, ctx)
   end
   local task = {
     sess = sess,
+    owner = sess:_maki_task_owner(),
     closed = false,
     validator = spec.local_tools ~= nil,
   }
@@ -355,6 +358,17 @@ local function spawn_handler(input, ctx)
   return { llm_output = maki.json.encode({ task_id = task_id }) }
 end
 
+local function resolve_task(task_id)
+  local task = tasks[task_id]
+  if not task then
+    return nil, UNKNOWN_TASK_ERR
+  end
+  if not task.owner:_maki_can_control() then
+    return nil, TASK_ACCESS_ERR
+  end
+  return task, nil
+end
+
 -- task_get -------------------------------------------------------------------
 
 local get_schema = {
@@ -367,9 +381,9 @@ local get_schema = {
 }
 
 local function get_handler(input)
-  local task = tasks[input.task_id]
+  local task, access_err = resolve_task(input.task_id)
   if not task then
-    return { llm_output = UNKNOWN_TASK_ERR, is_error = true }
+    return { llm_output = access_err, is_error = true }
   end
   local status, err = task.sess:status()
   if err then
@@ -398,9 +412,9 @@ local send_schema = {
 }
 
 local function send_handler(input)
-  local task = tasks[input.task_id]
+  local task, access_err = resolve_task(input.task_id)
   if not task then
-    return { llm_output = UNKNOWN_TASK_ERR, is_error = true }
+    return { llm_output = access_err, is_error = true }
   end
   local ok, err = enqueue(task, input.message)
   if not ok then
@@ -421,9 +435,9 @@ local despawn_schema = {
 }
 
 local function despawn_handler(input)
-  local task = tasks[input.task_id]
+  local task, access_err = resolve_task(input.task_id)
   if not task then
-    return { llm_output = UNKNOWN_TASK_ERR, is_error = true }
+    return { llm_output = access_err, is_error = true }
   end
   fail_task(task, TASK_CLOSED_ERR)
   tasks[input.task_id] = nil
@@ -446,6 +460,10 @@ local function handler(input, ctx)
     end
     if sess_err then
       error(sess_err, 0)
+    end
+    if ctx:audience() == "general_sub" and not sess:_maki_managed() then
+      sess:close()
+      return { llm_output = RECURSIVE_UNMANAGED_TASK_ERR, is_error = true }
     end
 
     local message = input.prompt

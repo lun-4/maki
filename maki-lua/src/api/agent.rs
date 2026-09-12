@@ -800,8 +800,9 @@ async fn is_yolo(_lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<Pair<bo
 ///     usage into the parent session's UI or event stream. The session still
 ///     completes and `:prompt()` still returns its result (including a commit
 ///     set via a `local_tools` handler). Use for hidden one-shot classification.
-///   `auto_deliver` (boolean?) - queue completed output for the parent agent.
-///     Default: `true`.
+///   `auto_deliver` (boolean?) - queue completed output for the root agent when
+///     this is an asynchronous direct-root child. Nested children and blocking
+///     prompts deliver to their immediate caller instead. Default: `true`.
 ///   `semaphore` (maki.async.Semaphore?) - concurrency limit acquired by the
 ///     driver immediately before each unmanaged turn and released when that turn
 ///     ends. Managed sessions ignore it and use the parent manager's limit.
@@ -1363,8 +1364,8 @@ async fn prompt(
 ) -> LuaResult<Pair<Table>> {
     let actor = Arc::clone(&this.actor);
     let state = Arc::clone(&this.state);
-    let (managed_child_id, fallback_cancel) = match &this.control {
-        SessionControl::Managed { agent, .. } => (Some(agent.id()), None),
+    let (managed_child, fallback_cancel) = match &this.control {
+        SessionControl::Managed { agent, .. } => (Some(agent.clone()), None),
         SessionControl::Unmanaged {
             parent_cancels,
             cancel_slot,
@@ -1377,7 +1378,10 @@ async fn prompt(
         .map(|opts| opts.get::<Option<u64>>("timeout"))
         .transpose()?
         .flatten();
-    let managed_wait = match (managed_child_id, crate::runtime::current_managed_turn(&lua)) {
+    let managed_wait = match (
+        managed_child.as_ref().map(maki_agent::AgentRef::id),
+        crate::runtime::current_managed_turn(&lua),
+    ) {
         (Some(child_id), Some(current)) => {
             try_pair!(current.validate_descendant(child_id));
             Some((current, child_id))
@@ -1438,7 +1442,11 @@ async fn prompt(
                     })
                     .await;
                 let Some(outcome) = outcome else {
-                    state.close_with(&actor);
+                    if let Some(agent) = &managed_child {
+                        let _ = agent.close_subtree();
+                    } else {
+                        state.close_with(&actor);
+                    }
                     if let Some((parent_cancels, id, cancel_slot)) = &fallback_cancel {
                         parent_cancels.retire(id, *cancel_slot);
                     }
@@ -1618,6 +1626,37 @@ fn session_id(lua: &Lua, this: &LuaSession) -> LuaResult<String> {
     Ok(this.id.clone())
 }
 
+struct LuaTaskOwner {
+    owner_id: Option<AgentId>,
+}
+
+impl mlua::UserData for LuaTaskOwner {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("_maki_can_control", |lua, this, ()| {
+            let Some(owner_id) = this.owner_id else {
+                return Ok(true);
+            };
+            let Some(current) = crate::runtime::current_managed_turn(lua) else {
+                return Ok(false);
+            };
+            Ok(current.agent_id() == owner_id || current.validate_descendant(owner_id).is_ok())
+        });
+    }
+}
+
+fn session_internal_methods<M: mlua::UserDataMethods<LuaSession>>(methods: &mut M) {
+    methods.add_method("_maki_managed", |_, this, ()| {
+        Ok(matches!(this.control, SessionControl::Managed { .. }))
+    });
+    methods.add_method("_maki_task_owner", |_, this, ()| {
+        Ok(LuaTaskOwner {
+            owner_id: matches!(this.control, SessionControl::Managed { .. })
+                .then_some(this.state.parent_agent_id)
+                .flatten(),
+        })
+    });
+}
+
 lua_class! {
     /// A subagent session with its own conversation history.
     ///
@@ -1626,6 +1665,7 @@ lua_class! {
     /// can have a multi-step conversation. Call `:close()` when you are done,
     /// or let garbage collection handle it.
     "maki.agent.Session" => LuaSession, SESSION_DOCS [prompt, send, status, close, session_id]
+    extra session_internal_methods
 }
 
 /// Commit a result to the session whose local tool is currently executing.

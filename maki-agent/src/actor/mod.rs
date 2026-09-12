@@ -65,6 +65,8 @@ pub(crate) struct ActorInner {
     pub(crate) managed_admission: Option<ManagedTurnAdmission>,
     #[cfg(test)]
     pub(crate) after_pop: Mutex<Option<(flume::Sender<()>, flume::Receiver<()>)>>,
+    #[cfg(test)]
+    pub(crate) after_finalization_retire: Mutex<Option<(flume::Sender<()>, flume::Receiver<()>)>>,
 }
 
 /// Lifecycle, run status, and the active turn's cancellation wiring. One
@@ -130,34 +132,27 @@ impl ActiveCancel {
     }
 }
 
-/// Retains one outcome, resolves the admission's ticket, and (when
-/// `deliver`) makes the single delivery attempt for the turn. Idempotent:
-/// the first call wins; nothing is recorded, resolved, or delivered twice.
-pub(crate) fn finalize_turn(
-    inner: &ActorInner,
-    turn_id: TurnId,
-    outcome: TurnOutcome,
-    admission: Option<&TurnAdmission>,
-    deliver: bool,
-) {
-    let first = {
-        let mut outcomes = inner.outcomes.lock().unwrap_or_else(|e| e.into_inner());
-        match outcomes.entry(turn_id) {
-            std::collections::hash_map::Entry::Occupied(_) => {
-                // Already finalized: no side effects on a repeat finalization.
-                false
-            }
-            std::collections::hash_map::Entry::Vacant(vacant) => {
-                vacant.insert(outcome.clone());
-                *inner.latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome.clone());
-                *inner.usage.lock().unwrap_or_else(|e| e.into_inner()) += outcome.usage();
-                true
-            }
-        }
+/// Retains one outcome and retires its cancellation and ticket registration.
+/// The first call wins; terminal registration is gone before any waiter or
+/// event recipient can observe the outcome.
+pub(crate) fn retire_turn(inner: &ActorInner, turn_id: TurnId, outcome: &TurnOutcome) -> bool {
+    let mut outcomes = inner.outcomes.lock().unwrap_or_else(|e| e.into_inner());
+    let std::collections::hash_map::Entry::Vacant(vacant) = outcomes.entry(turn_id) else {
+        return false;
     };
-    if !first {
-        return;
-    }
+    let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+    let mut tickets = inner.tickets.lock().unwrap_or_else(|e| e.into_inner());
+    vacant.insert(outcome.clone());
+    state.cancelled_turns.remove(&turn_id);
+    tickets.remove(&turn_id);
+    drop(tickets);
+    drop(state);
+    *inner.latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome.clone());
+    *inner.usage.lock().unwrap_or_else(|e| e.into_inner()) += outcome.usage();
+    true
+}
+
+pub(crate) fn publish_turn(outcome: TurnOutcome, admission: Option<&TurnAdmission>, deliver: bool) {
     if deliver
         && let Some(admission) = admission
         && let Some(sender) = &admission.event_sender
@@ -166,11 +161,28 @@ pub(crate) fn finalize_turn(
     }
     if let Some(admission) = admission {
         admission.ticket.resolve(outcome);
-        inner
-            .tickets
+    }
+}
+
+pub(crate) fn finalize_turn(
+    inner: &ActorInner,
+    turn_id: TurnId,
+    outcome: TurnOutcome,
+    admission: Option<&TurnAdmission>,
+    deliver: bool,
+) {
+    if retire_turn(inner, turn_id, &outcome) {
+        #[cfg(test)]
+        if let Some((retired, release)) = inner
+            .after_finalization_retire
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&turn_id);
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = retired.send(());
+            let _ = release.recv();
+        }
+        publish_turn(outcome, admission, deliver);
     }
 }
 
@@ -264,6 +276,8 @@ impl AgentActorHandle {
             managed_admission,
             #[cfg(test)]
             after_pop: Mutex::new(None),
+            #[cfg(test)]
+            after_finalization_retire: Mutex::new(None),
         });
         let wake = Arc::new(runner::WakeFlag::new());
         let handle = Self {
@@ -288,6 +302,18 @@ impl AgentActorHandle {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some((popped_tx, release_rx));
         (popped_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    fn pause_after_next_finalization_retire(&self) -> (flume::Receiver<()>, flume::Sender<()>) {
+        let (retired_tx, retired_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        *self
+            .inner
+            .after_finalization_retire
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((retired_tx, release_rx));
+        (retired_rx, release_tx)
     }
 
     /// Admits one turn. The [`TurnId`] and ticket are allocated immediately
@@ -324,6 +350,7 @@ impl AgentActorHandle {
                 ticket: ticket.clone(),
             };
             let outcome = cancelled_outcome(self.inner.agent_id, turn_id, reason);
+            drop(state);
             finalize_turn(
                 &self.inner,
                 turn_id,
@@ -340,6 +367,11 @@ impl AgentActorHandle {
             );
             return Ok(ticket);
         }
+        self.inner
+            .tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(turn_id, ticket.clone());
         self.inner.queue.push(ActorWork::Turn(TurnAdmission {
             turn_id,
             input: Some(input),
@@ -354,11 +386,6 @@ impl AgentActorHandle {
             correlation = %correlation,
             "turn admitted"
         );
-        self.inner
-            .tickets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(turn_id, ticket.clone());
         Ok(ticket)
     }
 

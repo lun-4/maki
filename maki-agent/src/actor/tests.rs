@@ -529,6 +529,68 @@ fn cancel_existing_catches_turn_between_pop_and_active_install() {
 }
 
 #[test]
+fn cancel_existing_catches_control_between_pop_and_backend_entry() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let (popped, release) = handle.pause_after_next_pop();
+        handle
+            .push_control(ControlWork {
+                name: "cancelled".into(),
+                correlation: "cancelled".into(),
+            })
+            .unwrap();
+
+        popped.recv_async().await.unwrap();
+        handle.cancel_existing();
+        release.send(()).unwrap();
+        until(|| handle.snapshot().queued == 0).await;
+        assert!(state.controls.lock().unwrap().is_empty());
+
+        handle
+            .push_control(ControlWork {
+                name: "surviving".into(),
+                correlation: "surviving".into(),
+            })
+            .unwrap();
+        until(|| !state.controls.lock().unwrap().is_empty()).await;
+        assert_eq!(state.controls.lock().unwrap().as_slice(), ["surviving"]);
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn cancel_existing_catches_compact_between_pop_and_backend_entry() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let state = Arc::clone(&backend.state);
+        let (handle, task) = spawn(backend);
+        let (popped, release) = handle.pause_after_next_pop();
+        handle.push_compact(1).unwrap();
+
+        popped.recv_async().await.unwrap();
+        handle.cancel_existing();
+        release.send(()).unwrap();
+        until(|| handle.snapshot().queued == 0).await;
+        assert_eq!(state.compacts.load(Ordering::SeqCst), 0);
+
+        handle.push_compact(2).unwrap();
+        handle
+            .push_control(ControlWork {
+                name: "fence".into(),
+                correlation: "fence".into(),
+            })
+            .unwrap();
+        until(|| !state.controls.lock().unwrap().is_empty()).await;
+        assert_eq!(state.compacts.load(Ordering::SeqCst), 1);
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
 fn cancel_turn_catches_exact_turn_between_pop_and_active_install() {
     smol::block_on(async {
         let backend = ScriptedBackend::new();
@@ -577,11 +639,14 @@ fn cancel_turn_catches_exact_turn_between_pop_and_active_install() {
 #[test]
 fn cancel_turn_terminalizes_only_the_queued_exact_ticket() {
     smol::block_on(async {
-        let backend = ScriptedBackend::new();
+        let gate = Gate::new();
+        let backend = ScriptedBackend::gated(Arc::clone(&gate));
+        let state = Arc::clone(&backend.state);
         let (handle, task) = spawn(backend);
         let first = handle
             .admit_turn(input("first"), None, "shared".into())
             .unwrap();
+        until(|| state.entered.load(Ordering::SeqCst) == 1).await;
         let second = handle
             .admit_turn(input("second"), None, "shared".into())
             .unwrap();
@@ -594,8 +659,48 @@ fn cancel_turn_terminalizes_only_the_queued_exact_ticket() {
                 ..
             }
         ));
+        assert_eq!(state.entered.load(Ordering::SeqCst), 1);
+        gate.open();
         assert!(matches!(first.wait().await, TurnOutcome::Completed { .. }));
 
+        handle.close();
+        task.await;
+    });
+}
+
+#[test]
+fn terminal_ticket_is_retired_before_notification() {
+    smol::block_on(async {
+        let backend = ScriptedBackend::new();
+        let (handle, task) = spawn(backend);
+        let (retired, release) = handle.pause_after_next_finalization_retire();
+        let ticket = handle
+            .admit_turn(input("work"), None, "work".into())
+            .unwrap();
+        let turn_id = ticket.turn_id();
+
+        let cancel_handle = handle.clone();
+        let cancel = std::thread::spawn(move || {
+            retired.recv().unwrap();
+            let result = cancel_handle.cancel_turn(turn_id);
+            release.send(()).unwrap();
+            result
+        });
+
+        assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+        assert!(matches!(
+            cancel.join().unwrap(),
+            Err(ActorError::UnknownTurn(id)) if id == turn_id
+        ));
+        assert!(
+            !handle
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .cancelled_turns
+                .contains(&turn_id)
+        );
         handle.close();
         task.await;
     });

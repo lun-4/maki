@@ -44,6 +44,8 @@ const RAISE_MSG: &str = "stub prompt kaboom";
 const PARTIAL_TEXT: &str = "half a transcript";
 const CANCELLED_ERR: &str = "cancelled";
 const DUPLICATE_TASK_ID_ERR: &str = "duplicate task_id";
+const RECURSIVE_UNMANAGED_TASK_ERR: &str =
+    "blocking task is unavailable from an unmanaged subagent; use task_spawn";
 /// Mirrors the task plugin's `max_concurrent` default.
 const TASK_DEFAULT_MAX_CONCURRENT: u64 = 8;
 
@@ -157,11 +159,37 @@ maki.agent.session = function(ctx, opts)
   function sess:session_id()
     return opts.name
   end
+  function sess:_maki_managed()
+    return false
+  end
+  function sess:_maki_task_owner()
+    return {
+      _maki_can_control = function()
+        return recorder.can_control ~= false
+      end,
+    }
+  end
   function sess:close()
     recorder.closed = recorder.closed + 1
   end
   return sess
 end
+
+maki.api.register_tool({
+  name = "set_task_access",
+  description = "set task access",
+  schema = {
+    type = "object",
+    required = { "allowed" },
+    properties = { allowed = { type = "boolean" } },
+    additionalProperties = false,
+  },
+  audiences = { "main" },
+  handler = function(input)
+    recorder.can_control = input.allowed
+    return "ok"
+  end,
+})
 
 maki.api.register_tool({
   name = "probe",
@@ -561,6 +589,23 @@ fn no_summary_errors_after_nudges() {
 }
 
 #[test]
+fn recursive_unmanaged_blocking_task_rejects_before_capacity_wait() {
+    let mut opts = serde_json::Map::new();
+    opts.insert("max_concurrent".into(), json!(1));
+    let (reg, _host) = load_task_host_with_opts(opts);
+    let mut ctx = stub_ctx(&AgentMode::Build);
+    ctx.audience = ToolAudience::GENERAL_SUB;
+
+    let error =
+        common::exec_tool(&reg, &ctx, TASK_TOOL, task_input(SCENARIO_PLAIN, None)).unwrap_err();
+    assert_eq!(error, RECURSIVE_UNMANAGED_TASK_ERR);
+    let snapshot = probe(&reg);
+    assert_eq!(snapshot["prompt_count"], json!(0));
+    assert_eq!(snapshot["closed"], json!(1));
+    assert_eq!(snapshot["sem_size"], json!(1));
+}
+
+#[test]
 fn raising_prompt_does_not_exhaust_semaphore() {
     let (reg, _host) = load_task_host();
     let err = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_RAISE, None)).unwrap_err();
@@ -635,6 +680,31 @@ fn duplicate_task_id_is_rejected_without_overwrite() {
     let snap = probe(&reg);
     assert_eq!(snap["sessions"], json!(2));
     assert_eq!(snap["closed"], json!(1));
+}
+
+#[test]
+fn lifecycle_tools_deny_cross_branch_access_without_mutating_task() {
+    const ACCESS_ERR: &str = "task is owned by another agent branch";
+
+    let (reg, _host) = load_task_host();
+    let spawn = exec_tool_json(&reg, "task_spawn", task_input(SCENARIO_PLAIN, None));
+    let task_id = spawn["task_id"].as_str().unwrap();
+    exec_tool(&reg, "set_task_access", json!({ "allowed": false })).unwrap();
+
+    for tool in ["task_get", "task_send", "task_despawn"] {
+        let input = if tool == "task_send" {
+            json!({ "task_id": task_id, "message": "forbidden" })
+        } else {
+            json!({ "task_id": task_id })
+        };
+        assert_eq!(exec_tool(&reg, tool, input).unwrap_err(), ACCESS_ERR);
+    }
+
+    exec_tool(&reg, "set_task_access", json!({ "allowed": true })).unwrap();
+    let status = exec_tool_json(&reg, "task_get", json!({ "task_id": task_id }));
+    assert_eq!(status["status"], json!("done"));
+    let closed = exec_tool_json(&reg, "task_despawn", json!({ "task_id": task_id }));
+    assert_eq!(closed["ok"], json!(true));
 }
 
 #[test]

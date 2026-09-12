@@ -6094,6 +6094,50 @@ fn stamped_child_failure_wins_over_prior_history_snapshot() {
     assert_eq!(app.chats[1].last_message_text(), "provider unavailable");
 }
 
+#[test_case(false, true,  false ; "grandchild")]
+#[test_case(true,  false, false ; "auto_delivery_disabled")]
+#[test_case(true,  true,  true  ; "eligible_direct_child")]
+fn failed_subagent_delivery_obeys_ownership_policy(
+    parent_is_root: bool,
+    auto_deliver: bool,
+    expect_delivery: bool,
+) {
+    const FAILURE_MESSAGE: &str = "provider unavailable";
+
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let (input_tx, _input_rx) = flume::unbounded();
+    let mut info = subagent_info_full(TASK_ID, "worker", None, Some(input_tx));
+    info.parent_is_root = parent_is_root;
+    info.auto_deliver = auto_deliver;
+    let outcome = TurnOutcome::Failed {
+        agent_id: info.agent_id,
+        turn_id: TurnId::generate(),
+        usage: TokenUsage::default(),
+        num_turns: 1,
+        failure: TurnFailure {
+            kind: TurnFailureKind::Provider,
+            diagnostic: FAILURE_MESSAGE.into(),
+            user_message: FAILURE_MESSAGE.into(),
+            retryable: false,
+        },
+    };
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TurnOutcome(outcome),
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    assert_eq!(app.chats[1].last_message_role(), Some(&DisplayRole::Error));
+    assert_eq!(app.chats[1].last_message_text(), FAILURE_MESSAGE);
+    assert_eq!(
+        app.queue.text_messages().len(),
+        usize::from(expect_delivery)
+    );
+}
+
 #[test_case("anthropic/claude-sonnet-4-5" ; "non_opus_anthropic")]
 #[test_case("openai/gpt-5.5" ; "non_anthropic")]
 fn fast_flashes_error_on_ineligible_model(spec: &str) {

@@ -21,11 +21,43 @@ mod common;
 
 const TOOL_NAME: &str = "managed_session";
 const TIMEOUT_TOOL_NAME: &str = "managed_session_timeout";
+const RETAIN_TOOL_NAME: &str = "managed_session_retain";
+const OUTSIDE_TIMEOUT_TOOL_NAME: &str = "managed_session_outside_timeout";
 const TIMEOUT_ERROR: &str = "session prompt timed out after 1s";
 const CORRELATION: &str = "managed-root";
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 const PLUGIN_SRC: &str = r#"
+local retained_session
+
+maki.api.register_tool({
+  name = "managed_session_retain",
+  description = "retain a managed child",
+  schema = { type = "object", properties = {}, additionalProperties = false },
+  audiences = { "main" },
+  handler = function(_, ctx)
+    retained_session = assert(maki.agent.session(ctx, {
+      name = "managed-retained-child",
+      inherit_provider = true,
+    }))
+    return "ok"
+  end,
+})
+
+maki.api.register_tool({
+  name = "managed_session_outside_timeout",
+  description = "time out a retained managed child",
+  schema = { type = "object", properties = {}, additionalProperties = false },
+  audiences = { "main" },
+  handler = function()
+    local result, err = retained_session:prompt("wait", { timeout = 1 })
+    if result ~= nil or err ~= "session prompt timed out after 1s" then
+      return { llm_output = "unexpected retained timeout result", is_error = true }
+    end
+    return "ok"
+  end,
+})
+
 maki.api.register_tool({
   name = "managed_session_timeout",
   description = "time out a managed child prompt",
@@ -231,6 +263,65 @@ fn managed_session_uses_root_authority_and_closes_its_node() {
             .find(|envelope| matches!(envelope.event, AgentEvent::SubagentHistory { .. }))
             .expect("managed child history envelope");
         assert_eq!(envelope.subagent.unwrap().agent_id, child.agent_id);
+
+        let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        assert!(report.timed_out.is_empty());
+    });
+}
+
+#[test]
+fn retained_managed_prompt_timeout_outside_invocation_closes_graph_node() {
+    smol::block_on(async {
+        let registry = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&registry)).unwrap();
+        host.load_source("managed-session", PLUGIN_SRC).unwrap();
+        let (dropped_tx, dropped_rx) = flume::bounded(1);
+        let provider = Arc::new(PendingProvider {
+            dropped: dropped_tx,
+        });
+        let (context, _events, _cancel) = common::ctx_with_provider(provider);
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let (completed_tx, completed_rx) = flume::bounded(1);
+        let root = manager
+            .create_root(
+                Vec::new(),
+                None,
+                Box::new(LuaToolBackend {
+                    registry: Arc::clone(&registry),
+                    context: context.clone(),
+                    completed: completed_tx,
+                    tool_name: RETAIN_TOOL_NAME,
+                }),
+            )
+            .unwrap();
+        let ticket = root
+            .actor()
+            .unwrap()
+            .admit_turn(input(), None, CORRELATION.into())
+            .unwrap();
+
+        assert_eq!(completed_rx.recv_async().await.unwrap(), Ok(()));
+        assert!(matches!(ticket.wait().await, TurnOutcome::Completed { .. }));
+        let invocation = registry
+            .get(OUTSIDE_TIMEOUT_TOOL_NAME)
+            .unwrap()
+            .tool
+            .parse(&json!({}))
+            .unwrap();
+        assert!(
+            invocation.execute(&context).await.output.is_ok(),
+            "{TIMEOUT_ERROR}"
+        );
+        dropped_rx
+            .recv_async()
+            .await
+            .expect("timed-out retained provider request remained alive");
+        let child = manager
+            .snapshot()
+            .into_iter()
+            .find(|node| node.parent_id == Some(root.id()))
+            .expect("retained managed child");
+        assert_eq!(child.graph_lifecycle, GraphLifecycle::Closed);
 
         let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
         assert!(report.timed_out.is_empty());

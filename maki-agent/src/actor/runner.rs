@@ -161,8 +161,10 @@ impl Runner {
                     .await
             }
             ActorWork::Root(root) => self.run_root(root, cancellation_generation).await,
-            ActorWork::Control(control) => self.run_control(control).await,
-            ActorWork::Compact { run_id } => self.run_compact(run_id).await,
+            ActorWork::Control(control) => self.run_control(control, cancellation_generation).await,
+            ActorWork::Compact { run_id } => {
+                self.run_compact(run_id, cancellation_generation).await
+            }
         }
     }
 
@@ -350,7 +352,17 @@ impl Runner {
 
     /// Runs a standalone control. Never carries a [`TurnId`] and never
     /// produces a [`TurnOutcome`].
-    async fn run_control(&mut self, control: ControlWork) {
+    async fn run_control(&mut self, control: ControlWork, popped_generation: u64) {
+        if self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .cancellation_generation
+            != popped_generation
+        {
+            return;
+        }
         let result = self
             .backend
             .run_control(
@@ -376,15 +388,18 @@ impl Runner {
         }
     }
 
-    async fn run_compact(&mut self, run_id: u64) {
+    async fn run_compact(&mut self, run_id: u64, popped_generation: u64) {
         // Consumed: retire any precancel mark for this run_id's canonical
         // correlation.
-        self.inner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .cancelled_correlations
-            .remove(&super::run_correlation(run_id));
+        {
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.cancellation_generation != popped_generation {
+                return;
+            }
+            state
+                .cancelled_correlations
+                .remove(&super::run_correlation(run_id));
+        }
         let result = self
             .backend
             .run_compact(

@@ -473,6 +473,51 @@ fn completed_waiter_observes_ownership_during_backend_poll() {
 }
 
 #[test]
+fn cancellation_wakes_pending_managed_execution_and_runs_cleanup() {
+    smol::block_on(async {
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let root = manager
+            .create_root(Vec::new(), None, TestBackend::boxed())
+            .unwrap();
+        let turn_id = crate::TurnId::generate();
+        let (cancel, token) = crate::ReasonedCancelToken::new();
+        let (guard, current) =
+            super::enter_managed_turn(&Arc::downgrade(&manager.0), root.id(), turn_id, &token)
+                .await
+                .unwrap();
+        let (polled_tx, polled_rx) = flume::unbounded();
+        let backend = std::future::poll_fn(move |_| {
+            polled_tx.send(()).unwrap();
+            Poll::<BackendResult>::Pending
+        });
+        let execution = super::manage_execution(
+            Box::pin(backend),
+            guard,
+            Arc::clone(&current.lease.inner),
+            token,
+        );
+        let task = smol::spawn(execution);
+
+        polled_rx.recv_async().await.unwrap();
+        cancel.cancel(crate::TurnCancellationReason::User);
+        polled_rx.recv_async().await.unwrap();
+        assert!(
+            !manager
+                .lock_graph()
+                .active_turns
+                .contains_key(&(root.id(), turn_id))
+        );
+        assert!(!current.lease.inner.state.lock().unwrap().closing);
+
+        task.cancel().await;
+        assert!(current.lease.inner.state.lock().unwrap().closing);
+        root.actor().unwrap().shutdown();
+        let report = manager.shutdown(std::time::Duration::from_secs(1)).await;
+        assert!(report.timed_out.is_empty());
+    });
+}
+
+#[test]
 fn dropping_pending_managed_execution_closes_lease_and_releases_permit() {
     smol::block_on(async {
         let limits = AgentLimits {
@@ -697,6 +742,7 @@ fn shutdown_does_not_join_reserved_root_before_factory_completes() {
         })
     });
     let root_id = reserved_rx.recv().unwrap();
+    assert!(!manager.runner_finished(root_id).unwrap());
 
     let report = smol::block_on(manager.shutdown(std::time::Duration::ZERO));
     assert!(report.joined.is_empty());
