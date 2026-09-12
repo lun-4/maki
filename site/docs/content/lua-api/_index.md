@@ -1224,9 +1224,10 @@ and tool set.
     usage into the parent session's UI or event stream. The session still
     completes and `:prompt()` still returns its result (including a commit
     set via a `local_tools` handler). Use for hidden one-shot classification.
-  - `auto_deliver` (`boolean?`) queue completed output for the root agent when
-    this is an asynchronous direct-root child. Nested children and blocking
-    prompts deliver to their immediate caller instead. Default: `true`.
+  - `auto_deliver` (`boolean?`) queue completed output for the root agent only
+    for asynchronous direct-root children. Blocking `prompt()` returns its
+    result to the caller. Nested asynchronous completion is not automatically
+    delivered to the parent. Default: `true`.
   - `semaphore` (`maki.async.Semaphore?`) concurrency limit acquired by the
     driver immediately before each unmanaged turn and released when that turn
     ends. Managed sessions ignore it and use the parent manager's limit.

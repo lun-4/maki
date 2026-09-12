@@ -122,6 +122,8 @@ pub(crate) struct ManagerInner {
     #[cfg(test)]
     prompt_admission_gate: Mutex<Option<PromptAdmissionGate>>,
     #[cfg(test)]
+    prompt_wait_registration_gate: Mutex<Option<TestGate>>,
+    #[cfg(test)]
     descendant_cut_gate: Mutex<Option<TestGate>>,
 }
 
@@ -157,6 +159,8 @@ impl AgentManagerHandle {
             commit_gate: Mutex::new(None),
             #[cfg(test)]
             prompt_admission_gate: Mutex::new(None),
+            #[cfg(test)]
+            prompt_wait_registration_gate: Mutex::new(None),
             #[cfg(test)]
             descendant_cut_gate: Mutex::new(None),
         })))
@@ -487,6 +491,8 @@ impl AgentManagerHandle {
                 turn_id: ticket.turn_id(),
             });
         }
+        #[cfg(test)]
+        self.wait_at_prompt_wait_registration_gate();
 
         let watcher_id = self.0.next_watcher.fetch_add(1, Ordering::Relaxed);
         let (cancel, cancel_token) = crate::ReasonedCancelToken::new();
@@ -1127,6 +1133,24 @@ impl AgentManagerHandle {
     }
 
     #[cfg(test)]
+    fn set_prompt_wait_registration_gate(
+        &self,
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+    ) {
+        *self
+            .0
+            .prompt_wait_registration_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(TestGate { entered, release });
+    }
+
+    #[cfg(test)]
+    fn wait_at_prompt_wait_registration_gate(&self) {
+        self.wait_at_test_gate(&self.0.prompt_wait_registration_gate);
+    }
+
+    #[cfg(test)]
     fn set_prompt_admission_gate(
         &self,
         admitted: flume::Sender<TurnId>,
@@ -1178,6 +1202,7 @@ struct LeaseState {
     permit: Option<SemaphoreGuardArc>,
     owns_permit: bool,
     suspensions: usize,
+    suspensions_sealed: bool,
     closing: bool,
     wake: Option<std::task::Waker>,
     watcher_cancels: HashMap<u64, Option<crate::cancel::ReasonedCancelTrigger>>,
@@ -1198,7 +1223,7 @@ impl LeaseInner {
         cancel: crate::cancel::ReasonedCancelTrigger,
     ) -> Result<(), ManagerError> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state.closing {
+        if state.closing || state.suspensions_sealed {
             return Err(ManagerError::InactiveTurn {
                 agent_id: self.agent_id,
                 turn_id: self.turn_id,
@@ -1232,6 +1257,7 @@ impl LeaseInner {
     fn cancel_waiters(&self) {
         let cancels = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.suspensions_sealed = true;
             state
                 .watcher_cancels
                 .values_mut()
@@ -1555,6 +1581,7 @@ pub(crate) async fn enter_managed_turn(
             permit: Some(permit),
             owns_permit: true,
             suspensions: 0,
+            suspensions_sealed: false,
             closing: false,
             wake: None,
             watcher_cancels: HashMap::new(),

@@ -1810,8 +1810,12 @@ impl App {
                 self.delivered_subagent_histories.remove(&subagent.agent_id);
                 self.stamped_subagent_outcomes
                     .retain(|(agent_id, _)| *agent_id != subagent.agent_id);
+                self.cleanup_subagent_input(subagent.agent_id);
                 if let Some(&chat_idx) = self.live_chat_index.get(&subagent.agent_id) {
                     self.chats[chat_idx].cancel_in_progress();
+                    if !self.chats[chat_idx].is_finished() {
+                        self.chats[chat_idx].mark_finished(DisplayRole::Error, CANCELLED_TEXT);
+                    }
                     self.sync_task_picker();
                 }
                 return vec![];
@@ -2586,6 +2590,28 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn cleanup_subagent_input(&mut self, agent_id: maki_agent::AgentId) {
+        self.input_queue.retain(|demand| {
+            demand
+                .perm
+                .as_ref()
+                .is_none_or(|perm| perm.agent_id != Some(agent_id))
+        });
+        if self.permission_prompt.agent_id() == Some(agent_id) {
+            self.permission_prompt.close();
+        }
+        if matches!(
+            self.pending_input,
+            PendingInput::AuthRetry {
+                agent_id: Some(retry_agent_id)
+            } if retry_agent_id == agent_id
+        ) {
+            self.pending_input = PendingInput::None;
+        }
+        self.reconcile_active();
+        let _ = self.promote_deferred_if_ready();
     }
 
     pub(crate) fn permission_active(&self) -> bool {

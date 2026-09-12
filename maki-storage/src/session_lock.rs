@@ -92,12 +92,26 @@ fn read_owner(path: &Path, file: &mut File) -> io::Result<Option<LockOwner>> {
     let Some(pid) = read_pid(file)? else {
         return Ok(None);
     };
-    let Ok(record) = fs::read_to_string(owner_path(path)) else {
-        return Ok(Some(LockOwner { pid, token: None }));
+    let record = match read_owner_sidecar(path) {
+        Ok(record) => record,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(Some(LockOwner { pid, token: None }));
+        }
+        Err(error) => return Err(error),
     };
-    Ok(parse_owner(&record)
-        .filter(|owner| owner.pid == pid)
-        .or(Some(LockOwner { pid, token: None })))
+    let owner = match parse_owner(&record) {
+        Some(owner) if owner.pid == pid => owner,
+        Some(_) | None => LockOwner { pid, token: None },
+    };
+    Ok(Some(owner))
+}
+
+fn read_owner_sidecar(path: &Path) -> io::Result<String> {
+    #[cfg(test)]
+    if let Some(error) = take_sidecar_read_error(path) {
+        return Err(error);
+    }
+    fs::read_to_string(owner_path(path))
 }
 
 fn holder_pid(path: &Path) -> Option<u32> {
@@ -131,6 +145,24 @@ fn owner_token() -> io::Result<String> {
 
 #[cfg(test)]
 type ReleaseHook = (PathBuf, Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+fn sidecar_read_error() -> &'static Mutex<Option<(PathBuf, io::ErrorKind)>> {
+    static ERROR: OnceLock<Mutex<Option<(PathBuf, io::ErrorKind)>>> = OnceLock::new();
+    ERROR.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn take_sidecar_read_error(path: &Path) -> Option<io::Error> {
+    let mut error = sidecar_read_error()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if error.as_ref().is_some_and(|(expected, _)| expected == path) {
+        let (_, kind) = error.take().expect("matching sidecar read error");
+        return Some(io::Error::new(kind, "injected sidecar read failure"));
+    }
+    None
+}
 
 #[cfg(test)]
 fn release_before_write_hook() -> &'static Mutex<Option<ReleaseHook>> {
@@ -426,6 +458,24 @@ mod tests {
     }
 
     #[test]
+    fn malformed_sidecar_is_treated_as_tokenless() {
+        let dir = tempdir().unwrap();
+        let id = MakiId::generate();
+        let path = lock_path(dir.path(), &id);
+        fake_lock(dir.path(), &id);
+        fs::write(owner_path(&path), "malformed owner record").unwrap();
+        let mut file = File::options().read(true).write(true).open(&path).unwrap();
+
+        assert_eq!(
+            read_owner(&path, &mut file).unwrap(),
+            Some(LockOwner {
+                pid: FAKE_PID,
+                token: None,
+            })
+        );
+    }
+
+    #[test]
     fn claimed_record_is_pid_only_with_token_in_sidecar() {
         let dir = tempdir().unwrap();
         let id = MakiId::generate();
@@ -555,6 +605,21 @@ mod tests {
             io::ErrorKind::WouldBlock
         );
         blocker.unlock().unwrap();
+        assert_eq!(lease.heartbeat().unwrap(), LockBeat::Held);
+    }
+
+    #[test]
+    fn heartbeat_recovers_after_sidecar_read_failure() {
+        let dir = tempdir().unwrap();
+        let id = MakiId::generate();
+        let path = lock_path(dir.path(), &id);
+        let mut lease = claim(dir.path(), &id).unwrap().unwrap();
+        *sidecar_read_error().lock().unwrap() = Some((path, io::ErrorKind::PermissionDenied));
+
+        assert_eq!(
+            lease.heartbeat().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
         assert_eq!(lease.heartbeat().unwrap(), LockBeat::Held);
     }
 

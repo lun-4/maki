@@ -7666,8 +7666,11 @@ fn submit_after_subagent_completion_routes_to_reusable_child() {
 
 #[test]
 fn subagent_closed_marks_despawned_and_rejects_input() {
+    const LATE_FAILURE: &str = "late failure";
+
     let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
-    let agent_id = app.chats[app.active_chat].agent_id.unwrap();
+    let chat_idx = app.active_chat;
+    let agent_id = app.chats[chat_idx].agent_id.unwrap();
     let info = subagent_info_for_agent(
         agent_id,
         TASK_ID,
@@ -7675,13 +7678,38 @@ fn subagent_closed_marks_despawned_and_rejects_input() {
         None,
         app.subagent_channels[&agent_id].input_tx.clone(),
     );
+    app.open_tasks();
     assert!(!app.active_subagent_closed());
+    assert!(app.task_picker.item(chat_idx).unwrap().is_spinning());
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::SubagentClosed,
-        subagent: Some(info),
+        subagent: Some(info.clone()),
         run_id: 1,
     })));
     assert!(app.active_subagent_closed());
+    assert!(app.chats[chat_idx].is_finished());
+    assert!(app.task_picker.item(chat_idx).unwrap().is_finished());
+    assert!(!app.task_picker.item(chat_idx).unwrap().is_spinning());
+    assert_eq!(app.chats[chat_idx].last_message_text(), CANCELLED_TEXT);
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TurnOutcome(TurnOutcome::Failed {
+            agent_id,
+            turn_id: TurnId::generate(),
+            usage: TokenUsage::default(),
+            num_turns: 1,
+            failure: TurnFailure {
+                kind: TurnFailureKind::Provider,
+                diagnostic: LATE_FAILURE.into(),
+                user_message: LATE_FAILURE.into(),
+                retryable: false,
+            },
+        }),
+        subagent: Some(info),
+        run_id: 1,
+    })));
+    assert!(app.chats[chat_idx].is_finished());
+    assert_eq!(app.chats[chat_idx].last_message_text(), CANCELLED_TEXT);
 
     match app.submit_prompt(queued_msg("poke")) {
         SubmitOutcome::Rejected(e) => assert_eq!(e, queue::NO_SUBAGENT_ERR),
@@ -7691,6 +7719,125 @@ fn subagent_closed_marks_despawned_and_rejects_input() {
         app.queue.text_messages().is_empty(),
         "nothing may reach the main queue"
     );
+}
+
+#[test]
+fn subagent_closed_replaces_active_permission_with_live_root_request() {
+    const CHILD_PERMISSION_ID: &str = "child-permission";
+    const ROOT_PERMISSION_ID: &str = "root-permission";
+
+    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let agent_id = app.chats[app.active_chat].agent_id.unwrap();
+    let info = subagent_info_for_agent(
+        agent_id,
+        TASK_ID,
+        "research",
+        None,
+        app.subagent_channels[&agent_id].input_tx.clone(),
+    );
+    let permission = |id: &str| AgentEvent::PermissionRequest {
+        id: id.into(),
+        tool: maki_config::ToolKey::native(PERM_TOOL),
+        scopes: vec![PERM_SCOPE.into()],
+    };
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: permission(CHILD_PERMISSION_ID),
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+    app.pending_input = PendingInput::AuthRetry {
+        agent_id: Some(agent_id),
+    };
+    app.update(agent_msg(permission(ROOT_PERMISSION_ID)));
+    assert_eq!(app.permission_prompt.agent_id(), Some(agent_id));
+    assert_eq!(app.input_queue.len(), 1);
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentClosed,
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    assert!(app.permission_active());
+    assert_eq!(app.permission_prompt.agent_id(), None);
+    assert!(app.input_queue.is_empty());
+    assert_eq!(app.pending_input, PendingInput::None);
+}
+
+#[test]
+fn subagent_closed_prunes_deferred_permission_before_live_root_request() {
+    const CHILD_PERMISSION_ID: &str = "deferred-child-permission";
+    const ROOT_PERMISSION_ID: &str = "deferred-root-permission";
+
+    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let agent_id = app.chats[app.active_chat].agent_id.unwrap();
+    let info = subagent_info_for_agent(
+        agent_id,
+        TASK_ID,
+        "research",
+        None,
+        app.subagent_channels[&agent_id].input_tx.clone(),
+    );
+    let permission = |id: &str| AgentEvent::PermissionRequest {
+        id: id.into(),
+        tool: maki_config::ToolKey::native(PERM_TOOL),
+        scopes: vec![PERM_SCOPE.into()],
+    };
+    app.last_input = Some(Instant::now());
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: permission(CHILD_PERMISSION_ID),
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+    app.update(agent_msg(permission(ROOT_PERMISSION_ID)));
+    assert_eq!(app.input_queue.len(), 2);
+    assert!(!app.permission_prompt.is_open());
+    app.last_input = None;
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentClosed,
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    assert!(app.permission_active());
+    assert_eq!(app.permission_prompt.agent_id(), None);
+    assert!(app.input_queue.is_empty());
+}
+
+#[test_case(false, DONE_TEXT, &DisplayRole::Done ; "completed")]
+#[test_case(true, "failed", &DisplayRole::Error ; "failed")]
+fn subagent_closed_preserves_terminal_status(
+    failed: bool,
+    expected_text: &str,
+    expected_role: &DisplayRole,
+) {
+    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let chat_idx = app.active_chat;
+    let agent_id = app.chats[chat_idx].agent_id.unwrap();
+    let info = subagent_info_for_agent(
+        agent_id,
+        TASK_ID,
+        "research",
+        None,
+        app.subagent_channels[&agent_id].input_tx.clone(),
+    );
+    if failed {
+        app.chats[chat_idx].mark_failed(expected_text);
+    } else {
+        app.chats[chat_idx].mark_finished(DisplayRole::Done, expected_text);
+    }
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentClosed,
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    assert!(app.chats[chat_idx].is_finished());
+    assert_eq!(app.chats[chat_idx].last_message_text(), expected_text);
+    assert_eq!(app.chats[chat_idx].last_message_role(), Some(expected_role));
 }
 
 #[test]

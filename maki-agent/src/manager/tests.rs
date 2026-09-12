@@ -1680,6 +1680,76 @@ fn parent_waiting_for_child_yields_permit() {
 }
 
 #[test]
+fn parent_cancellation_seals_descendant_wait_registration() {
+    let limits = AgentLimits {
+        max_concurrent_agent_turns: 2,
+        ..AgentLimits::default()
+    };
+    let (manager, root, current, root_gate) = active_root(limits);
+    let child_gate = Gate::new();
+    let child = manager
+        .spawn_child(
+            &current,
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            Box::new(TestBackend {
+                current: None,
+                gate: Some(Arc::clone(&child_gate)),
+            }),
+        )
+        .unwrap();
+    let child_actor = child.actor().unwrap();
+    let child_ticket = child_actor
+        .admit_turn(input(), None, "child".into())
+        .unwrap();
+    let (registration_entered_tx, registration_entered_rx) = flume::bounded(1);
+    let (registration_release_tx, registration_release_rx) = flume::bounded(1);
+    manager.set_prompt_wait_registration_gate(registration_entered_tx, registration_release_rx);
+
+    let lease = current.lease();
+    let wait_current = current.clone();
+    let wait_actor = child_actor.clone();
+    let child_id = child.id();
+    let pending_ticket = child_ticket.clone();
+    let registration = std::thread::spawn(move || {
+        lease.wait_for_descendant(&wait_current, child_id, &wait_actor, pending_ticket, None)
+    });
+    registration_entered_rx.recv().unwrap();
+
+    manager.cancel_agent(root.id()).unwrap();
+    loop {
+        if current.lease.inner.state.lock().unwrap().suspensions_sealed {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    registration_release_tx.send(()).unwrap();
+    assert!(matches!(
+        registration.join().unwrap(),
+        Err(ManagerError::InactiveTurn { .. })
+    ));
+    {
+        let state = current.lease.inner.state.lock().unwrap();
+        assert!(state.suspensions_sealed);
+        assert!(!state.closing);
+        assert_eq!(state.suspensions, 0);
+        assert!(state.watcher_cancels.is_empty());
+    }
+    let mut child_completion = Box::pin(child_ticket.wait());
+    assert!(smol::block_on(futures_lite::future::poll_once(&mut child_completion)).is_none());
+
+    child_gate.release(1);
+    assert!(matches!(
+        smol::block_on(child_completion),
+        TurnOutcome::Completed { .. }
+    ));
+    root_gate.release(1);
+    let report = smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
+    assert!(report.timed_out.is_empty());
+}
+
+#[test]
 fn parent_cancellation_while_suspended_retires_wait_and_releases_permit() {
     smol::block_on(async {
         let limits = AgentLimits {
