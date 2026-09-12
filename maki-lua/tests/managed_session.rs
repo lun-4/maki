@@ -28,6 +28,8 @@ const OUTSIDE_TIMEOUT_TOOL_NAME: &str = "managed_session_outside_timeout";
 const JOIN_TOOL_NAME: &str = "managed_session_join";
 const RETAIN_ASYNC_TOOL_NAME: &str = "managed_session_retain_async";
 const RELEASE_ASYNC_TOOL_NAME: &str = "managed_session_release_async";
+const RETAIN_NESTED_TOOL_NAME: &str = "managed_session_retain_nested";
+const RETRY_NESTED_TOOL_NAME: &str = "managed_session_retry_nested";
 const TIMEOUT_ERROR: &str = "session prompt timed out after 1s";
 const NESTED_RESULT: &str = "nested child result";
 const MANAGED_NESTED_SPAWN_ERR: &str = "managed general subagents must use the blocking task tool";
@@ -183,6 +185,38 @@ maki.api.register_tool({
     local result, err = retained_session:prompt("wait", { timeout = 1 })
     if result ~= nil or err ~= "session prompt timed out after 1s" then
       return { llm_output = "unexpected retained timeout result", is_error = true }
+    end
+    return "ok"
+  end,
+})
+
+maki.api.register_tool({
+  name = "managed_session_retain_nested",
+  description = "retain a nested managed child after its first prompt",
+  schema = { type = "object", properties = {}, additionalProperties = false },
+  audiences = { "general_sub" },
+  handler = function(_, ctx)
+    retained_session = assert(maki.agent.session(ctx, {
+      name = "managed-retained-nested-child",
+      inherit_provider = true,
+    }))
+    local result, err = retained_session:prompt("nested initial prompt")
+    if not result then
+      return { llm_output = err, is_error = true }
+    end
+    return result.text
+  end,
+})
+
+maki.api.register_tool({
+  name = "managed_session_retry_nested",
+  description = "verify a retained nested child is permanently closed",
+  schema = { type = "object", properties = {}, additionalProperties = false },
+  audiences = { "main" },
+  handler = function()
+    local result, err = retained_session:prompt("must reject")
+    if result ~= nil or err ~= "session closed" then
+      return { llm_output = "unexpected retained close result: " .. tostring(err), is_error = true }
     end
     return "ok"
   end,
@@ -603,6 +637,87 @@ fn managed_nested_blocking_task_completes_before_parent_turn_ends_at_capacity_on
             parent_ticket.wait().await,
             TurnOutcome::Completed { .. }
         ));
+        let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
+        assert!(report.timed_out.is_empty());
+    });
+}
+
+#[test]
+fn closing_managed_subtree_closes_retained_nested_session_adapter() {
+    smol::block_on(async {
+        let registry = Arc::new(ToolRegistry::new());
+        let host = PluginHost::new(Arc::clone(&registry)).unwrap();
+        host.load_source("managed-session", PLUGIN_SRC).unwrap();
+        let (context, events, _cancel) =
+            common::ctx_with_replies(vec![common::canned_reply(NESTED_RESULT)]);
+        let manager = AgentManagerHandle::new(AgentLimits::default()).unwrap();
+        let (completed_tx, completed_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let (parent, _parent_ticket) = spawn_managed_parent(
+            &manager,
+            Box::new(NestedTaskBackend {
+                registry: Arc::clone(&registry),
+                context: context.clone(),
+                tool_name: RETAIN_NESTED_TOOL_NAME,
+                input: json!({}),
+                completed: completed_tx,
+                release: release_rx,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            completed_rx.recv_async().await.unwrap(),
+            Ok(NESTED_RESULT.into())
+        );
+        let descendant_id = manager
+            .snapshot()
+            .into_iter()
+            .find(|node| node.parent_id == Some(parent.id()))
+            .expect("retained nested managed session")
+            .agent_id;
+        manager.close_subtree(parent.id()).unwrap();
+
+        let closed = futures_lite::future::race(
+            async {
+                loop {
+                    let envelope = events.recv_async().await.unwrap();
+                    if matches!(envelope.event, AgentEvent::SubagentClosed)
+                        && envelope
+                            .subagent
+                            .as_ref()
+                            .is_some_and(|info| info.agent_id == descendant_id)
+                    {
+                        break true;
+                    }
+                }
+            },
+            async {
+                smol::Timer::after(SHUTDOWN_TIMEOUT).await;
+                false
+            },
+        )
+        .await;
+        assert!(closed, "descendant UI adapter did not permanently close");
+
+        let retry = registry
+            .get(RETRY_NESTED_TOOL_NAME)
+            .unwrap()
+            .tool
+            .parse(&json!({}))
+            .unwrap()
+            .execute(&context)
+            .await;
+        assert!(retry.output.is_ok(), "retained descendant accepted input");
+        while !manager.runner_finished(descendant_id).unwrap() {
+            smol::future::yield_now().await;
+        }
+        assert_eq!(
+            manager.node(descendant_id).unwrap().graph_lifecycle,
+            GraphLifecycle::Closed
+        );
+
+        release_tx.send(()).unwrap();
         let report = manager.shutdown(SHUTDOWN_TIMEOUT).await;
         assert!(report.timed_out.is_empty());
     });

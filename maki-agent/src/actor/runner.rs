@@ -335,7 +335,7 @@ impl Runner {
             event_sender: None,
             correlation: root.correlation,
             root: true,
-            ticket: super::tickets::TurnTicket::new_anonymous(),
+            ticket: super::tickets::TurnTicket::new_anonymous(Arc::clone(&self.inner.identity)),
         };
         self.run_turn(
             admission,

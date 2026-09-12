@@ -933,6 +933,47 @@ fn closing_idle_child_releases_capacity_on_next_admission() {
 }
 
 #[test]
+fn direct_actor_close_releases_child_capacity_when_runner_finishes() {
+    let limits = AgentLimits {
+        max_children_per_agent: 1,
+        ..AgentLimits::default()
+    };
+    let (manager, _, current, gate) = active_root(limits);
+    let child = manager
+        .spawn_child(
+            &current,
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            TestBackend::boxed(),
+        )
+        .unwrap();
+
+    child.actor().unwrap().close();
+    smol::block_on(async {
+        while !manager.runner_finished(child.id()).unwrap() {
+            smol::future::yield_now().await;
+        }
+    });
+    assert_eq!(
+        child.snapshot().unwrap().graph_lifecycle,
+        GraphLifecycle::Closed
+    );
+    manager
+        .spawn_child(
+            &current,
+            AgentMetadata::default(),
+            Vec::new(),
+            None,
+            TestBackend::boxed(),
+        )
+        .unwrap();
+
+    gate.release(1);
+    smol::block_on(manager.shutdown(std::time::Duration::from_secs(1)));
+}
+
+#[test]
 fn closing_active_child_consumes_capacity_until_runner_finishes() {
     smol::block_on(async {
         let limits = AgentLimits {
@@ -1244,6 +1285,170 @@ fn unauthorized_prompt_wait_does_not_cancel_child_turn() {
             .shutdown(std::time::Duration::from_secs(1))
             .await;
         assert!(report.timed_out.is_empty());
+    });
+}
+
+#[test]
+fn descendant_admission_rejects_parent_actor_without_suspending() {
+    smol::block_on(async {
+        let (manager, root, current, root_gate) = active_root(AgentLimits::default());
+        let child = manager
+            .spawn_child(
+                &current,
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::boxed(),
+            )
+            .unwrap();
+        let child_actor = child.actor().unwrap();
+
+        let error = current
+            .lease()
+            .admit_and_wait_for_descendant(
+                &current,
+                child.id(),
+                &root.actor().unwrap(),
+                super::PromptAdmission {
+                    input: input(),
+                    event_sender: None,
+                    correlation: "child".into(),
+                },
+                None,
+            )
+            .err()
+            .unwrap();
+        assert!(matches!(error, ManagerError::ActorMismatch { .. }));
+        assert_eq!(current.lease.inner.state.lock().unwrap().suspensions, 0);
+        assert_eq!(child_actor.snapshot().queued, 0);
+
+        root_gate.release(1);
+        assert!(
+            manager
+                .shutdown(std::time::Duration::from_secs(1))
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn descendant_admission_rejects_foreign_manager_actor_without_suspending() {
+    smol::block_on(async {
+        let (manager, _, current, root_gate) = active_root(AgentLimits::default());
+        let child = manager
+            .spawn_child(
+                &current,
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::boxed(),
+            )
+            .unwrap();
+        let child_actor = child.actor().unwrap();
+        let (foreign_manager, foreign_root, _, foreign_gate) = active_root(AgentLimits::default());
+
+        let error = current
+            .lease()
+            .admit_and_wait_for_descendant(
+                &current,
+                child.id(),
+                &foreign_root.actor().unwrap(),
+                super::PromptAdmission {
+                    input: input(),
+                    event_sender: None,
+                    correlation: "child".into(),
+                },
+                None,
+            )
+            .err()
+            .unwrap();
+        assert!(matches!(error, ManagerError::ActorMismatch { .. }));
+        assert_eq!(current.lease.inner.state.lock().unwrap().suspensions, 0);
+        assert_eq!(child_actor.snapshot().queued, 0);
+
+        root_gate.release(1);
+        foreign_gate.release(1);
+        assert!(
+            manager
+                .shutdown(std::time::Duration::from_secs(1))
+                .await
+                .timed_out
+                .is_empty()
+        );
+        assert!(
+            foreign_manager
+                .shutdown(std::time::Duration::from_secs(1))
+                .await
+                .timed_out
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn descendant_wait_rejects_ticket_from_another_actor_without_suspending() {
+    smol::block_on(async {
+        let (manager, _, current, root_gate) = active_root(AgentLimits::default());
+        let first = manager
+            .spawn_child(
+                &current,
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                TestBackend::boxed(),
+            )
+            .unwrap();
+        let second_gate = Gate::new();
+        let second = manager
+            .spawn_child(
+                &current,
+                AgentMetadata::default(),
+                Vec::new(),
+                None,
+                Box::new(TestBackend {
+                    current: None,
+                    gate: Some(Arc::clone(&second_gate)),
+                }),
+            )
+            .unwrap();
+        let ticket = second
+            .actor()
+            .unwrap()
+            .admit_turn(input(), None, "second".into())
+            .unwrap();
+
+        let error = current
+            .lease()
+            .wait_for_descendant(
+                &current,
+                first.id(),
+                &first.actor().unwrap(),
+                ticket.clone(),
+                None,
+            )
+            .err()
+            .unwrap();
+        assert!(matches!(error, ManagerError::TicketActorMismatch { .. }));
+        assert_eq!(current.lease.inner.state.lock().unwrap().suspensions, 0);
+        let mut pending = Box::pin(ticket.wait());
+        assert!(
+            futures_lite::future::poll_once(&mut pending)
+                .await
+                .is_none()
+        );
+
+        second_gate.release(1);
+        assert!(matches!(pending.await, TurnOutcome::Completed { .. }));
+        root_gate.release(1);
+        assert!(
+            manager
+                .shutdown(std::time::Duration::from_secs(1))
+                .await
+                .timed_out
+                .is_empty()
+        );
     });
 }
 

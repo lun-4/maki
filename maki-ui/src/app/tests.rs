@@ -7694,6 +7694,74 @@ fn subagent_closed_marks_despawned_and_rejects_input() {
 }
 
 #[test]
+fn progress_after_subagent_closed_does_not_reopen_chat() {
+    const LATE_PROGRESS: &str = "late progress";
+
+    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let chat_idx = app.active_chat;
+    let agent_id = app.chats[chat_idx].agent_id.unwrap();
+    let info = subagent_info_for_agent(
+        agent_id,
+        TASK_ID,
+        "research",
+        None,
+        app.subagent_channels[&agent_id].input_tx.clone(),
+    );
+    app.chats[chat_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
+
+    for event in [
+        AgentEvent::SubagentClosed,
+        AgentEvent::TextDelta {
+            text: LATE_PROGRESS.into(),
+        },
+    ] {
+        app.update(Msg::Agent(Box::new(Envelope {
+            event,
+            subagent: Some(info.clone()),
+            run_id: 1,
+        })));
+    }
+
+    app.chats[chat_idx].flush();
+    assert!(app.chats[chat_idx].is_finished());
+    assert_eq!(app.chats[chat_idx].last_message_text(), DONE_TEXT);
+}
+
+#[test]
+fn delayed_subagent_closed_after_root_cancel_does_not_recreate_chat() {
+    const IN_PROGRESS: &str = "in progress";
+
+    let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
+    let agent_id = app.chats[app.active_chat].agent_id.unwrap();
+    let info = subagent_info_for_agent(
+        agent_id,
+        TASK_ID,
+        "research",
+        None,
+        app.subagent_channels[&agent_id].input_tx.clone(),
+    );
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta {
+            text: IN_PROGRESS.into(),
+        },
+        subagent: Some(info.clone()),
+        run_id: 1,
+    })));
+    assert!(!app.chats[app.active_chat].is_finished());
+
+    app.handle_cancel();
+    let chat_count = app.chats.len();
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::SubagentClosed,
+        subagent: Some(info),
+        run_id: 1,
+    })));
+
+    assert_eq!(app.chats.len(), chat_count);
+    assert!(app.live_chat_index.is_empty());
+}
+
+#[test]
 fn subagent_closed_prunes_only_its_delivery_state() {
     let (mut app, _input_rx) = app_with_subagent_input_tx(TASK_ID);
     let agent_id = app.chats[app.active_chat].agent_id.unwrap();

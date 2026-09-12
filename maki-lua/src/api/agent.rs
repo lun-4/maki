@@ -199,10 +199,26 @@ impl LuaActorState {
         };
     }
 
+    fn notify_closed(&self) {
+        if !self.silent
+            && let Some(subagent) = self.subagent_info.get()
+            && !self
+                .close_notified
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let _ = self.parent_event_tx.send_envelope(Envelope {
+                event: AgentEvent::SubagentClosed,
+                subagent: Some(subagent.clone()),
+                run_id: self.parent_event_tx.run_id(),
+            });
+        }
+    }
+
     /// Idempotent close: retire the actor, resolving queued/parked waiters as
     /// Closed and rejecting later work. An executing backend relays its own
     /// transcript when it settles; close never races it with a stale fallback.
     fn close_with(&self, actor: &AgentActorHandle) {
+        self.notify_closed();
         actor.close();
         if !self
             .execution_started
@@ -228,6 +244,12 @@ struct LuaActorBackend {
 impl LuaActorBackend {
     fn new(state: Arc<LuaActorState>) -> Self {
         Self { state }
+    }
+}
+
+impl Drop for LuaActorBackend {
+    fn drop(&mut self) {
+        self.state.notify_closed();
     }
 }
 
@@ -1108,12 +1130,15 @@ async fn session(
     let fast = state.fast;
 
     // `task_despawn` and global cancellation fire the shared child token.
-    // Mapping that to `actor.close()`
-    // aborts the running turn through its per-turn cancel and terminalizes
-    // queued turns; a normal close stops the relay first.
+    // Permanent closure aborts running turns and terminalizes queued turns;
+    // managed sessions close their subtree. A normal close stops the relay first.
     let (relay_stop_tx, relay_stop_rx) = flume::bounded::<()>(1);
     {
         let actor = actor.clone();
+        let managed_agent = match &control {
+            SessionControl::Managed { agent, .. } => Some(agent.clone()),
+            SessionControl::Unmanaged { .. } => None,
+        };
         let child_cancel = state.child_cancel.clone();
         smol::spawn(async move {
             select(
@@ -1123,7 +1148,11 @@ async fn session(
                 }),
             )
             .await;
-            actor.close();
+            if let Some(agent) = managed_agent {
+                let _ = agent.close_subtree();
+            } else {
+                actor.close();
+            }
         })
         .detach();
     }
@@ -1287,19 +1316,7 @@ struct LuaSession {
 
 impl LuaSession {
     fn close_controlled(&self) {
-        if !self.state.silent
-            && let Some(subagent) = self.state.subagent_info.get()
-            && !self
-                .state
-                .close_notified
-                .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            let _ = self.state.parent_event_tx.send_envelope(Envelope {
-                event: AgentEvent::SubagentClosed,
-                subagent: Some(subagent.clone()),
-                run_id: self.state.parent_event_tx.run_id(),
-            });
-        }
+        self.state.notify_closed();
         let _ = self.relay_stop_tx.try_send(());
         match &self.control {
             SessionControl::Managed { agent, .. } => {

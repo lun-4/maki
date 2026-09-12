@@ -423,18 +423,40 @@ impl AgentManagerHandle {
         }
     }
 
+    fn validated_descendant_actor(
+        &self,
+        current: &CurrentManagedTurn,
+        child_id: AgentId,
+    ) -> Result<AgentActorHandle, ManagerError> {
+        self.validate_descendant(current, child_id)?;
+        self.actor(child_id)
+    }
+
     fn register_prompt_wait(
         &self,
         current: &CurrentManagedTurn,
         lease: &TurnPermitLease,
         child_id: AgentId,
+        actor: &AgentActorHandle,
         ticket: crate::TurnTicket,
         timeout: Option<Duration>,
     ) -> Result<ManagedPromptWait, ManagerError> {
         if !Arc::ptr_eq(&lease.inner, &current.lease.inner) {
             return Err(ManagerError::WrongManager);
         }
-        self.validate_descendant(current, child_id)?;
+        let managed_actor = self.validated_descendant_actor(current, child_id)?;
+        if !managed_actor.same_actor(actor) {
+            return Err(ManagerError::ActorMismatch {
+                expected_id: child_id,
+                actual_id: actor.agent_id(),
+            });
+        }
+        if !managed_actor.owns_ticket(&ticket) {
+            return Err(ManagerError::TicketActorMismatch {
+                agent_id: child_id,
+                turn_id: ticket.turn_id(),
+            });
+        }
 
         let watcher_id = self.0.next_watcher.fetch_add(1, Ordering::Relaxed);
         let (cancel, cancel_token) = crate::ReasonedCancelToken::new();
@@ -553,7 +575,12 @@ impl AgentManagerHandle {
             let Some(node) = graph.nodes.get_mut(&agent_id) else {
                 return;
             };
-            if node.reservation == reservation && node.lifecycle == GraphLifecycle::Closing {
+            if node.reservation == reservation
+                && !matches!(
+                    node.lifecycle,
+                    GraphLifecycle::Closed | GraphLifecycle::Removed
+                )
+            {
                 node.lifecycle = GraphLifecycle::Closed;
                 graph.revision += 1;
             }

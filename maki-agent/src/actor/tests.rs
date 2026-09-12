@@ -973,7 +973,7 @@ fn queue_pop_interrupt_keeps_incompatible_entries() {
         event_sender: None,
         correlation: "t".into(),
         root: false,
-        ticket: super::TurnTicket::new(crate::types::TurnId::generate()),
+        ticket: super::TurnTicket::new(crate::types::TurnId::generate(), Arc::new(())),
     };
     queue.push(ActorWork::Turn(admission));
     queue.push(ActorWork::Root(RootWork {

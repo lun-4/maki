@@ -185,14 +185,14 @@ impl TurnPermitLease {
         &self,
         current: &CurrentManagedTurn,
         child_id: AgentId,
-        _actor: &AgentActorHandle,
+        actor: &AgentActorHandle,
         ticket: TurnTicket,
         timeout: Option<Duration>,
     ) -> Result<ManagedPromptWait, super::ManagerError> {
         current
             .token
             .manager
-            .register_prompt_wait(current, self, child_id, ticket, timeout)
+            .register_prompt_wait(current, self, child_id, actor, ticket, timeout)
     }
 
     pub fn admit_and_wait_for_descendant(
@@ -206,11 +206,17 @@ impl TurnPermitLease {
         if !Arc::ptr_eq(&self.inner, &current.lease.inner) {
             return Err(super::ManagerError::WrongManager);
         }
-        current
+        let managed_actor = current
             .token
             .manager
-            .validate_descendant(current, child_id)?;
-        let Ok(ticket) = actor.admit_turn(
+            .validated_descendant_actor(current, child_id)?;
+        if !managed_actor.same_actor(actor) {
+            return Err(super::ManagerError::ActorMismatch {
+                expected_id: child_id,
+                actual_id: actor.agent_id(),
+            });
+        }
+        let Ok(ticket) = managed_actor.admit_turn(
             admission.input,
             admission.event_sender,
             admission.correlation,
@@ -220,14 +226,17 @@ impl TurnPermitLease {
         let turn_id = ticket.turn_id();
         #[cfg(test)]
         current.token.manager.wait_at_prompt_admission_gate(turn_id);
-        match current
-            .token
-            .manager
-            .register_prompt_wait(current, self, child_id, ticket, timeout)
-        {
+        match current.token.manager.register_prompt_wait(
+            current,
+            self,
+            child_id,
+            &managed_actor,
+            ticket,
+            timeout,
+        ) {
             Ok(wait) => Ok(Some((turn_id, wait))),
             Err(error) => {
-                let _ = actor.cancel_turn(turn_id);
+                let _ = managed_actor.cancel_turn(turn_id);
                 Err(error)
             }
         }

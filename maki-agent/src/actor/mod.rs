@@ -56,6 +56,7 @@ pub enum ActorWork {
 /// The mutable half of an actor, shared with every clone of the handle.
 pub(crate) struct ActorInner {
     pub(crate) agent_id: AgentId,
+    pub(crate) identity: Arc<()>,
     pub(crate) state: Mutex<ActorState>,
     pub(crate) queue: Arc<ActorQueue>,
     pub(crate) outcomes: Mutex<HashMap<TurnId, TurnOutcome>>,
@@ -267,6 +268,7 @@ impl AgentActorHandle {
         };
         let inner = Arc::new(ActorInner {
             agent_id,
+            identity: Arc::new(()),
             state: Mutex::new(ActorState::idle()),
             queue: Arc::new(ActorQueue::new()),
             outcomes: Mutex::new(HashMap::new()),
@@ -290,6 +292,14 @@ impl AgentActorHandle {
 
     pub fn agent_id(&self) -> AgentId {
         self.inner.agent_id
+    }
+
+    pub(crate) fn same_actor(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner.identity, &other.inner.identity)
+    }
+
+    pub(crate) fn owns_ticket(&self, ticket: &TurnTicket) -> bool {
+        ticket.belongs_to(&self.inner.identity)
     }
 
     #[cfg(test)]
@@ -335,7 +345,7 @@ impl AgentActorHandle {
             });
         }
         let turn_id = TurnId::generate();
-        let ticket = TurnTicket::new(turn_id);
+        let ticket = TurnTicket::new(turn_id, Arc::clone(&self.inner.identity));
         if let Some(reason) = state.cancelled_correlations.get(&correlation) {
             // Precancelled before admission: terminalize exactly once with the
             // remembered reason, deliver, and resolve the waiter immediately.

@@ -322,6 +322,7 @@ pub struct App {
     pub(super) active_chat: usize,
     pub(super) chat_index: HashMap<String, usize>,
     pub(super) live_chat_index: HashMap<maki_agent::AgentId, usize>,
+    terminal_subagents: HashSet<maki_agent::AgentId>,
     pub(crate) input_box: InputBox,
     pub(super) command_palette: CommandPalette,
     pub(crate) command_runtime: Arc<CommandRuntime>,
@@ -476,6 +477,7 @@ impl App {
             active_chat: 0,
             chat_index: HashMap::new(),
             live_chat_index: HashMap::new(),
+            terminal_subagents: HashSet::new(),
             input_box,
             command_runtime: Arc::clone(&command_runtime),
             command_target: command_target.clone(),
@@ -1782,18 +1784,24 @@ impl App {
             return vec![];
         }
 
-        if let (Some(subagent), AgentEvent::SubagentClosed) = (&envelope.subagent, &envelope.event)
-        {
-            let chat_idx = self.resolve_or_create_chat(subagent);
-            if let Some(channels) = self.subagent_channels.get_mut(&subagent.agent_id) {
-                channels.closed = true;
+        if let Some(subagent) = &envelope.subagent {
+            if self.terminal_subagents.contains(&subagent.agent_id) {
+                return vec![];
             }
-            self.delivered_subagent_histories.remove(&subagent.agent_id);
-            self.stamped_subagent_outcomes
-                .retain(|(agent_id, _)| *agent_id != subagent.agent_id);
-            self.chats[chat_idx].cancel_in_progress();
-            self.sync_task_picker();
-            return vec![];
+            if matches!(&envelope.event, AgentEvent::SubagentClosed) {
+                self.terminal_subagents.insert(subagent.agent_id);
+                if let Some(channels) = self.subagent_channels.get_mut(&subagent.agent_id) {
+                    channels.closed = true;
+                }
+                self.delivered_subagent_histories.remove(&subagent.agent_id);
+                self.stamped_subagent_outcomes
+                    .retain(|(agent_id, _)| *agent_id != subagent.agent_id);
+                if let Some(&chat_idx) = self.live_chat_index.get(&subagent.agent_id) {
+                    self.chats[chat_idx].cancel_in_progress();
+                    self.sync_task_picker();
+                }
+                return vec![];
+            }
         }
 
         if let (Some(subagent), AgentEvent::TurnOutcome(outcome)) =
@@ -2884,6 +2892,8 @@ impl App {
     }
 
     fn finish_subagents(&mut self, role: DisplayRole, text: &str) {
+        self.terminal_subagents
+            .extend(self.live_chat_index.keys().copied());
         self.retain_resolved_subagents(role, text);
         self.chat_index.clear();
         self.live_chat_index.clear();

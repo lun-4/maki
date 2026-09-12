@@ -55,7 +55,6 @@ const SCENARIO_INVALID_THEN_VALID: &str = "invalid_then_valid";
 const SCENARIO_NEVER_STRUCTURED: &str = "never_structured";
 const SCENARIO_INVALID_ONLY: &str = "invalid_only";
 const SCENARIO_PROMPT_ERROR: &str = "prompt_error";
-const SCENARIO_NESTED_FAILED: &str = "nested_failed";
 const SCENARIO_PARTIAL_ERROR: &str = "partial_error";
 const SCENARIO_RAISE: &str = "raise";
 const SCENARIO_NO_SUMMARY: &str = "no_summary";
@@ -636,15 +635,10 @@ fn raising_prompt_does_not_exhaust_semaphore() {
 // --- Four-tool async lifecycle (AC.1 - AC.5, AC.7) --------------------------
 
 #[test]
-fn unmanaged_general_child_cannot_send_to_or_despawn_sibling_tasks() {
-    let provider = Arc::new(common::CannedProvider::new(vec![
-        common::canned_tool_use(
-            "task_send",
-            json!({ "task_id": "sibling", "message": "mutate" }),
-        ),
-        common::canned_tool_use("task_despawn", json!({ "task_id": "sibling" })),
-        common::canned_reply("done"),
-    ]));
+fn unmanaged_general_child_can_access_all_nested_lifecycle_tools() {
+    let provider = Arc::new(common::CannedProvider::new(vec![common::canned_reply(
+        "done",
+    )]));
     let (ctx, _rx, _trigger) = common::ctx_with_provider(Arc::clone(&provider));
     let (reg, _host) = load_real_driver_host("build");
 
@@ -654,20 +648,21 @@ fn unmanaged_general_child_cannot_send_to_or_despawn_sibling_tasks() {
         .expect("general child should complete after rejected mutation attempts");
     assert_eq!(output, "done");
 
-    let captured = provider.captured_tools();
-    assert_eq!(
-        captured.len(),
-        3,
-        "the driver must process both mutation attempts before the final reply"
-    );
-    for tools in captured {
-        let names = common::tool_names(&tools);
-        for name in ["task_send", "task_despawn"] {
-            assert!(
-                !names.iter().any(|available| available == name),
-                "unmanaged sibling can invoke {name}"
-            );
-        }
+    let filter = ToolFilter::All;
+    let description_ctx = DescriptionContext {
+        filter: &filter,
+        audience: ToolAudience::GENERAL_SUB,
+        workflow: false,
+    };
+    for name in ["task_spawn", "task_get", "task_send", "task_despawn"] {
+        assert!(
+            !reg.get(name)
+                .expect("lifecycle tool is registered")
+                .tool
+                .description(&description_ctx)
+                .is_empty(),
+            "unmanaged general child cannot invoke {name}"
+        );
     }
 }
 
@@ -702,21 +697,27 @@ fn nested_spawn_contract_directs_managed_callers_to_blocking_task() {
 }
 
 #[test]
-fn unmanaged_nested_spawn_and_get_remain_compatible() {
+fn unmanaged_nested_task_lifecycle_remains_compatible() {
     let (reg, _host) = load_task_host();
     let mut ctx = stub_ctx(&AgentMode::Build);
     ctx.audience = ToolAudience::GENERAL_SUB;
-    let spawned = exec_tool_json_with_ctx(
-        &reg,
-        &ctx,
-        "task_spawn",
-        task_input(SCENARIO_NESTED_FAILED, None),
-    );
+    let spawned =
+        exec_tool_json_with_ctx(&reg, &ctx, "task_spawn", task_input(SCENARIO_PLAIN, None));
     let task_id = spawned["task_id"].as_str().unwrap();
     let status = exec_tool_json_with_ctx(&reg, &ctx, "task_get", json!({ "task_id": task_id }));
     assert_eq!(status["status"], json!("done"));
-    assert_eq!(status["error"], json!(PROMPT_ERR_MSG));
-    assert!(status.get("result").is_none());
+    assert_eq!(status["result"]["text"], json!(PLAIN_TEXT));
+
+    let queued = exec_tool_json_with_ctx(
+        &reg,
+        &ctx,
+        "task_send",
+        json!({ "task_id": task_id, "message": "follow up" }),
+    );
+    assert_eq!(queued["queued"], json!(true));
+
+    let closed = exec_tool_json_with_ctx(&reg, &ctx, "task_despawn", json!({ "task_id": task_id }));
+    assert_eq!(closed["ok"], json!(true));
 }
 
 #[test]

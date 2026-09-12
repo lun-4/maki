@@ -26,6 +26,13 @@ pub enum ManagerError {
     WrongManager,
     #[error("managed turn {turn_id} for agent {agent_id} is no longer active")]
     InactiveTurn { agent_id: AgentId, turn_id: TurnId },
+    #[error("agent actor mismatch: expected {expected_id}, got {actual_id}")]
+    ActorMismatch {
+        expected_id: AgentId,
+        actual_id: AgentId,
+    },
+    #[error("turn {turn_id} does not belong to agent {agent_id}")]
+    TicketActorMismatch { agent_id: AgentId, turn_id: TurnId },
     #[error("agent {child_id} is not a descendant of agent {parent_id}")]
     NotDescendant {
         parent_id: AgentId,
